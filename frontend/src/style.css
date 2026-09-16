@@ -1,0 +1,25 @@
+/* 透明窗口的全局基础样式。
+   关键点：html / body / #app 都必须保持 transparent，
+   任何一层出现不透明底色，透明窗口就会露出一块方块。 */
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  overflow: hidden;
+}
+
+body {
+  font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  /* 桌宠窗口是按像素画出来的，不应该像网页那样能拖选文字 */
+  user-select: none;
+  cursor: default;
+}
+
+button {
+  font-family: inherit;
+}

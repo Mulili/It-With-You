@@ -1,0 +1,87 @@
+package main
+
+import (
+	"agent-for-you-love/internal/llm"
+	"embed"
+	"log"
+
+	"github.com/wailsapp/wails/v2"
+	"github.com/wailsapp/wails/v2/pkg/options"
+	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/options/windows"
+)
+
+//go:embed all:frontend/dist
+var assets embed.FS
+
+// trayIcon 复用 Wails 生成的应用图标作为托盘图标。
+// 注意：systray 在 Windows 上要求 .ico，给 png 会加载失败。
+//
+//go:embed build/windows/icon.ico
+var trayIcon []byte
+
+func main() {
+	llmCfg := llm.ConfigFromEnv()
+	if llmCfg.APIKey == "" {
+		// 只是提示，不 Fatal：桌宠启动失败又看不到任何窗口，是最难排查的一类故障。
+		log.Println("[llm] 未检测到 COMPANION_LLM_API_KEY，发消息时才会报错")
+	}
+	app := NewApp(llm.NewOpenAIProvider(llmCfg))
+
+	err := wails.Run(&options.App{
+		Title:         "AI 桌面伴侣",
+		Width:         340,
+		Height:        460,
+		Frameless:     true, // 无边框：去掉标题栏，桌宠才能"浮"在桌面上
+		AlwaysOnTop:   true, // 置顶：不被其他窗口遮住
+		DisableResize: true,
+		// Wails 在 Windows 上会丢掉这个颜色的 alpha：内部只用 RGB 建一把实心画刷，通过
+		// GCLP_HBRBACKGROUND 刷成窗口类的背景（wails 内部 win32.SetBackgroundColour 的
+		// 函数签名里就没有 alpha 参数）。也就是说填什么色，窗口就是什么底色，A=0 并不透明。
+		//
+		// 窗口透明不靠这里，靠下面 Windows 段的 WindowIsTranslucent：开了之后窗口没有
+		// 重定向表面，这把刷子画出来的东西不再进入 DWM 合成，自然透不出来。
+		// 若将来真机上仍看到实色底，先排查这里（试试把 BackgroundColour 设为 nil 隔离变量），
+		// 而不是回到下面这些已证实无效的做法。
+		//
+		// 以下做法已验证无效或有害，不要再试：
+		//   - 给窗口加 WS_EX_LAYERED：WebView2 走 DirectComposition，用 SetWindowLong
+		//     改扩展样式会切换窗口合成模式，把它的视觉层踢掉，窗口整个不渲染。
+		//   - DwmExtendFrameIntoClientArea 全玻璃（MARGINS 四个方向都设 -1）：无效。
+		//   - 清窗口类背景画刷（GCLP_HBRBACKGROUND 设 0）：会造成"假透明"——
+		//     客户区从此不再重绘，只是残留屏幕上的旧像素，看着像透明，实际是脏画面。
+		BackgroundColour: &options.RGBA{R: 0, G: 0, B: 0, A: 0},
+		AssetServer: &assetserver.Options{
+			Assets: assets,
+		},
+		OnStartup:  app.startup,
+		OnShutdown: app.shutdown,
+		Bind: []interface{}{
+			app,
+		},
+		Windows: &windows.Options{
+			// 让 WebView2 的默认背景透明：网页自己画的透明区域不会被涂白。
+			// 这一项只解决"网页层"，窗口那层底要靠下面的 WindowIsTranslucent，两层配套才有效果。
+			WebviewIsTransparent: true,
+			// 窗口级透明：Wails 在建窗时给窗口样式加上 WS_EX_NOREDIRECTIONBITMAP，窗口不再有
+			// 重定向表面，WebView2 的视觉层直接交给 DWM 合成，网页透明的地方才能真正透出桌面。
+			//
+			// 这个样式必须在 CreateWindow 的那一刻就带上，事后用 SetWindowLong 补会切换窗口
+			// 合成模式、把 WebView2 的视觉层踢掉（窗口整个不渲染）——所以不要自己手动加。
+			// 同理，上面 BackgroundColour 画的那把实心刷子此时也不再进入合成，不会露出来。
+			//
+			// 透出来的是什么由 BackdropType 决定（本项默认 Auto，先不锁死，等真机看过再定）：
+			// Win11 22621+ 走 DWM backdrop，可用 windows.None 直接看见桌面、Mica/Acrylic 做磨砂；
+			// 更低的 Windows 版本 Wails 会回落成 ACCENT_ENABLE_BLURBEHIND，只能得到模糊透视。
+			WindowIsTranslucent: true,
+			// 关掉 Win11 无边框窗口的圆角与投影
+			DisableFramelessWindowDecorations: true,
+			// 阶段1 先不做点击穿透，按文档"关键决策"：先可交互，后续再加穿透开关。
+			// 注意透明 ≠ 穿透：透明像素仍然属于窗口，一样会挡住桌面点击。
+		},
+	})
+
+	if err != nil {
+		log.Fatalf("应用启动失败: %v", err)
+	}
+}

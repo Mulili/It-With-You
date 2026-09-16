@@ -1,0 +1,7 @@
+# 这个文件的作用是让 frontend/dist/ 目录存在于 git 里。
+#
+# 为什么需要它：main.go 里有 //go:embed all:frontend/dist，而 .gitignore 忽略了
+# frontend/dist/*（构建产物不该进版本库）。没有这个占位文件，全新 clone 的工作区里
+# 就没有 dist 目录，go build 会直接报 "pattern all:frontend/dist: no matching files found"。
+# wails build 不受影响（它会先跑前端构建把 dist 生成出来），所以这个问题只在
+# 别人 clone 后直接用 go build 时才会暴露。
