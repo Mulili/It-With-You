@@ -14,12 +14,20 @@ export function HideWindow() {
   return window['go']['main']['App']['HideWindow']();
 }
 
+export function History() {
+  return window['go']['main']['App']['History']();
+}
+
 export function Quit() {
   return window['go']['main']['App']['Quit']();
 }
 
 export function Say(arg1) {
   return window['go']['main']['App']['Say'](arg1);
+}
+
+export function SetMenuOpen(arg1) {
+  return window['go']['main']['App']['SetMenuOpen'](arg1);
 }
 
 export function ShowWindow() {

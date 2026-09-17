@@ -1,7 +1,8 @@
 <script setup>
+import petImg from './assets/pet.png'
 import { ref, onMounted, onUnmounted } from 'vue'
 import Bubble from './components/Bubble.vue'
-import { Ask, Cancel, Say, HideWindow, Quit } from '../wailsjs/go/main/App'
+import { Ask, Cancel, Say, HideWindow, Quit, History, SetMenuOpen } from '../wailsjs/go/main/App'
 import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime'
 
 // 与 Go 侧 internal/ui/events.go 里的常量保持一致
@@ -14,6 +15,46 @@ const bubbleText = ref('')
 const draft = ref('')
 const busy = ref(false)   // 是否正在流式回复
 const streamId = ref('')  // 当前这一轮的 ID，用来过滤掉上一轮的残留片段
+
+const menuOpen = ref(false)
+const historyItems = ref([])
+
+async function openMenu() {
+  menuOpen.value = true
+  SetMenuOpen(true)
+  try {
+    // 历史是只读快照，打开时拉一次即可，不做轮询、不做增量推送
+    historyItems.value = (await History()) ?? []
+  } catch (e) {
+    historyItems.value = []
+    console.error('读取历史失败', e)
+  }
+}
+
+function closeMenu() {
+  menuOpen.value = false
+  SetMenuOpen(false)
+}
+
+function toggleMenu() {
+  menuOpen.value ? closeMenu() : openMenu()
+}
+
+// 隐藏前先收起菜单：否则窗口会带着「加高后的尺寸 + 打开的面板」一起被隐藏，
+// 下次从托盘唤出时尺寸与预期不符
+function onHide() {
+  if (menuOpen.value) closeMenu()
+  HideWindow()
+}
+
+// 菜单里只显示 时:分，够用了；跨天的记录补上月-日，否则长会话里分不清先后
+function fmtTime(at) {
+  const d = new Date(at)
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  return d.toDateString() === new Date().toDateString()
+    ? hm
+    : `${d.getMonth() + 1}-${d.getDate()} ${hm}`
+}
 
 function say(text) {
   if (!text) return
@@ -106,17 +147,41 @@ onUnmounted(() => {
 <template>
   <div class="companion">
     <header class="dragbar">
+      <button class="dragbar__icon" title="历史记录" @click="toggleMenu">☰</button>
       <span class="dragbar__title">AI 桌面伴侣</span>
-      <button class="dragbar__btn" title="隐藏到托盘" @click="HideWindow()">×</button>
+      <button class="dragbar__btn" title="隐藏到托盘" @click="onHide()">×</button>
     </header>
 
     <main class="stage">
       <!-- 流式期间 duration=0，避免气泡在长回复中途自动收起 -->
       <Bubble :text="bubbleText" :duration="busy ? 0 : 8000" />
       <button class="pet" title="点我：有输入就发送，没输入就打个招呼" @click="onPetClick">
-        <span class="pet__face">🐣</span>
+        <img class = "pet__face" :src = "petImg" alt = "" draggable = "false" />
       </button>
     </main>
+
+    <!-- 历史浮层：必须放在 .stage 之外，那里的 overflow: hidden 会把它裁掉 -->
+    <Transition name="menu">
+      <section v-if="menuOpen" class="menu">
+        <p v-if="!historyItems.length" class="menu__empty">还没有对话记录</p>
+        <ul v-else class="menu__list">
+          <!-- 列表只增不改、每条 id 唯一，用 id 做 key 是安全的 -->
+          <li
+            v-for="item in historyItems"
+            :key="item.id"
+            class="menu__item"
+            :class="item.role === 'user' ? 'menu__item--user' : 'menu__item--bot'"
+          >
+            <div class="menu__meta">
+              <span>{{ item.role === 'user' ? '我' : '伴侣' }}</span>
+              <span>{{ fmtTime(item.at) }}</span>
+              <span v-if="item.status === 'canceled'" class="menu__tag">已打断</span>
+            </div>
+            <p class="menu__text">{{ item.text }}</p>
+          </li>
+        </ul>
+      </section>
+    </Transition>
 
     <footer class="composer">
       <input
@@ -190,6 +255,9 @@ onUnmounted(() => {
   /* 整个窗口默认不可拖，只有 .dragbar 例外 */
   --wails-draggable: no-drag;
 
+  /* 历史浮层的定位参照：浮层是 absolute，需要一个 position 不为 static 的祖先 */
+  position: relative;
+
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -240,6 +308,25 @@ onUnmounted(() => {
   color: #33333d;
 }
 
+.dragbar__icon {
+  --wails-draggable: no-drag;
+
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #8a8a99;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.dragbar__icon:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: #33333d;
+}
+
 .stage {
   flex: 1;
   display: flex;
@@ -262,11 +349,19 @@ onUnmounted(() => {
   height: 112px;
   border: 0;
   border-radius: 50%;
-  background: radial-gradient(circle at 32% 28%, #ffe9a8, #ffb46b 62%, #ff9d5c);
-  box-shadow: 0 10px 24px rgba(255, 157, 92, 0.35), inset 0 -6px 14px rgba(0, 0, 0, 0.08);
-  font-size: 48px;
+  overflow: hidden;
+  background: transparent;
   cursor: pointer;
   transition: transform 0.16s ease;
+}
+
+.pet__face {
+  width: 100%;
+  height: 100%;
+  object-fit: cover; 
+  pointer-events: none;  /* 点击必须落在 button 上，别让 img 吃掉 */
+  clip-path: circle(50% at 50% 50%);
+  aspect-ratio: 1 / 1;
 }
 
 .pet:hover {
@@ -275,6 +370,88 @@ onUnmounted(() => {
 
 .pet:active {
   transform: translateY(0) scale(0.98);
+}
+
+/* 历史浮层盖住拖拽区以下的全部区域：只读浏览，不需要与桌宠争空间。
+   top 取 44px 是为了让拖拽区（含 ☰ 与 ×）露在外面，随时能收起菜单。 */
+.menu {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 44px;
+  bottom: 10px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: 0 12px 30px rgba(30, 25, 60, 0.22);
+  overflow: hidden;
+}
+
+.menu__list {
+  flex: 1;
+  margin: 0;
+  padding: 8px;
+  list-style: none;
+  overflow-y: auto;
+}
+
+.menu__item {
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+
+.menu__item + .menu__item {
+  margin-top: 6px;
+}
+
+.menu__item--user {
+  background: rgba(124, 108, 245, 0.08);
+}
+
+.menu__meta {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 10px;
+  color: #9a9aa8;
+}
+
+.menu__tag {
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(255, 157, 92, 0.18);
+  color: #b2652b;
+}
+
+.menu__text {
+  margin: 3px 0 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #2b2b33;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.menu__empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  font-size: 12px;
+  color: #9a9aa8;
+}
+
+.menu-enter-active,
+.menu-leave-active {
+  transition: opacity 0.16s ease;
+}
+
+.menu-enter-from,
+.menu-leave-to {
+  opacity: 0;
 }
 
 .actions {

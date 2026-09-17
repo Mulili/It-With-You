@@ -12,3 +12,6 @@ node_modules
 
 # 本地构建缓存（可随时删除，仅为沙箱内构建 Go / npm 而设）
 .cache/
+
+# 测试图片不必上传
+frontend/src/assets

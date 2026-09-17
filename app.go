@@ -22,13 +22,35 @@ type App struct {
 	provider llm.Provider
 
 	mu sync.Mutex
-	// history 阶段2 只放内存。隐藏窗口不销毁进程，所以"关闭窗口不丢历史"这条验收成立；
-	// 进程重启即丢，持久化留到阶段3 / 阶段4。
-	history []llm.Message
+	// records 是会话历史的唯一真源，阶段2.5 只放内存：隐藏窗口不销毁进程，
+	// 所以"关闭窗口不丢历史"这条验收成立；进程重启即丢，持久化留到阶段3 / 阶段4。
+	//
+	// 两个出口都从它投影而来，不另存副本——两份数据要成对 append，
+	// 漏一处就会永久不同步，而症状是"菜单里少一条"这种极难定位的问题：
+	//   - 发给模型：projectMessages（阶段4 的上下文截断加在那里）
+	//   - 给前端菜单：History（截到最近 ui.HistoryDisplayLimit 条）
+	records []record
 	// prevCancel 是上一轮流的取消函数。context.CancelFunc 可重复调用，所以不必清理，
 	// 每次新请求直接覆盖即可——省掉了"谁负责清空"的并发问题。
 	prevCancel context.CancelFunc
 	msgSeq     int
+}
+
+// record 是内部记录：除了 llm.Message 还带上展示需要的编号、时间与状态。
+//
+// 这些字段必须留在这里，不能加进 llm.Message——后者会被整段序列化进请求体，
+// 加什么字段都会原样发给模型。
+type record struct {
+	id      string
+	message llm.Message
+	at      int64
+	status  string
+}
+
+// nextID 返回进程内自增的记录编号。调用方必须持有 a.mu。
+func (a *App) nextID() string {
+	a.msgSeq++
+	return fmt.Sprintf("m%d", a.msgSeq)
 }
 
 func NewApp(provider llm.Provider) *App {
@@ -93,11 +115,16 @@ func (a *App) Ask(text string) (string, error) {
 		a.prevCancel() // 掐掉上一轮，保证同时只有一个流
 	}
 	a.prevCancel = cancel
-	a.history = append(a.history, llm.Message{Role: llm.RoleUser, Content: text})
-	// 拷贝一份给 goroutine：之后 history 还会被 append，共享底层数组会读到意料之外的内容。
-	msgs := append([]llm.Message(nil), a.history...)
-	a.msgSeq++
-	id := fmt.Sprintf("m%d", a.msgSeq)
+	// 这一轮的 ID 同时就是这条 user 记录的 ID，流式事件也用它，前端据此过滤片段
+	id := a.nextID()
+	a.records = append(a.records, record{
+		id:      id,
+		message: llm.Message{Role: llm.RoleUser, Content: text},
+		at:      time.Now().UnixMilli(),
+		status:  ui.StatusOK, // 用户这句话在发出时就是完整的
+	})
+	// 拷贝一份给 goroutine：之后 records 还会被 append，共享底层数组会读到意料之外的内容。
+	msgs := projectMessages(a.records)
 	a.mu.Unlock()
 
 	go a.stream(ctx, id, msgs)
@@ -114,6 +141,45 @@ func (a *App) Cancel() {
 	}
 }
 
+// projectMessages 把内部记录投影成发给模型的消息。
+//
+// 现在只是把 message 摘出来，但它有意做成一函数而不是一段内联代码：
+// 阶段3 要在头部拼人格 System Prompt、阶段4 要「只发最近 N 轮」，
+// 那两件事都加在这里，而不是去动 records 本身。
+//
+// 纯函数、不碰锁：调用方持有 a.mu 时使用。
+func projectMessages(records []record) []llm.Message {
+	msgs := make([]llm.Message, 0, len(records))
+	for _, r := range records {
+		msgs = append(msgs, r.message)
+	}
+	return msgs
+}
+
+// History 返回最近的历史对话，供前端菜单展示（只读，拉模式）。
+//
+// 返回的是新切片，与内部 records 不共享底层数组，前端随便改都影响不到真源。
+func (a *App) History() []ui.HistoryItem {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	start := len(a.records) - ui.HistoryDisplayLimit
+	if start < 0 {
+		start = 0
+	}
+	items := make([]ui.HistoryItem, 0, len(a.records)-start)
+	for _, r := range a.records[start:] {
+		items = append(items, ui.HistoryItem{
+			ID:     r.id,
+			Role:   r.message.Role,
+			Text:   r.message.Content,
+			At:     r.at,
+			Status: r.status,
+		})
+	}
+	return items
+}
+
 // stream 消费 Provider 的通道，边收边推事件。
 func (a *App) stream(ctx context.Context, id string, msgs []llm.Message) {
 	ch, err := a.provider.ChatStream(ctx, msgs)
@@ -128,7 +194,8 @@ func (a *App) stream(ctx context.Context, id string, msgs []llm.Message) {
 		if chunk.Err != nil {
 			if errors.Is(chunk.Err, context.Canceled) {
 				// 用户点了停止，或发了新问题把这一轮掐掉——这不是错误，安静收场。
-				a.appendAssistant(full.String())
+				// 已收到的半截内容照样进历史，但标成 canceled：菜单要能把它和正常回复区分开。
+				a.appendAssistant(full.String(), ui.StatusCanceled)
 				return
 			}
 			runtime.EventsEmit(a.ctx, ui.EventChatError, ui.ChatErrorPayload{ID: id, Message: chunk.Err.Error()})
@@ -141,16 +208,22 @@ func (a *App) stream(ctx context.Context, id string, msgs []llm.Message) {
 		runtime.EventsEmit(a.ctx, ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: chunk.Content})
 	}
 
-	a.appendAssistant(full.String())
+	a.appendAssistant(full.String(), ui.StatusOK)
 	runtime.EventsEmit(a.ctx, ui.EventChatDone, ui.ChatDonePayload{ID: id})
 }
 
-func (a *App) appendAssistant(content string) {
+// appendAssistant 把这一轮的回复写进历史。status 区分"正常说完"与"被用户打断"。
+func (a *App) appendAssistant(content, status string) {
 	if content == "" {
 		return
 	}
 	a.mu.Lock()
-	a.history = append(a.history, llm.Message{Role: llm.RoleAssistant, Content: content})
+	a.records = append(a.records, record{
+		id:      a.nextID(),
+		message: llm.Message{Role: llm.RoleAssistant, Content: content},
+		at:      time.Now().UnixMilli(),
+		status:  status,
+	})
 	a.mu.Unlock()
 }
 
@@ -162,6 +235,9 @@ func (a *App) HideWindow() { a.win.Hide() }
 
 // ToggleWindow 在显示 / 隐藏之间切换。
 func (a *App) ToggleWindow() { a.win.Toggle() }
+
+// SetMenuOpen 由前端在打开 / 关闭历史菜单时调用，用于临时加高窗口。
+func (a *App) SetMenuOpen(open bool) { a.win.SetMenuOpen(open) }
 
 // Quit 退出应用。
 func (a *App) Quit() { runtime.Quit(a.ctx) }

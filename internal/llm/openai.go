@@ -1,3 +1,11 @@
+// 本文件是阶段2 的 LLM 接入实现：OpenAI 兼容协议的流式对话（DeepSeek 直接复用这套协议）。
+//
+// 一次调用的完整链路：
+//
+//	拼 JSON 请求体 → POST /chat/completions（stream:true）→ 服务端按 SSE 逐帧返回 → pump 逐行解析 → Chunk 通道
+//
+// 选择「net/http + 手写 SSE 解析」而不是引第三方 SDK：本项目只需要读 content 一个字段，
+// 自己解既不用跟第三方依赖的版本节奏，也能把"流式到底是什么"看明白。
 package llm
 
 import (
@@ -12,31 +20,53 @@ import (
 	"strings"
 )
 
+// OpenAIProvider 是 Provider 接口的 OpenAI 兼容实现，DeepSeek / OpenAI / 本地 vLLM 都能直接复用。
+//
+// client 用默认 Transport（自带连接池与 keep-alive），刻意不设 Timeout：
+// 流式响应天生要长时间占住连接，设总超时会在长回复说到一半时被掐断。
+// 超时与取消统一交给 ctx 控制——前端「停止」按钮走的就是这条路径。
 type OpenAIProvider struct {
 	cfg    Config
 	client *http.Client
 }
 
+// NewOpenAIProvider 只做组装，不做网络校验。
+// 缺 Key 之类的错误留到 ChatStream 里以业务错误码返回，这样构造函数保持无副作用、便于测试。
 func NewOpenAIProvider(cfg Config) *OpenAIProvider {
 	return &OpenAIProvider{cfg: cfg, client: &http.Client{}}
 }
 
+// chatRequest 是请求体。用结构体而不是 map 拼：字段名写错时 struct tag 至少能在审阅中被发现，
+// 而 map 的 key 写错只会被服务端静默忽略，最后表现为"模型答非所问"这种很难查的现象。
+//
+// Stream 必须为 true。若为 false，服务端会一次性返回完整 JSON（没有 SSE 帧），
+// 下面的 pump 一行都解不出来，表现是"发出去没反应"。
 type chatRequest struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
 	Stream   bool      `json:"stream"`
 }
 
+// streamResponse 是响应流中「一帧」的结构，只声明用得到的字段——JSON 反序列化会自动忽略多余字段。
 type streamResponse struct {
 	Choices []struct {
+		// Delta 是本帧的增量（区别于非流式的 message，后者是整段回答）
 		Delta struct {
 			Content string `json:"content"`
 		} `json:"delta"`
+		// FinishReason 目前不参与判断（本轮结束以 [DONE] 哨兵为准）。
+		// 保留它是为将来区分"正常说完"与"被 max_tokens 截断"（值为 "length"）留个口子。
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 }
 
+// ChatStream 发起一次流式对话，立即返回 Chunk 通道（Provider 接口的约定，见 types.go）。
+//
+// 通道由内部 goroutine 生产。ctx 必须由调用方持有 cancel：
+// 取消时底层 HTTP 往返会被中断，pump 收到 ctx.Err() 后以 Chunk{Err} 收尾，
+// 而不是让前端自己丢弃后面的包。
 func (p *OpenAIProvider) ChatStream(c context.Context, messages []Message) (<-chan Chunk, error) {
+	// 没有 Key 就不用发请求了，直接返回业务错误码，前端会把它显示在气泡里
 	if p.cfg.APIKey == "" {
 		return nil, errorcode.ErrCodeUnKownAPIKey
 	}
@@ -48,14 +78,19 @@ func (p *OpenAIProvider) ChatStream(c context.Context, messages []Message) (<-ch
 	if err != nil {
 		return nil, fmt.Errorf("序列化请求失败: %w", err)
 	}
+	// BaseURL 来自环境变量，用户很可能写成带结尾斜杠的形式（https://x.com/），
+	// 先裁掉再拼，避免拼出 //chat/completions，openai规定多轮对话格式必须使用chat
 	url := strings.TrimRight(p.cfg.BaseURL, "/") + "/chat/completions"
+	// NewRequestWithContext 把 ctx 绑在这次请求上：此后 cancel 会真正中断 HTTP 往返。
+	// 「停止」按钮能立刻停住靠的就是这里，而不是前端单纯地不再渲染。
 	req, err := http.NewRequestWithContext(c, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("构造请求失败： %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Key 只在这一行出现，绝不能打进日志。注意它也不该写进代码或仓库，来源见 config.go
 	req.Header.Set("Authorization", "Bearer "+p.cfg.APIKey)
-	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Accept", "text/event-stream") // 明确告诉服务端要流式响应
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -63,11 +98,17 @@ func (p *OpenAIProvider) ChatStream(c context.Context, messages []Message) (<-ch
 	}
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
+		// 错误响应体只读前 4KB：正常错误 JSON 很小，但网关异常时可能返回整页 HTML，
+		// 无上限地 ReadAll 会白占内存。io.LimitReader 是这类"只取一段"场景的标准做法。
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		return nil, fmt.Errorf("服务端返回%s: %s", resp.Status, strings.TrimSpace(string(detail)))
 	}
+	// 无缓冲通道 = 天然背压：生产端每写一帧都要等消费端取走，
+	// 于是前端渲染不过来时，网络读取也会跟着慢下来，而不是把数据堆在内存里。
 	ch := make(chan Chunk)
 	go func() {
+		// defer 是后进先出，所以实际执行顺序是：先关响应体，再关通道。
+		// 这个顺序不能反——通道一关，调用方的 for range 立刻结束，会认为本轮已干净收尾。
 		defer close(ch)
 		defer resp.Body.Close()
 		p.pump(c, resp.Body, ch)
@@ -75,14 +116,26 @@ func (p *OpenAIProvider) ChatStream(c context.Context, messages []Message) (<-ch
 	return ch, nil
 }
 
+// pump 逐行读取 SSE 响应，把每一帧转成 Chunk 写进通道，是流式解析的核心。
+//
+// SSE 帧格式（OpenAI 风格）长这样，一行一帧、空行分隔：
+//
+//	data: {"choices":[{"delta":{"content":"你"},"finish_reason":null}]}
+//	: keep-alive                     ← 冒号开头的是注释/心跳，用于保活，不是内容
+//	data: [DONE]                     ← 结束哨兵，注意它不是合法 JSON
 func (p *OpenAIProvider) pump(c context.Context, r io.Reader, ch chan<- Chunk) {
 	scanner := bufio.NewScanner(r)
 
+	// bufio.Scanner 默认单行上限 64KB，超过就直接报 "token too long" 并中断整个流。
+	// 一帧增量通常只有几个字，但首帧可能带上很长的 role / 元信息，留 1MB 余量更稳。
 	scanner.Buffer(make([]byte, 0, 64<<10), 1<<20)
 
 	for scanner.Scan() {
+		// 每读一行查一次取消状态。粒度是"行"：若正卡在上一行的 ch <- 上，
+		// 要等消费端取走才会走到这里（消费端按约定读到底，所以不会真的卡死）。
 		select {
 		case <-c.Done():
+			// 把取消当成一种"结束原因"交给上层，由上层决定这算错误还是正常收场
 			ch <- Chunk{Err: c.Err()}
 			return
 		default:
@@ -90,22 +143,29 @@ func (p *OpenAIProvider) pump(c context.Context, r io.Reader, ch chan<- Chunk) {
 
 		line := strings.TrimSpace(scanner.Text())
 
+		// 空行是帧分隔符，冒号开头是心跳/注释，两者都不是内容
 		if line == "" || strings.HasPrefix(line, ":") {
 			continue
 		}
+		// 只认 data: 行。event: / id: / retry: 等 SSE 字段本项目用不上，直接跳过。
+		// 注意这是对 OpenAI 风格的简化解析：这里假定一帧就是一个完整的 JSON，
+		// 没有处理标准 SSE 允许的"多行 data 拼一个事件"的情况。
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
 
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
-			ch <- Chunk{Done: true}
+			ch <- Chunk{Done: true} // 收尾出口之一：正常结束
 			return
 		}
 		var sr streamResponse
+		// 单帧解析失败就跳过这一行，不中断整轮：服务端偶尔会插入非标准行，
+		// 为一行无效数据放弃已经收到的整段回复不划算。
 		if err := json.Unmarshal([]byte(payload), &sr); err != nil {
 			continue
 		}
+		// 首帧通常只带 role 不带 content，choices 也可能为空，两种情况都跳过
 		if len(sr.Choices) == 0 {
 			continue
 		}
@@ -114,9 +174,12 @@ func (p *OpenAIProvider) pump(c context.Context, r io.Reader, ch chan<- Chunk) {
 		}
 	}
 
+	// 收尾出口之二：读流出错（网络中断、响应体被截断等）
 	if err := scanner.Err(); err != nil {
 		ch <- Chunk{Err: fmt.Errorf("读取响应流失败: %w", err)}
 		return
 	}
+	// 收尾出口之三：连接正常读完但始终没收到 [DONE]（部分服务端如此），按正常完成处理。
+	// 走到这里说明上面的 [DONE] 分支没命中，所以不存在重复发 Done 的问题。
 	ch <- Chunk{Done: true}
 }
