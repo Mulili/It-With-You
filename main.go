@@ -1,7 +1,10 @@
 package main
 
 import (
+	"agent-for-you-love/internal/config"
 	"agent-for-you-love/internal/llm"
+	"agent-for-you-love/internal/persona/builtin"
+	"agent-for-you-love/internal/persona/store"
 	"embed"
 	"log"
 
@@ -21,12 +24,22 @@ var assets embed.FS
 var trayIcon []byte
 
 func main() {
+	// .env 只在这里加载一次，之后各包只管读环境变量（理由见 internal/config 的包注释）
+	if path := config.LoadDotEnv(); path != "" {
+		log.Printf("[config] 已加载 %s", path)
+	}
+
 	llmCfg := llm.ConfigFromEnv()
 	if llmCfg.APIKey == "" {
 		// 只是提示，不 Fatal：桌宠启动失败又看不到任何窗口，是最难排查的一类故障。
 		log.Println("[llm] 未检测到 COMPANION_LLM_API_KEY，发消息时才会报错")
 	}
-	app := NewApp(llm.NewOpenAIProvider(llmCfg))
+
+	// 人格存储：优先 PostgreSQL，连不上就退回内存实现（内置人格照常可用）。
+	// OpenStore 刻意不返回错误——数据库没起来不该让桌宠起不来。
+	personaStore := store.OpenStore(store.DSNFromEnv(), loadBuiltinPersonas())
+
+	app := NewApp(llm.NewOpenAIProvider(llmCfg), personaStore)
 
 	err := wails.Run(&options.App{
 		Title:         "AI 桌面伴侣",
@@ -84,4 +97,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("应用启动失败: %v", err)
 	}
+}
+
+// loadBuiltinPersonas 读取内置人格；失败只记日志，不让应用起不来。
+//
+// 内置人格坏掉本该在开发期被 TestBuiltinPersonasValid 拦住（它是随 exe 分发的数据，
+// 编译时就已经确定），真走到这里说明打包异常；此时让人格列表为空、应用照常启动，
+// 比直接崩掉更好排查。
+func loadBuiltinPersonas() []builtin.Entry {
+	builtins, err := builtin.Load()
+	if err != nil {
+		log.Printf("[persona] 加载内置人格失败: %v", err)
+	}
+	return builtins
 }

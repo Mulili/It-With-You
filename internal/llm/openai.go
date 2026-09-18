@@ -38,13 +38,36 @@ func NewOpenAIProvider(cfg Config) *OpenAIProvider {
 
 // chatRequest 是请求体。用结构体而不是 map 拼：字段名写错时 struct tag 至少能在审阅中被发现，
 // 而 map 的 key 写错只会被服务端静默忽略，最后表现为"模型答非所问"这种很难查的现象。
-//
-// Stream 必须为 true。若为 false，服务端会一次性返回完整 JSON（没有 SSE 帧），
-// 下面的 pump 一行都解不出来，表现是"发出去没反应"。
 type chatRequest struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
+	// Stream 为 true 时走流式（ChatStream 用）；为 false 时服务端一次性返回完整 JSON（Chat 用）。
+	// 流式那条路径下它必须为 true，否则返回体里没有 SSE 帧，pump 一行都解不出来，
+	// 表现是"发出去没反应"。
+	Stream bool `json:"stream"`
+	// ResponseFormat 只在要求 JSON 输出时带上，其余情况为 nil 并被 omitempty 省略
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+}
+
+// responseFormat 对应 OpenAI 兼容协议的 response_format 字段。
+// 目前只用 "json_object"：要求服务端保证输出可被解析为 JSON 对象。
+type responseFormat struct {
+	Type string `json:"type"`
+}
+
+// chatResponse 是**非流式**响应的结构，正文在 choices[0].message.content。
+// 它与流式的 streamResponse 形状不同（那边在 delta 里），所以各写一个。
+//
+// 注意：开了 JSON 模式时 content 仍是**一个字符串**（里面装着 JSON 文本），
+// 服务端不会把它解包成嵌套对象，解析由调用方负责。
+type chatResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+		// FinishReason 同 streamResponse，暂不使用，留给"是否被截断"的判断
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
 }
 
 // streamResponse 是响应流中「一帧」的结构，只声明用得到的字段——JSON 反序列化会自动忽略多余字段。
@@ -60,26 +83,27 @@ type streamResponse struct {
 	} `json:"choices"`
 }
 
-// ChatStream 发起一次流式对话，立即返回 Chunk 通道（Provider 接口的约定，见 types.go）。
+// newRequest 构造一次 /chat/completions 请求（含鉴权与 ctx 绑定）。
 //
-// 通道由内部 goroutine 生产。ctx 必须由调用方持有 cancel：
-// 取消时底层 HTTP 往返会被中断，pump 收到 ctx.Err() 后以 Chunk{Err} 收尾，
-// 而不是让前端自己丢弃后面的包。
-func (p *OpenAIProvider) ChatStream(c context.Context, messages []Message) (<-chan Chunk, error) {
-	// 没有 Key 就不用发请求了，直接返回业务错误码，前端会把它显示在气泡里
-	if p.cfg.APIKey == "" {
-		return nil, errorcode.ErrCodeUnKownAPIKey
+// 流式与非流式共用：URL 拼接、请求头、ctx 绑定这几件事只写一份，
+// 否则两条路径会慢慢走样（典型是加了新头只改了一边）。
+func (p *OpenAIProvider) newRequest(c context.Context, messages []Message, stream, jsonMode bool) (*http.Request, error) {
+	// 只有在要求 JSON 输出时才带 response_format；不要求时留 nil，被 omitempty 省略
+	var rf *responseFormat
+	if jsonMode {
+		rf = &responseFormat{Type: "json_object"}
 	}
 	body, err := json.Marshal(chatRequest{
-		Model:    p.cfg.Model,
-		Messages: messages,
-		Stream:   true,
+		Model:          p.cfg.Model,
+		Messages:       messages,
+		Stream:         stream,
+		ResponseFormat: rf,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("序列化请求失败: %w", err)
 	}
 	// BaseURL 来自环境变量，用户很可能写成带结尾斜杠的形式（https://x.com/），
-	// 先裁掉再拼，避免拼出 //chat/completions，openai规定多轮对话格式必须使用chat
+	// 先裁掉再拼，避免拼出 //chat/completions
 	url := strings.TrimRight(p.cfg.BaseURL, "/") + "/chat/completions"
 	// NewRequestWithContext 把 ctx 绑在这次请求上：此后 cancel 会真正中断 HTTP 往返。
 	// 「停止」按钮能立刻停住靠的就是这里，而不是前端单纯地不再渲染。
@@ -90,11 +114,21 @@ func (p *OpenAIProvider) ChatStream(c context.Context, messages []Message) (<-ch
 	req.Header.Set("Content-Type", "application/json")
 	// Key 只在这一行出现，绝不能打进日志。注意它也不该写进代码或仓库，来源见 config.go
 	req.Header.Set("Authorization", "Bearer "+p.cfg.APIKey)
-	req.Header.Set("Accept", "text/event-stream") // 明确告诉服务端要流式响应
+	if stream {
+		req.Header.Set("Accept", "text/event-stream") // 明确告诉服务端要流式响应
+	}
+	return req, nil
+}
 
+// send 发一次请求并检查状态码，返回可读的响应体（**调用方负责 Close**）。
+func (p *OpenAIProvider) send(c context.Context, messages []Message, stream, jsonMode bool) (*http.Response, error) {
+	req, err := p.newRequest(c, messages, stream, jsonMode)
+	if err != nil {
+		return nil, err
+	}
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("请求%s 失败： %w", url, err)
+		return nil, fmt.Errorf("请求%s 失败： %w", req.URL, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
@@ -102,6 +136,55 @@ func (p *OpenAIProvider) ChatStream(c context.Context, messages []Message) (<-ch
 		// 无上限地 ReadAll 会白占内存。io.LimitReader 是这类"只取一段"场景的标准做法。
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		return nil, fmt.Errorf("服务端返回%s: %s", resp.Status, strings.TrimSpace(string(detail)))
+	}
+	return resp, nil
+}
+
+// Chat 非流式地要一次完整回复，返回模型输出的正文（字符串）。
+//
+// 为什么要有非流式：流式是"给人看着舒服"，而抽取类场景（从对话里抽槽位、抽事实）
+// 要的是机器可用的一整块结果，半个 JSON 没法解析，只能等完整响应。
+//
+// 本层不假设返回内容一定是 JSON——只负责把正文取出来，解析与校验由调用方做。
+func (p *OpenAIProvider) Chat(c context.Context, messages []Message, opts ChatOptions) (string, error) {
+	// 没有 Key 就不用发请求了，直接返回业务错误码
+	if p.cfg.APIKey == "" {
+		return "", errorcode.ErrCodeUnKownAPIKey
+	}
+	resp, err := p.send(c, messages, false, opts.JSON)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	// 抽取结果通常只有几百字节，但仍加上限兜底，避免异常情况下读进一整页垃圾
+	var cr chatResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&cr); err != nil {
+		return "", fmt.Errorf("解析响应失败: %w", err)
+	}
+	if len(cr.Choices) == 0 {
+		return "", fmt.Errorf("服务端未返回任何选择项")
+	}
+	content := cr.Choices[0].Message.Content
+	if content == "" {
+		return "", fmt.Errorf("服务端返回了空内容")
+	}
+	return content, nil
+}
+
+// ChatStream 发起一次流式对话，立即返回 Chunk 通道（Provider 接口的约定，见 types.go）。
+//
+// 通道由内部 goroutine 生产。ctx 必须由调用方持有 cancel：
+// 取消时底层 HTTP 往返会被中断，pump 收到 ctx.Err() 后以 Chunk{Err} 收尾，
+// 而不是让前端自己丢弃后面的包。
+func (p *OpenAIProvider) ChatStream(c context.Context, messages []Message) (<-chan Chunk, error) {
+	// 没有 Key 就不用发请求了，直接返回业务错误码，前端会把它显示在气泡里
+	if p.cfg.APIKey == "" {
+		return nil, errorcode.ErrCodeUnKownAPIKey
+	}
+	resp, err := p.send(c, messages, true, false)
+	if err != nil {
+		return nil, err
 	}
 	// 无缓冲通道 = 天然背压：生产端每写一帧都要等消费端取走，
 	// 于是前端渲染不过来时，网络读取也会跟着慢下来，而不是把数据堆在内存里。

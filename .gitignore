@@ -15,3 +15,6 @@ node_modules
 
 # 测试图片不必上传
 frontend/src/assets
+
+# 
+operation.md

@@ -10,6 +10,10 @@ const (
 	EventChatChunk = "chat:chunk"
 	EventChatDone  = "chat:done"
 	EventChatError = "chat:error"
+
+	// EventPersonaChanged 是人格被改动的通知（阶段3）。
+	// 用途有二：显式指令写入后的回执（让用户知道"它记住了"）、设置浮层开着时刷新。
+	EventPersonaChanged = "persona:changed"
 )
 
 // SayPayload 是 EventSay 事件的负载。
@@ -36,4 +40,17 @@ type ChatDonePayload struct {
 type ChatErrorPayload struct {
 	ID      string `json:"id"`
 	Message string `json:"message"`
+}
+
+// PersonaChangedPayload 是一条人格变更通知。
+//
+// Summary 是后端组装好的中文短句，前端可以直接显示（例如"已记住：称呼 → 主人"）——
+// 把文案留给后端，是为了让"有没有真的记住、记的是什么"只有一处真相。
+type PersonaChangedPayload struct {
+	PersonaID string `json:"personaId"`
+	// Action 形如 create / update / delete / enable / disable（见 persona 包的 Action* 常量）
+	Action  string `json:"action"`
+	Slot    string `json:"slot"`
+	Value   string `json:"value"`
+	Summary string `json:"summary"`
 }

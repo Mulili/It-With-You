@@ -10,6 +10,10 @@ export function Cancel() {
   return window['go']['main']['App']['Cancel']();
 }
 
+export function GetPersonaSnapshot() {
+  return window['go']['main']['App']['GetPersonaSnapshot']();
+}
+
 export function HideWindow() {
   return window['go']['main']['App']['HideWindow']();
 }
@@ -24,6 +28,10 @@ export function Quit() {
 
 export function Say(arg1) {
   return window['go']['main']['App']['Say'](arg1);
+}
+
+export function SetActivePersona(arg1) {
+  return window['go']['main']['App']['SetActivePersona'](arg1);
 }
 
 export function SetMenuOpen(arg1) {

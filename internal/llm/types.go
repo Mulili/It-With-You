@@ -5,6 +5,9 @@
 //
 // 流式输出的通路（阶段2 的关键决策）：Wails 前端拿不到 Go 的流，所以 ChatStream 返回通道，
 // App 层每收到一个 chunk 就用 runtime.EventsEmit 往前端推一次，前端用 EventsOn 增量渲染。
+// 除流式外，这里还提供非流式的 Chat：抽取类场景（从对话里抽槽位、抽事实）需要一整块
+// 可解析的 JSON，半个 JSON 没法解析，所以不能用流式。阶段3 的人格抽取与阶段4 的记忆抽取都走它。
+//
 // 事件名统一定义在 internal/ui/events.go，两端共用。
 package llm
 
@@ -41,4 +44,20 @@ type Chunk struct {
 type Provider interface {
 	// ChatStream 以流式方式返回回复，chunk 通道关闭表示本轮结束。
 	ChatStream(ctx context.Context, messages []Message) (<-chan Chunk, error)
+
+	// Chat 非流式地要一次完整回复，返回模型输出的正文。
+	//
+	// 与 ChatStream 的分工：流式给人看（逐字上屏），非流式给机器用
+	// （从对话里抽槽位、抽事实这类场景要一整块可解析的结果，半个 JSON 没法解析）。
+	// 返回的是模型原样输出的字符串，本层不假设它是 JSON，解析由调用方负责。
+	Chat(ctx context.Context, messages []Message, opts ChatOptions) (string, error)
+}
+
+// ChatOptions 是非流式对话的可选项。零值表示"普通文本回复"。
+type ChatOptions struct {
+	// JSON 为 true 时要求服务端输出可解析的 JSON 对象（response_format: json_object）。
+	//
+	// 注意：OpenAI 与 DeepSeek 都要求**提示词里出现 "json" 字样**才会接受这个参数，
+	// 否则会直接报错。这是调用方的责任，本层不做校验也不做改写。
+	JSON bool
 }
