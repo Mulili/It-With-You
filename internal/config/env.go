@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -58,6 +59,23 @@ func Get(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// GetInt 读环境变量并解析成整数；缺失**或解析失败**时返回默认值。
+//
+// 解析失败也回落默认值（而不是报错）：一个格式写错的配置项不该让应用起不来。
+// 代价是"写错了却看不出来"，所以需要严格校验的调用方要自己再验一次——
+// 例如嵌入维度，会在启动时与服务端实际返回的维度比对（见 llm.Embedder 的 Verify）。
+func GetInt(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 func loadDotEnvAt(path string) string {

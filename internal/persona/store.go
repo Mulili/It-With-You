@@ -32,8 +32,25 @@ type Store interface {
 	// Snapshot 返回前端渲染设置页所需的全部数据
 	Snapshot() Snapshot
 
+	// RulesOf 返回**指定**人格的规则（已排序）。
+	// 编辑器要能改任意人格（含非当前人格），而 Snapshot 只带当前人格的规则。
+	RulesOf(personaID string) ([]PersonaRule, error)
+
+	// ChangesOf 返回**指定**人格的最近变更记录（时间倒序，最多 SnapshotChangeLimit 条）。
+	// 与 RulesOf 同理：变更记录也是"这一个个体"的私事，而编辑器要能看任意人格的。
+	ChangesOf(personaID string) ([]PersonaChange, error)
+
 	SaveSeedText(personaID, text string) error
 	SetActivePersona(id string) error
+
+	// ThinkingDisabled 报告用户是否关掉了思考模式。
+	//
+	// 默认 false = 跟随官方默认（DeepSeek 的思考模式默认开启）。
+	// 它是**应用级**设置、不属于任何人格，所以不放进 Snapshot——那里装的是"这个人格"的数据。
+	ThinkingDisabled() (bool, error)
+	// SetThinkingDisabled 保存思考开关（落 app_settings；PG 连不上时随内存一起丢，与人格同命运）。
+	SetThinkingDisabled(disabled bool) error
+
 	CreatePersona(name, copyFromID string) (string, error)
 	RenamePersona(id, name string) error
 	DeletePersona(id string) error

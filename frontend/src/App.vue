@@ -1,8 +1,14 @@
 <script setup>
 import petImg from './assets/pet.png'
-import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import Bubble from './components/Bubble.vue'
-import { Ask, Cancel, Say, HideWindow, Quit, History, SetMenuOpen, GetPersonaSnapshot, SetActivePersona } from '../wailsjs/go/main/App'
+import {
+  Ask, Cancel, Say, HideWindow, Quit, History, SetMenuOpen,
+  GetPersonaSnapshot, SetActivePersona, GetPersonaRules, GetPersonaChanges, GetPersonaMeta,
+  CreatePersona, RenamePersona, DeletePersona, SaveSeedText,
+  SaveRule, DeleteRule, SetRuleEnabled,
+  GetSettings, SetThinkingDisabled, ExportPersonaToFile, ImportPersonaFromFile,
+} from '../wailsjs/go/main/App'
 import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime'
 
 // 与 Go 侧 internal/ui/events.go 里的常量保持一致
@@ -28,6 +34,11 @@ const activePersonaId = ref('')
 // 后端有没有连上持久化存储（PG）。false 时自建人格不会保存，界面要如实说明
 const storageReady = ref(true)
 
+// 全局设置（⑨）。思考开关是应用级的，不属于任何人格，所以不塞进人格快照里
+const settings = ref({ thinkingDisabled: false })
+// 导出哪个人格；空串 = 用当前生效的那个
+const exportId = ref('')
+
 async function loadPersona() {
   try {
     const snap = await GetPersonaSnapshot()
@@ -51,6 +62,84 @@ async function loadHistory() {
   }
 }
 
+// ---------- 设置（⑨）----------
+
+async function loadSettings() {
+  try {
+    const s = await GetSettings()
+    settings.value = { thinkingDisabled: s?.thinkingDisabled ?? false }
+  } catch (e) {
+    console.error('读取设置失败', e)
+  }
+}
+
+// 思考开关。文案里要如实说出代价：关掉换来的是"快"，代价是复杂推理会变弱，
+// 不能只说"更快了"——用户第二天遇到模型答错时会不知道是自己关的。
+async function toggleThinking() {
+  const next = !settings.value.thinkingDisabled
+  try {
+    await SetThinkingDisabled(next)
+    settings.value.thinkingDisabled = next
+    showToast(next ? '已关闭思考：回复更快，复杂推理会变弱' : '已开启思考：回复更稳，首字更慢')
+  } catch (e) {
+    showToast('保存失败：' + errText(e))
+  }
+}
+
+// 导出选中的那个人格（没选就是当前人格）。
+// 内置人格也允许导出——那正是"产出自己的人格"的通道：在应用里调好再导出来。
+async function exportPersona() {
+  const id = exportId.value || activePersonaId.value
+  if (!id) return
+  try {
+    const path = await ExportPersonaToFile(id)
+    if (!path) return // 用户取消了保存对话框，不是错误
+    showToast('已导出到 ' + path)
+  } catch (e) {
+    showToast('导出失败：' + errText(e))
+  }
+}
+
+// 导入：同名不覆盖，后端会存成一份副本，所以这里只要刷新列表并把新名字报出来
+async function importPersona() {
+  try {
+    const p = await ImportPersonaFromFile()
+    if (!p || !p.id) return // 用户取消了打开对话框
+    await loadPersona()
+    showToast(`已导入为「${p.name}」`)
+  } catch (e) {
+    showToast('导入失败：' + errText(e))
+  }
+}
+
+// ---------- 数据库未就绪时阻断（⑪）----------
+//
+// 数据库是**硬性要求**：人格不持久，等于"随对话成长"这件事不存在，重启就回到出厂状态——
+// 那是个假陪伴。所以这里不是"提示一下、继续用"，而是明确挡住，同时把"该怎么修"直接摆在眼前。
+//
+// 形态上选"启动但阻断"而不是"启动即退出"：桌面应用闪退是最难排查的故障（本项目的
+// README 里就记着这条教训）。一个看得见的说明页，用户能自己走完，也知道自己卡在哪一步。
+
+// dbReady 为 false 时整个界面进入阻断态
+const dbReady = computed(() => storageReady.value !== false)
+
+// 能命令代劳的两步。装 PostgreSQL 本身没法代劳，只在文案里指路（README 有完整步骤）。
+const setupCmd = [
+  'psql -U postgres -c "CREATE DATABASE companion;"',
+  'psql -U postgres -d companion -c "CREATE EXTENSION IF NOT EXISTS vector;"',
+].join('\n')
+
+async function copySetupCmd() {
+  try {
+    await navigator.clipboard.writeText(setupCmd)
+    showToast('命令已复制')
+  } catch (e) {
+    // WebView2 里 clipboard API 可能因非 secure context 不可用。不静默失败：
+    // 告诉用户可以手动选中——那个 textarea 本来就是可选的。
+    showToast('复制失败，请手动选中命令再复制')
+  }
+}
+
 // 切换人格：立即生效（后端每轮现拼 system）。历史按人格隔离，所以切完要重新拉一份——
 // 看到的是**那个人格自己的**对话，而不是上一个人格聊过的内容。
 async function switchPersona(p) {
@@ -66,6 +155,264 @@ async function switchPersona(p) {
   } catch (e) {
     console.error('切换人格失败', e)
     showToast('切换人格失败：' + (e?.message ?? e))
+  }
+}
+
+// ---------- 人格编辑器（⑧ 最小片）----------
+//
+// 两层视图：列表（点一行 = 切换人格）→ 详情（主体文本 / 重命名 / 删除 / 复制 + 规则增删改停用 + 变更记录）。
+//
+// 表单与"删除确认"都做在浮层内，刻意不用 window.prompt / window.confirm：
+// WebView2 对 prompt 的支持不可靠，而且系统对话框会盖住这个 340px 的小窗，观感很突兀。
+// 槽位清单与各字段的字数上限都来自后端（GetPersonaMeta），不在前端硬编码一份会走样的表。
+
+const slots = ref([])          // 规范槽位清单，由后端 SlotSpecs() 提供
+// 各字段的字数上限。先给一份保守默认值，取到真值前按钮也能用（后端仍会兜底校验）
+const limits = ref({ seedTextRunes: 1200, ruleValueRunes: 200, injectBudgetRunes: 1500 })
+const detailId = ref('')       // 空 = 列表视图；否则为正在查看的人格 ID
+const detailRules = ref([])    // 详情页里那个人格的规则
+const detailChanges = ref([])  // 详情页里那个人格的最近变更（时间倒序）
+const seedForm = ref(null)     // null = 未在编辑；否则为 { text }
+const ruleForm = ref(null)     // null = 未在编辑；否则为表单内容（id 为空即新增）
+const nameForm = ref(null)     // { mode: 'create' | 'rename', name, copyFrom }
+const confirmDelete = ref(false)
+const formError = ref('')
+
+const detailPersona = computed(
+  () => personaList.value.find((p) => p.id === detailId.value) ?? null,
+)
+
+// 内置人格只读：能给出的入口只有「复制为我的」。
+// 不让写操作的按钮显示出来，比"点了才报错"友好——后端的拒绝信息是给排查用的，不该当交互反馈。
+const canEdit = computed(() => !!detailPersona.value && !detailPersona.value.isBuiltin)
+
+function slotLabel(key) {
+  return slots.value.find((s) => s.key === key)?.label ?? key
+}
+
+// 规则来源：让人一眼看出"这条是它自己记下的，还是我手动写的"
+function sourceLabel(src) {
+  return { manual: '手动', explicit: '你的要求', inferred: '自动' }[src] ?? src
+}
+
+function tierLabel(tier) {
+  return { core: '核心', recent: '近期', archived: '归档' }[tier] ?? tier
+}
+
+// 变更记录里的 field：主体字段是固定的英文名，规则字段直接是槽位 key
+function fieldLabel(field) {
+  return { seedText: '主体文本', name: '名称' }[field] ?? slotLabel(field)
+}
+
+function actionLabel(action) {
+  return { create: '新增', update: '修改', delete: '删除', enable: '启用', disable: '停用' }[action] ?? action
+}
+
+async function loadMeta() {
+  if (slots.value.length) return
+  try {
+    const m = await GetPersonaMeta()
+    slots.value = m?.slots ?? []
+    limits.value = {
+      seedTextRunes: m?.seedTextRunes ?? 1200,
+      ruleValueRunes: m?.ruleValueRunes ?? 200,
+      injectBudgetRunes: m?.injectBudgetRunes ?? 1500,
+    }
+  } catch (e) {
+    console.error('读取元信息失败', e)
+  }
+}
+
+async function loadRules(id) {
+  try {
+    detailRules.value = (await GetPersonaRules(id)) ?? []
+  } catch (e) {
+    detailRules.value = []
+    console.error('读取规则失败', e)
+  }
+}
+
+async function loadChanges(id) {
+  try {
+    detailChanges.value = (await GetPersonaChanges(id)) ?? []
+  } catch (e) {
+    detailChanges.value = []
+    console.error('读取变更记录失败', e)
+  }
+}
+
+function resetForms() {
+  seedForm.value = null
+  ruleForm.value = null
+  nameForm.value = null
+  confirmDelete.value = false
+  formError.value = ''
+}
+
+async function openDetail(p) {
+  resetForms()
+  detailId.value = p.id
+  await Promise.all([loadRules(p.id), loadChanges(p.id)])
+}
+
+function closeDetail() {
+  resetForms()
+  detailId.value = ''
+}
+
+function startCreate() {
+  resetForms()
+  // 复制来源取"当前查看的人格"，列表里没有查看对象时退回当前生效人格
+  nameForm.value = { mode: 'create', name: '', copyFrom: true }
+}
+
+function startRename() {
+  resetForms()
+  nameForm.value = { mode: 'rename', name: detailPersona.value?.name ?? '' }
+}
+
+async function saveNameForm() {
+  const f = nameForm.value
+  if (!f) return
+  const name = f.name.trim()
+  if (!name) {
+    formError.value = '人格名不能为空'
+    return
+  }
+  try {
+    if (f.mode === 'create') {
+      const source = f.copyFrom ? (detailId.value || activePersonaId.value) : ''
+      const id = await CreatePersona(name, source)
+      nameForm.value = null
+      await loadPersona()
+      // 建完直接进它的详情页，方便接着加规则
+      const created = personaList.value.find((p) => p.id === id)
+      if (created) await openDetail(created)
+    } else {
+      await RenamePersona(detailId.value, name)
+      nameForm.value = null
+      await loadPersona()
+    }
+  } catch (e) {
+    formError.value = errText(e)
+  }
+}
+
+// 「复制为我的」：内置人格只读，想改就得先有一份自己的
+async function copyPersona() {
+  const name = (detailPersona.value?.name ?? '人格') + '（我的）'
+  try {
+    const id = await CreatePersona(name, detailId.value)
+    await loadPersona()
+    const created = personaList.value.find((p) => p.id === id)
+    if (created) await openDetail(created)
+  } catch (e) {
+    formError.value = errText(e)
+  }
+}
+
+async function removePersona() {
+  try {
+    await DeletePersona(detailId.value)
+    closeDetail()
+    // 删除会连带清掉该人格的历史，所以两张都要重拉
+    await Promise.all([loadPersona(), loadHistory()])
+  } catch (e) {
+    formError.value = errText(e)
+  }
+}
+
+// 主体文本 = 用户最初写下的那段提示词，注入时放在最前面，也是"这个人格是谁"的定义。
+// 它不在规则表里，而在 personas.seed_text 这一列上，所以走单独的 SaveSeedText。
+function startEditSeed() {
+  resetForms()
+  seedForm.value = { text: detailPersona.value?.seedText ?? '' }
+}
+
+async function saveSeedForm() {
+  const f = seedForm.value
+  if (!f) return
+  const text = f.text.trim()
+  if (!text) {
+    formError.value = '主体文本不能为空'
+    return
+  }
+  try {
+    await SaveSeedText(detailId.value, text)
+    seedForm.value = null
+    formError.value = ''
+    // 主体文本是人格列表里那一行的摘要，改完列表要跟着变
+    await loadPersona()
+  } catch (e) {
+    formError.value = errText(e)
+  }
+}
+
+function startAddRule() {
+  resetForms()
+  ruleForm.value = {
+    id: '',
+    personaId: detailId.value,
+    slot: slots.value[0]?.key ?? '',
+    value: '',
+    tier: 'core',
+    // 手动新增默认 0（同层里排最后）。内置人格用 10/8/6/5 分档，想插到前面就自己调大
+    priority: 0,
+  }
+}
+
+function startEditRule(r) {
+  resetForms()
+  ruleForm.value = {
+    id: r.id,
+    personaId: r.personaId,
+    slot: r.slot,
+    value: r.value,
+    tier: r.tier,
+    priority: r.priority ?? 0,
+  }
+}
+
+async function saveRuleForm() {
+  const f = ruleForm.value
+  if (!f) return
+  if (!f.value.trim()) {
+    formError.value = '取值不能为空'
+    return
+  }
+  try {
+    // id 为空即新增；单值槽位再写入是"覆盖"，后端负责沿用原规则 ID
+    await SaveRule({
+      id: f.id,
+      personaId: f.personaId,
+      slot: f.slot,
+      value: f.value.trim(),
+      tier: f.tier,
+      priority: Number(f.priority) || 0,
+    })
+    ruleForm.value = null
+    formError.value = ''
+    await loadRules(detailId.value)
+  } catch (e) {
+    formError.value = errText(e)
+  }
+}
+
+async function removeRule(r) {
+  try {
+    await DeleteRule(r.id)
+    await loadRules(detailId.value)
+  } catch (e) {
+    showToast('删除规则失败：' + errText(e))
+  }
+}
+
+async function toggleRule(r) {
+  try {
+    await SetRuleEnabled(r.id, !r.enabled)
+    await loadRules(detailId.value)
+  } catch (e) {
+    showToast('操作失败：' + errText(e))
   }
 }
 
@@ -87,15 +434,24 @@ function showToast(text) {
 function onPersonaChanged(p) {
   if (!p || !p.summary) return
   showToast(p.summary)
+  if (!menuOpen.value) return
   // 当前人格可能被后端换掉了（例如对内置人格提要求时自动复制一份"我的"），
   // 菜单开着就刷新列表，否则用户会看到一份过期的清单
-  if (menuOpen.value) loadPersona()
+  loadPersona()
+  // 删除人格、切换人格都会影响"当前人格的历史"，历史页可能正开着
+  loadHistory()
+  // 详情页开着就同步它那份规则与变更记录：改这两样的入口不止编辑器一处
+  // （"记住我的要求"也会写），变更记录更是每写必增
+  if (detailId.value && detailId.value === p.personaId) {
+    loadRules(detailId.value)
+    loadChanges(detailId.value)
+  }
 }
 
 async function openMenu() {
   menuOpen.value = true
   SetMenuOpen(true)
-  await Promise.all([loadHistory(), loadPersona()])
+  await Promise.all([loadHistory(), loadPersona(), loadMeta(), loadSettings()])
 }
 
 function closeMenu() {
@@ -155,7 +511,8 @@ watch(busy, (running) => {
 
 async function send() {
   const text = draft.value.trim()
-  if (!text || busy.value) return
+  // dbReady 这一道是防御：阻断层已经盖住了输入区，但回车键仍可能走到这里
+  if (!text || busy.value || !dbReady.value) return
 
   draft.value = ''
   bubbleText.value = ''
@@ -210,13 +567,22 @@ function onError(p) {
   bubbleText.value = p.message
 }
 
-onMounted(() => {
+onMounted(async () => {
   EventsOn(EVENT_SAY, onSayEvent)
   EventsOn(EVENT_CHUNK, onChunk)
   EventsOn(EVENT_DONE, onDone)
   EventsOn(EVENT_ERROR, onError)
   EventsOn(EVENT_PERSONA_CHANGED, onPersonaChanged)
-  setTimeout(() => say('你好呀，我已经驻留在你的桌面上了～'), 500)
+
+  // 先把存储状态问出来，再决定说什么。
+  // 顺序不能反：数据库没就绪时该立刻进阻断态，而不是等用户点开菜单才知道
+  // （那时他已经开始打字了，白写一段话）。
+  await loadPersona()
+  if (storageReady.value === false) {
+    say('数据库未连接')
+    return
+  }
+  say('数据库已连接desu')
 })
 
 onUnmounted(() => {
@@ -232,7 +598,14 @@ onUnmounted(() => {
 <template>
   <div class="companion">
     <header class="dragbar">
-      <button class="dragbar__icon" title="历史记录" @click="toggleMenu">☰</button>
+      <button
+        class="dragbar__icon"
+        :disabled="!dbReady"
+        title="历史记录"
+        @click="toggleMenu"
+      >
+        ☰
+      </button>
       <span class="dragbar__title">With-You</span>
       <button class="dragbar__btn" title="隐藏到托盘" @click="onHide()">×</button>
     </header>
@@ -263,6 +636,13 @@ onUnmounted(() => {
           >
             人格
           </button>
+          <button
+            class="menu__tab"
+            :class="{ 'menu__tab--on': menuTab === 'settings' }"
+            @click="menuTab = 'settings'"
+          >
+            设置
+          </button>
         </nav>
 
         <template v-if="menuTab === 'history'">
@@ -285,32 +665,308 @@ onUnmounted(() => {
           </ul>
         </template>
 
-        <template v-else>
+        <template v-else-if="menuTab === 'persona'">
           <p v-if="!storageReady" class="menu__warn">
             数据库未连接：自建人格不会保存，当前只能用内置人格
           </p>
-          <p v-if="!personaList.length" class="menu__empty">没有可用的人格</p>
-          <ul v-else class="menu__list">
-            <li
-              v-for="p in personaList"
-              :key="p.id"
-              class="menu__item menu__item--pick"
-              :class="{ 'menu__item--on': p.id === activePersonaId }"
-              :title="p.id === activePersonaId ? '当前人格' : '点一下切换到这个人格'"
-              @click="switchPersona(p)"
-            >
-              <div class="menu__meta">
-                <span>{{ p.name }}</span>
-                <span v-if="p.isBuiltin" class="menu__tag">内置</span>
-                <span v-if="p.id === activePersonaId" class="menu__tag menu__tag--on">当前</span>
+
+          <!-- 名称表单：新建与重命名共用，两种视图里都能出现 -->
+          <div v-if="nameForm" class="form">
+            <p class="form__title">{{ nameForm.mode === 'create' ? '新建人格' : '重命名人格' }}</p>
+            <label class="form__row">
+              <span class="form__label">人格名</span>
+              <input v-model="nameForm.name" class="form__input" type="text" @keydown.enter="saveNameForm" />
+            </label>
+            <label v-if="nameForm.mode === 'create'" class="form__check">
+              <input v-model="nameForm.copyFrom" type="checkbox" />
+              <span>复制现有规则（内置人格不能直接改，通常要复制一份）</span>
+            </label>
+            <p v-if="formError" class="form__err">{{ formError }}</p>
+            <div class="form__btns">
+              <button class="btn btn--ghost" @click="nameForm = null">取消</button>
+              <button class="btn" @click="saveNameForm">保存</button>
+            </div>
+          </div>
+
+          <!-- 详情：改名 / 删除 / 复制 + 规则增删改停用 -->
+          <div v-if="detailId" class="pane">
+            <div class="bar">
+              <button class="iconbtn" title="返回列表" @click="closeDetail">←</button>
+              <span class="bar__name">{{ detailPersona?.name ?? detailId }}</span>
+              <span v-if="detailPersona?.isBuiltin" class="menu__tag">内置</span>
+              <span v-if="detailId === activePersonaId" class="menu__tag menu__tag--on">当前</span>
+              <button
+                v-if="detailPersona && detailId !== activePersonaId"
+                class="btn btn--ghost bar__switch"
+                @click="switchPersona(detailPersona)"
+              >
+                切到它
+              </button>
+            </div>
+
+            <p v-if="!canEdit" class="pane__note">
+              内置人格只读：名字与规则都改不了。想改就先「复制为我的」，会得到一份完全一样的副本。
+            </p>
+
+            <div class="ops">
+              <button v-if="canEdit" class="btn btn--ghost" @click="startRename">重命名</button>
+              <button v-else class="btn btn--ghost" @click="copyPersona">复制为我的</button>
+              <button v-if="canEdit" class="btn btn--ghost" @click="confirmDelete = true">删除</button>
+            </div>
+
+            <div v-if="confirmDelete" class="form form--danger">
+              <p class="form__warn">
+                删除「{{ detailPersona?.name }}」会一并删掉它的规则与「该人格的对话历史」，不可恢复。
+              </p>
+              <div class="form__btns">
+                <button class="btn btn--ghost" @click="confirmDelete = false">取消</button>
+                <button class="btn btn--danger" @click="removePersona">确认删除</button>
               </div>
-              <p class="menu__text">{{ p.seedText }}</p>
-            </li>
-          </ul>
-          <p class="menu__hint">切换后立即生效；每个人格有各自独立的对话历史</p>
+            </div>
+
+            <!-- 主体文本：人格的「我是谁」，注入时排在最前，也是人格列表里的那行摘要 -->
+            <div class="rules__head">
+              <span>主体文本</span>
+              <button
+                v-if="canEdit && !seedForm"
+                class="btn btn--ghost"
+                @click="startEditSeed"
+              >
+                编辑
+              </button>
+            </div>
+            <div v-if="seedForm" class="form">
+              <textarea
+                v-model="seedForm.text"
+                class="form__area"
+                rows="5"
+                :maxlength="limits.seedTextRunes"
+                placeholder="写清楚它是谁、怎么说话、怎么称呼你"
+              ></textarea>
+              <p class="form__count">{{ seedForm.text.length }} / {{ limits.seedTextRunes }}</p>
+              <p v-if="formError" class="form__err">{{ formError }}</p>
+              <div class="form__btns">
+                <button class="btn btn--ghost" @click="seedForm = null">取消</button>
+                <button class="btn" @click="saveSeedForm">保存</button>
+              </div>
+            </div>
+            <p v-else class="seed__text">
+              {{ detailPersona?.seedText || '（还没有写主体文本）' }}
+            </p>
+
+            <div class="rules__head">
+              <span>规则（{{ detailRules.length }}）</span>
+              <button v-if="canEdit" class="btn btn--ghost" @click="startAddRule">+ 添加</button>
+            </div>
+            <p v-if="!detailRules.length" class="pane__note">
+              还没有规则。{{ canEdit ? '点「+ 添加」写一条，例如「称呼用户 = 老板」。' : '' }}
+            </p>
+            <p v-else class="pane__note">
+              注入有 {{ limits.injectBudgetRunes }} 字预算：超预算先截「近期」层，主体与核心层不截。
+            </p>
+            <ul v-if="detailRules.length" class="rules">
+              <li
+                v-for="r in detailRules"
+                :key="r.id"
+                class="rule"
+                :class="{ 'rule--off': !r.enabled }"
+              >
+                <div
+                  class="rule__main"
+                  :title="canEdit ? '点一下编辑这条规则' : '内置人格的规则只读'"
+                  @click="canEdit && startEditRule(r)"
+                >
+                  <div class="rule__meta">
+                    <span class="rule__slot">{{ slotLabel(r.slot) }}</span>
+                    <span class="menu__tag">{{ sourceLabel(r.source) }}</span>
+                    <span class="menu__tag">{{ tierLabel(r.tier) }}</span>
+                    <!-- 0 是默认值，不显示，免得每行都挂一个没有信息量的标 -->
+                    <span
+                      v-if="r.priority"
+                      class="menu__tag"
+                      title="优先级：同一层内越大越先注入"
+                    >
+                      P{{ r.priority }}
+                    </span>
+                    <span v-if="!r.enabled" class="menu__tag">已停用</span>
+                  </div>
+                  <p class="rule__value">{{ r.value }}</p>
+                </div>
+                <div v-if="canEdit" class="rule__acts">
+                  <button
+                    class="iconbtn"
+                    :title="r.enabled ? '停用（仍保留，可再启用）' : '启用'"
+                    @click="toggleRule(r)"
+                  >
+                    {{ r.enabled ? '停' : '启' }}
+                  </button>
+                  <button class="iconbtn" title="删除这条规则" @click="removeRule(r)">删</button>
+                </div>
+              </li>
+            </ul>
+
+            <div v-if="ruleForm" class="form">
+              <p class="form__title">{{ ruleForm.id ? '编辑规则' : '新增规则' }}</p>
+              <label class="form__row">
+                <span class="form__label">槽位</span>
+                <select v-model="ruleForm.slot" class="form__input">
+                  <option v-for="s in slots" :key="s.key" :value="s.key">
+                    {{ s.label }}{{ s.multi ? '（可多条）' : '' }}
+                  </option>
+                </select>
+              </label>
+              <label class="form__row">
+                <span class="form__label">取值</span>
+                <input
+                  v-model="ruleForm.value"
+                  class="form__input"
+                  type="text"
+                  :maxlength="limits.ruleValueRunes"
+                  @keydown.enter="saveRuleForm"
+                />
+              </label>
+              <label class="form__row">
+                <span class="form__label">层级</span>
+                <select v-model="ruleForm.tier" class="form__input">
+                  <option value="core">核心（永不被预算截断）</option>
+                  <option value="recent">近期（参与预算，可能被截）</option>
+                </select>
+              </label>
+              <label class="form__row">
+                <span class="form__label">优先级</span>
+                <input v-model.number="ruleForm.priority" class="form__input" type="number" />
+              </label>
+              <p class="form__hint">
+                层级决定「会不会被预算截断」；优先级只管同一层内谁先注入（越大越先，内置人格用 10/8/6/5 分档）。
+              </p>
+              <p v-if="formError" class="form__err">{{ formError }}</p>
+              <div class="form__btns">
+                <button class="btn btn--ghost" @click="ruleForm = null">取消</button>
+                <button class="btn" @click="saveRuleForm">保存</button>
+              </div>
+            </div>
+
+            <!-- 变更记录：回溯"它什么时候被我改成这样的"，只读。
+                 与规则同放在详情里而不是另开一个 tab：看规则时最想知道的往往就是它怎么变成现在这样 -->
+            <div class="rules__head">
+              <span>变更记录（{{ detailChanges.length }}）</span>
+            </div>
+            <p v-if="!detailChanges.length" class="pane__note">
+              还没有变更记录。改主体文本、名字、规则都会在这里留一条。
+            </p>
+            <ul v-else class="changes">
+              <li v-for="c in detailChanges" :key="c.id" class="change">
+                <div class="rule__meta">
+                  <span class="rule__slot">{{ fieldLabel(c.field) }}</span>
+                  <span class="menu__tag">{{ actionLabel(c.action) }}</span>
+                  <span class="menu__tag">{{ sourceLabel(c.source) }}</span>
+                  <span class="change__time">{{ fmtTime(c.createdAt) }}</span>
+                </div>
+                <!-- 启用/停用这类动作没有取值新旧，只有标签，所以整行可省 -->
+                <p v-if="c.oldValue || c.newValue" class="change__val">
+                  <span v-if="c.oldValue" class="change__old">{{ c.oldValue }}</span>
+                  <span v-if="c.oldValue && c.newValue" class="change__arrow">→</span>
+                  <span v-if="c.newValue">{{ c.newValue }}</span>
+                </p>
+                <p v-if="c.evidence" class="change__ev">「{{ c.evidence }}」</p>
+              </li>
+            </ul>
+          </div>
+
+          <!-- 列表：点一行切换人格，点「改」进详情 -->
+          <div v-else class="pane">
+            <p v-if="!personaList.length" class="menu__empty">没有可用的人格</p>
+            <ul v-else class="menu__list menu__list--flat">
+              <li
+                v-for="p in personaList"
+                :key="p.id"
+                class="menu__item menu__item--pick"
+                :class="{ 'menu__item--on': p.id === activePersonaId }"
+                :title="p.id === activePersonaId ? '当前人格' : '点一下切换到这个人格'"
+                @click="switchPersona(p)"
+              >
+                <div class="menu__meta">
+                  <span>{{ p.name }}</span>
+                  <span v-if="p.isBuiltin" class="menu__tag">内置</span>
+                  <span v-if="p.id === activePersonaId" class="menu__tag menu__tag--on">当前</span>
+                  <button
+                    class="iconbtn meta__edit"
+                    title="编辑这个人格的名字与规则"
+                    @click.stop="openDetail(p)"
+                  >
+                    改
+                  </button>
+                </div>
+                <p class="menu__text">{{ p.seedText }}</p>
+              </li>
+            </ul>
+            <div class="ops">
+              <button class="btn btn--ghost" @click="startCreate">+ 新建人格</button>
+            </div>
+            <p class="menu__hint">
+              点一行切换人格；点「改」编辑它的名字与规则。每个人格有各自独立的对话历史
+            </p>
+          </div>
+        </template>
+
+        <!-- 设置：应用级的东西放这里，它们不属于任何一个人格 -->
+        <template v-else>
+          <div class="pane">
+            <p v-if="!storageReady" class="menu__warn">
+              数据库未连接：设置改完只在本次运行内有效
+            </p>
+
+            <div class="rules__head"><span>思考模式</span></div>
+            <p class="pane__note">
+              默认开启。关掉它：模型不必先算完思维链，首字更快，思考的 token 也不再计费；
+              而且 temperature 这类「说话跳脱度」的参数会重新生效——思考模式下它们是被忽略的。
+            </p>
+            <div class="ops">
+              <button class="btn btn--ghost" @click="toggleThinking">
+                {{ settings.thinkingDisabled ? '已关闭 · 点它开启' : '已开启 · 点它关闭' }}
+              </button>
+            </div>
+            <p class="pane__note">
+              只影响对话本身；「记住我的要求」那条链路仍然会用思考，它靠的是准确性。
+            </p>
+
+            <div class="rules__head"><span>人格导入导出</span></div>
+            <p class="pane__note">
+              导出的文件可以直接分享给别人；导入遇到同名人格会新建一份副本，不会覆盖现有的。
+            </p>
+            <div class="setting">
+              <label class="form__row">
+                <span class="form__label">导谁</span>
+                <select v-model="exportId" class="form__input">
+                  <option value="">（当前人格）</option>
+                  <option v-for="p in personaList" :key="p.id" :value="p.id">{{ p.name }}</option>
+                </select>
+              </label>
+            </div>
+            <div class="ops">
+              <button class="btn btn--ghost" @click="exportPersona">导出为文件</button>
+              <button class="btn btn--ghost" @click="importPersona">从文件导入</button>
+            </div>
+          </div>
         </template>
       </section>
     </Transition>
+
+    <!-- 数据库未就绪：挡住 stage 与输入区，只留出拖拽区（否则窗口都没法拖走） -->
+    <section v-if="!dbReady" class="blocker">
+      <p class="blocker__title">需要数据库才能开始</p>
+      <p class="blocker__desc">
+        人格与记忆要存在 PostgreSQL 里。
+      </p>
+      <p class="blocker__steps">
+        ① 装 PostgreSQL 18 + pgvector 扩展<br />
+        ② 建库并启用扩展（下面两条命令）<br />
+        ③ 在 .env 里填 COMPANION_PG_DSN，然后重启
+      </p>
+      <textarea class="blocker__cmd" rows="3" readonly :value="setupCmd"></textarea>
+      <button class="btn btn--ghost blocker__copy" @click="copySetupCmd">复制命令</button>
+      <p class="blocker__hint">完整步骤（含 pgvector 安装）见项目 README 的「运行依赖」一节</p>
+    </section>
 
     <!-- 人格回执：独立短提示，避免覆盖正在流式输出的气泡 -->
     <Transition name="menu">
@@ -323,10 +979,11 @@ onUnmounted(() => {
         v-model="draft"
         class="composer__input"
         type="text"
+        :disabled="!dbReady"
         :placeholder="busy ? '正在回复…' : '说点什么，回车发送'"
         @keydown.enter="onEnter"
       />
-      <button v-if="!busy" class="composer__btn" @click="send">发送</button>
+      <button v-if="!busy" class="composer__btn" :disabled="!dbReady" @click="send">发送</button>
       <button v-else class="composer__btn composer__btn--stop" @click="stop">停止</button>
     </footer>
   </div>
@@ -668,6 +1325,98 @@ onUnmounted(() => {
   box-shadow: 0 6px 18px rgba(30, 25, 60, 0.25);
 }
 
+/* ---------- 数据库未就绪的阻断层 ---------- */
+
+/* 与 .menu 同一套定位思路（absolute），但 z-index 更高——它要盖住菜单与 toast。
+   top 留 44px 是为了让拖拽区露在外面，否则窗口都没法被拖走。 */
+.blocker {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 44px;
+  bottom: 10px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 12px;
+  box-sizing: border-box;
+  overflow-y: auto;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 12px 30px rgba(30, 25, 60, 0.22);
+}
+
+.blocker__title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #33333d;
+}
+
+.blocker__desc {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: #5a5a6b;
+}
+
+.blocker__steps {
+  margin: 0;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.04);
+  font-size: 11px;
+  line-height: 1.8;
+  color: #5a5a6b;
+}
+
+/* 命令要能看清、也能手动选中（复制按钮失败时的兜底）：等宽字体 + 不折行 */
+.blocker__cmd {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px;
+  border: 0;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.05);
+  color: #2b2b33;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 10px;
+  line-height: 1.6;
+  white-space: pre;
+  overflow-x: auto;
+  resize: none;
+  outline: none;
+}
+
+/* .btn 自带 flex:1，在 flex column 里会被拉高，这里取消 */
+.blocker__copy {
+  flex: none;
+}
+
+.blocker__hint {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: #9a9aa8;
+}
+
+.dragbar__icon:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.dragbar__icon:disabled:hover {
+  background: transparent;
+  color: #8a8a99;
+}
+
+.composer__input:disabled,
+.composer__btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .actions {
   display: flex;
   gap: 6px;
@@ -699,5 +1448,360 @@ onUnmounted(() => {
 
 .btn--ghost:hover {
   background: #fff;
+}
+
+/* ---------- 人格编辑器（⑧）---------- */
+
+/* 详情 / 列表两种视图的滚动容器：内容变长时整体滚动，内部不再套第二层滚动 */
+.pane {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 4px;
+}
+
+/* 放进 .pane 里的列表不要再自己滚，否则与外层形成嵌套滚动 */
+.menu__list--flat {
+  flex: none;
+  overflow: visible;
+}
+
+.bar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px;
+}
+
+.bar__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  color: #33333d;
+}
+
+.bar__switch {
+  flex: none;
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
+.ops {
+  display: flex;
+  gap: 6px;
+  padding: 0 8px 6px;
+}
+
+.ops .btn {
+  flex: none;
+  padding: 5px 10px;
+  font-size: 11px;
+}
+
+.pane__note {
+  margin: 0;
+  padding: 6px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #9a9aa8;
+}
+
+.rules__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px 4px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  font-size: 11px;
+  color: #6b6b7b;
+}
+
+.rules__head .btn {
+  flex: none;
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
+.rules {
+  margin: 0;
+  padding: 4px 8px 8px;
+  list-style: none;
+}
+
+.rule {
+  display: flex;
+  gap: 4px;
+  padding: 5px 6px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.03);
+}
+
+.rule + .rule {
+  margin-top: 5px;
+}
+
+/* 停用的规则仍然显示，只是变淡——"停用"和"删除"要能一眼分清 */
+.rule--off {
+  opacity: 0.55;
+}
+
+.rule__main {
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.rule__meta {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  font-size: 10px;
+  color: #9a9aa8;
+}
+
+.rule__slot {
+  font-weight: 600;
+  color: #5a5a6b;
+}
+
+.rule__value {
+  margin: 2px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #2b2b33;
+  word-break: break-word;
+}
+
+.rule__acts {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+}
+
+/* 主体文本：只读展示。它是长文本且可能带换行，保留原样换行比压成一行好读 */
+.seed__text {
+  margin: 0;
+  padding: 2px 10px 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #2b2b33;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 变更记录：只读回溯列表，样式比规则更轻——它不承载操作，只回答"变过什么" */
+.changes {
+  margin: 0;
+  padding: 4px 8px 8px;
+  list-style: none;
+}
+
+.change {
+  padding: 5px 6px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.02);
+}
+
+.change + .change {
+  margin-top: 5px;
+}
+
+.change__time {
+  margin-left: auto;
+}
+
+.change__val {
+  margin: 2px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #2b2b33;
+  word-break: break-word;
+}
+
+/* 旧值划掉：一眼看出"改成了什么"，而不是只看到两个值并排 */
+.change__old {
+  color: #9a9aa8;
+  text-decoration: line-through;
+}
+
+.change__arrow {
+  margin: 0 4px;
+  color: #9a9aa8;
+}
+
+/* 原始触发话（evidence）：比取值更次要，弱化处理 */
+.change__ev {
+  margin: 2px 0 0;
+  font-size: 10px;
+  line-height: 1.4;
+  color: #9a9aa8;
+  word-break: break-word;
+}
+
+/* 行内小按钮：人格列表行与规则行共用，尺寸明显小于 .btn */
+.iconbtn {
+  --wails-draggable: no-drag;
+
+  flex: none;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.05);
+  color: #6b6b7b;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.iconbtn:hover {
+  background: rgba(124, 108, 245, 0.16);
+  color: #5b4bd6;
+}
+
+/* 人格列表行尾的「改」：靠右，不与名字挤在一起 */
+.meta__edit {
+  margin-left: auto;
+}
+
+/* 内联表单：新建 / 重命名 / 规则编辑 / 删除确认共用。
+   刻意不用系统对话框——它会盖住这个 340px 的小窗，且 WebView2 对 prompt 支持不可靠。 */
+.form {
+  margin: 6px 8px 8px;
+  padding: 8px;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 4px 14px rgba(30, 25, 60, 0.12);
+}
+
+.form--danger {
+  box-shadow: 0 4px 14px rgba(200, 60, 60, 0.16);
+}
+
+.form__title {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #33333d;
+}
+
+.form__row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.form__label {
+  flex: none;
+  width: 40px;
+  font-size: 11px;
+  color: #6b6b7b;
+}
+
+.form__input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 7px;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.05);
+  color: #2b2b33;
+  font-size: 12px;
+  outline: none;
+}
+
+.form__input:focus {
+  box-shadow: inset 0 0 0 1px rgba(124, 108, 245, 0.55);
+}
+
+/* 主体文本是多行输入，不能用 .form__input 的单行样式；只允许纵向拉伸，避免被拉宽撑破浮层 */
+.form__area {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.05);
+  color: #2b2b33;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+}
+
+.form__area:focus {
+  box-shadow: inset 0 0 0 1px rgba(124, 108, 245, 0.55);
+}
+
+/* 字数提示：给上限，但不阻止输入（超了后端也会拒）——只让人心里有数 */
+.form__count {
+  margin: 4px 0 6px;
+  text-align: right;
+  font-size: 10px;
+  color: #9a9aa8;
+}
+
+.form__check {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  margin-bottom: 6px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: #6b6b7b;
+}
+
+.form__check input {
+  margin-top: 2px;
+}
+
+/* 直接放在 .pane 里的表单行要自己补左右内边距：.form 那张卡片自带，这里没有卡片 */
+.setting {
+  padding: 0 10px 6px;
+}
+
+/* 表单里的说明：比错误文字浅、比正文小，用来解释字段之间的关系，不打断填写 */
+.form__hint {
+  margin: 0 0 6px;
+  font-size: 10px;
+  line-height: 1.45;
+  color: #9a9aa8;
+}
+
+.form__err {
+  margin: 0 0 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #c0392b;
+  word-break: break-word;
+}
+
+.form__warn {
+  margin: 0 0 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #b2652b;
+}
+
+.form__btns {
+  display: flex;
+  gap: 6px;
+}
+
+.form__btns .btn {
+  padding: 5px 0;
+  font-size: 11px;
+}
+
+.btn--danger {
+  background: linear-gradient(135deg, #e8604c, #f0897a);
 }
 </style>

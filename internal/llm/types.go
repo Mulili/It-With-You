@@ -43,7 +43,7 @@ type Chunk struct {
 //   - 调用方必须把通道读到底（for range），不能中途 return 走人。
 type Provider interface {
 	// ChatStream 以流式方式返回回复，chunk 通道关闭表示本轮结束。
-	ChatStream(ctx context.Context, messages []Message) (<-chan Chunk, error)
+	ChatStream(ctx context.Context, messages []Message, opts ChatOptions) (<-chan Chunk, error)
 
 	// Chat 非流式地要一次完整回复，返回模型输出的正文。
 	//
@@ -53,11 +53,25 @@ type Provider interface {
 	Chat(ctx context.Context, messages []Message, opts ChatOptions) (string, error)
 }
 
-// ChatOptions 是非流式对话的可选项。零值表示"普通文本回复"。
+// ChatOptions 是一次调用的可选项。零值表示"普通文本回复"。
 type ChatOptions struct {
 	// JSON 为 true 时要求服务端输出可解析的 JSON 对象（response_format: json_object）。
 	//
 	// 注意：OpenAI 与 DeepSeek 都要求**提示词里出现 "json" 字样**才会接受这个参数，
 	// 否则会直接报错。这是调用方的责任，本层不做校验也不做改写。
+	//
+	// 只对非流式的 Chat 有效：JSON 要求一次性给出完整对象，与逐帧流出天然矛盾。
 	JSON bool
+
+	// DisableThinking 为 true 时显式要求服务端关闭思考模式。
+	//
+	// 为什么需要这个开关：DeepSeek 的思考模式**默认开启**，而它对闲聊只有副作用——
+	// 最终回答之前要先算完思维链（表现为长时间不吐字）、思考 token 按输出价计费，
+	// 而且思考模式下 temperature / top_p / presence_penalty / frequency_penalty
+	// 会**静默失效**（设置了不报错、也不生效）。
+	//
+	// 零值必须是"不发送这个字段"：它是 DeepSeek 的扩展而非 OpenAI 标准，
+	// 对不认识它的服务端（OpenAI 官方、某些本地推理框架）会直接报未知参数。
+	// 所以只有调用方明确要求时才带上，默认路径的行为与加这个字段之前完全一致。
+	DisableThinking bool
 }

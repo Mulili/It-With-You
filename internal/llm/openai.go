@@ -47,6 +47,17 @@ type chatRequest struct {
 	Stream bool `json:"stream"`
 	// ResponseFormat 只在要求 JSON 输出时带上，其余情况为 nil 并被 omitempty 省略
 	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+	// Thinking 是 DeepSeek 的扩展字段（**不是** OpenAI 标准），形如
+	// {"thinking":{"type":"enabled"|"disabled"}}，官方默认 enabled。
+	//
+	// 只在调用方明确要求关思考时才带：对不认识它的服务端，多带一个未知字段会直接 400。
+	// 走手写 HTTP 时它就是**顶层字段**（用官方 SDK 才需要塞进 extra_body）。
+	Thinking *thinkingSpec `json:"thinking,omitempty"`
+}
+
+// thinkingSpec 对应 DeepSeek 的思考模式开关。
+type thinkingSpec struct {
+	Type string `json:"type"`
 }
 
 // responseFormat 对应 OpenAI 兼容协议的 response_format 字段。
@@ -87,17 +98,23 @@ type streamResponse struct {
 //
 // 流式与非流式共用：URL 拼接、请求头、ctx 绑定这几件事只写一份，
 // 否则两条路径会慢慢走样（典型是加了新头只改了一边）。
-func (p *OpenAIProvider) newRequest(c context.Context, messages []Message, stream, jsonMode bool) (*http.Request, error) {
+func (p *OpenAIProvider) newRequest(c context.Context, messages []Message, stream bool, opts ChatOptions) (*http.Request, error) {
 	// 只有在要求 JSON 输出时才带 response_format；不要求时留 nil，被 omitempty 省略
 	var rf *responseFormat
-	if jsonMode {
+	if opts.JSON {
 		rf = &responseFormat{Type: "json_object"}
+	}
+	// 同理：只有明确要求关思考时才带 thinking，默认路径完全不带这个扩展字段
+	var th *thinkingSpec
+	if opts.DisableThinking {
+		th = &thinkingSpec{Type: "disabled"}
 	}
 	body, err := json.Marshal(chatRequest{
 		Model:          p.cfg.Model,
 		Messages:       messages,
 		Stream:         stream,
 		ResponseFormat: rf,
+		Thinking:       th,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("序列化请求失败: %w", err)
@@ -121,8 +138,8 @@ func (p *OpenAIProvider) newRequest(c context.Context, messages []Message, strea
 }
 
 // send 发一次请求并检查状态码，返回可读的响应体（**调用方负责 Close**）。
-func (p *OpenAIProvider) send(c context.Context, messages []Message, stream, jsonMode bool) (*http.Response, error) {
-	req, err := p.newRequest(c, messages, stream, jsonMode)
+func (p *OpenAIProvider) send(c context.Context, messages []Message, stream bool, opts ChatOptions) (*http.Response, error) {
+	req, err := p.newRequest(c, messages, stream, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +168,7 @@ func (p *OpenAIProvider) Chat(c context.Context, messages []Message, opts ChatOp
 	if p.cfg.APIKey == "" {
 		return "", errorcode.ErrCodeUnKownAPIKey
 	}
-	resp, err := p.send(c, messages, false, opts.JSON)
+	resp, err := p.send(c, messages, false, opts)
 	if err != nil {
 		return "", err
 	}
@@ -177,12 +194,14 @@ func (p *OpenAIProvider) Chat(c context.Context, messages []Message, opts ChatOp
 // 通道由内部 goroutine 生产。ctx 必须由调用方持有 cancel：
 // 取消时底层 HTTP 往返会被中断，pump 收到 ctx.Err() 后以 Chunk{Err} 收尾，
 // 而不是让前端自己丢弃后面的包。
-func (p *OpenAIProvider) ChatStream(c context.Context, messages []Message) (<-chan Chunk, error) {
+func (p *OpenAIProvider) ChatStream(c context.Context, messages []Message, opts ChatOptions) (<-chan Chunk, error) {
 	// 没有 Key 就不用发请求了，直接返回业务错误码，前端会把它显示在气泡里
 	if p.cfg.APIKey == "" {
 		return nil, errorcode.ErrCodeUnKownAPIKey
 	}
-	resp, err := p.send(c, messages, true, false)
+	// 流式路径只认 DisableThinking：JSON 模式要求一次性给出完整对象，与逐帧流出天然矛盾，
+	// 这里显式丢掉，免得"流式 + json_object"这种无意义组合被静默发出去。
+	resp, err := p.send(c, messages, true, ChatOptions{DisableThinking: opts.DisableThinking})
 	if err != nil {
 		return nil, err
 	}

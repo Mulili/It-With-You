@@ -1,5 +1,80 @@
+export namespace main {
+	
+	export class AppSettings {
+	    thinkingDisabled: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new AppSettings(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.thinkingDisabled = source["thinkingDisabled"];
+	    }
+	}
+
+}
+
 export namespace persona {
 	
+	export class SlotSpec {
+	    key: string;
+	    label: string;
+	    desc: string;
+	    aliases: string[];
+	    kind: string;
+	    multi: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new SlotSpec(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.key = source["key"];
+	        this.label = source["label"];
+	        this.desc = source["desc"];
+	        this.aliases = source["aliases"];
+	        this.kind = source["kind"];
+	        this.multi = source["multi"];
+	    }
+	}
+	export class Meta {
+	    slots: SlotSpec[];
+	    seedTextRunes: number;
+	    ruleValueRunes: number;
+	    injectBudgetRunes: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new Meta(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.slots = this.convertValues(source["slots"], SlotSpec);
+	        this.seedTextRunes = source["seedTextRunes"];
+	        this.ruleValueRunes = source["ruleValueRunes"];
+	        this.injectBudgetRunes = source["injectBudgetRunes"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class Persona {
 	    id: string;
 	    name: string;
@@ -90,6 +165,7 @@ export namespace persona {
 	        this.updatedAt = source["updatedAt"];
 	    }
 	}
+	
 	export class Snapshot {
 	    personas: Persona[];
 	    activeId: string;

@@ -537,3 +537,95 @@ func TestSaveRuleUpsertReenablesAndKeepsTier(t *testing.T) {
 		}
 	}
 }
+
+// 编辑器要能改"非当前人格"的规则：RulesOf 按 ID 取，而不是只看当前人格。
+// 若它退化成"只返回当前人格的规则"，最直接的后果是想改别的人格必须先切过去——
+// 而切换会掐掉正在生成的那一轮并清空气泡，副作用太大。
+func TestRulesOfAnyPersona(t *testing.T) {
+	s := newTestStore()
+
+	builtinRules, err := s.RulesOf("builtin:a")
+	if err != nil {
+		t.Fatalf("取内置人格的规则失败: %v", err)
+	}
+	if len(builtinRules) == 0 {
+		t.Fatal("内置人格应当有规则")
+	}
+
+	// 新建的副本不是当前人格，同样要能取到它自己的规则
+	id, err := s.CreatePersona("甲 的副本", "builtin:a")
+	if err != nil {
+		t.Fatalf("复制人格失败: %v", err)
+	}
+	if s.Snapshot().ActiveID == id {
+		t.Fatal("这一步的副本不该是当前人格，否则测不到「非当前人格」这条路径")
+	}
+	copied, err := s.RulesOf(id)
+	if err != nil {
+		t.Fatalf("取非当前人格的规则失败: %v", err)
+	}
+	if len(copied) != len(builtinRules) {
+		t.Errorf("副本规则数 = %d，期望与来源一致（%d）", len(copied), len(builtinRules))
+	}
+	for _, r := range copied {
+		if r.PersonaID != id {
+			t.Errorf("返回了别人格的规则：%+v", r)
+		}
+	}
+
+	// 返回顺序必须与注入顺序一致（与 SortRules 同一口径）
+	lastRank := 0
+	for i, r := range copied {
+		rank, ok := map[string]int{persona.TierCore: 0, persona.TierRecent: 1, persona.TierArchived: 2}[r.Tier]
+		if !ok {
+			t.Fatalf("规则 %s 的 tier = %q 非法", r.Slot, r.Tier)
+		}
+		if i > 0 && rank < lastRank {
+			t.Errorf("规则顺序不是 tier 升序：%s 出现在更靠后的层级之后", r.Tier)
+		}
+		lastRank = rank
+	}
+
+	// 人格不存在时要报错，而不是返回一个空列表——两者在界面上长得一样，但含义完全不同
+	if _, err := s.RulesOf("builtin:不存在"); err == nil {
+		t.Error("不存在的人格应当返回错误，而不是空规则列表")
+	}
+}
+
+// 变更记录同样按人格隔离，且编辑器要能看"非当前人格"的变更。
+func TestChangesOfAnyPersona(t *testing.T) {
+	s := newTestStore()
+
+	id, err := s.CreatePersona("甲 的副本", "builtin:a")
+	if err != nil {
+		t.Fatalf("复制人格失败: %v", err)
+	}
+	if err := s.SaveSeedText(id, "改过的种子"); err != nil {
+		t.Fatalf("改主体文本失败: %v", err)
+	}
+
+	changes, err := s.ChangesOf(id)
+	if err != nil {
+		t.Fatalf("取非当前人格的变更失败: %v", err)
+	}
+	if len(changes) == 0 {
+		t.Fatal("刚改过主体文本，应当留下变更记录")
+	}
+	for _, c := range changes {
+		if c.PersonaID != id {
+			t.Errorf("混入了别人格的变更：%+v", c)
+		}
+	}
+	if len(changes) > 1 && changes[0].CreatedAt < changes[1].CreatedAt {
+		t.Errorf("变更记录应当按时间倒序：%d 排在 %d 之前", changes[0].CreatedAt, changes[1].CreatedAt)
+	}
+
+	// 内置人格不落库、没有变更记录，但这是"空"而不是"错误"
+	if got, err := s.ChangesOf("builtin:a"); err != nil || len(got) != 0 {
+		t.Errorf("内置人格应当返回空变更且不报错，实际 len=%d err=%v", len(got), err)
+	}
+
+	if _, err := s.ChangesOf("builtin:不存在"); err == nil {
+		t.Error("不存在的人格应当返回错误，而不是空变更列表")
+	}
+}

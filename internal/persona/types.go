@@ -75,6 +75,27 @@ const (
 // internal/persona/builtin 里的 TestRealBuiltinPersonasUsable 会按这个值报出超预算的人格。
 const InjectBudgetRunes = 1500
 
+// Meta 是前端渲染编辑器所需的"静态元信息"：槽位清单 + 各字段的长度上限。
+//
+// 由后端提供而不是前端写死：槽位表、上限值都是"唯一真相"，前端复制一份迟早走样——
+// 加了槽位 UI 里选不到、改了上限提示就变成错的。一次调用同时拿到两者，也省一次往返。
+type Meta struct {
+	Slots             []SlotSpec `json:"slots"`
+	SeedTextRunes     int        `json:"seedTextRunes"`
+	RuleValueRunes    int        `json:"ruleValueRunes"`
+	InjectBudgetRunes int        `json:"injectBudgetRunes"`
+}
+
+// MetaInfo 返回静态元信息（副本，调用方改不到内部表）。
+func MetaInfo() Meta {
+	return Meta{
+		Slots:             SlotSpecs(),
+		SeedTextRunes:     MaxSeedTextRunes,
+		RuleValueRunes:    MaxRuleValueRunes,
+		InjectBudgetRunes: InjectBudgetRunes,
+	}
+}
+
 // Persona 是一个人格的主体。
 type Persona struct {
 	ID        string `json:"id"`

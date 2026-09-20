@@ -34,6 +34,10 @@ type MemoryStore struct {
 	changes  []persona.PersonaChange
 	activeID string
 
+	// thinkingDisabled 是应用级设置（不属于任何人格），对应 PG 里的 app_settings。
+	// 内存实现下它随进程消失，与自建人格同命运。
+	thinkingDisabled bool
+
 	// storageReady 表示"持久化存储是否可用"。内存实现自己恒为可用，
 	// 但它被当作 PG 连不上时的降级路径时，前端要据此提示"数据库未连接"。
 	storageReady bool
@@ -90,13 +94,7 @@ func (s *MemoryStore) Snapshot() persona.Snapshot {
 
 	// 变更记录也只给当前人格的：它和对话历史一样，属于"这一个个体"，
 	// 把别人格的变更混进来同样是串台
-	changes := make([]persona.PersonaChange, 0, persona.SnapshotChangeLimit)
-	for i := len(s.changes) - 1; i >= 0 && len(changes) < persona.SnapshotChangeLimit; i-- {
-		if s.changes[i].PersonaID != s.activeID {
-			continue
-		}
-		changes = append(changes, s.changes[i])
-	}
+	changes := s.changesOfLocked(s.activeID)
 
 	return persona.Snapshot{
 		Personas:      personas,
@@ -105,6 +103,44 @@ func (s *MemoryStore) Snapshot() persona.Snapshot {
 		RecentChanges: changes,
 		StorageReady:  s.storageReady,
 	}
+}
+
+// RulesOf 实现 Store：返回指定人格的规则（已排序）。
+//
+// 返回的是副本：调用方（前端编辑器）排序或修改它，不该影响内部状态。
+func (s *MemoryStore) RulesOf(personaID string) ([]persona.PersonaRule, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, ok := s.personas[personaID]; !ok {
+		return nil, fmt.Errorf("人格 %s 不存在", personaID)
+	}
+	rules := append([]persona.PersonaRule(nil), s.rules[personaID]...)
+	persona.SortRules(rules)
+	return rules, nil
+}
+
+// ChangesOf 实现 Store：返回指定人格的最近变更记录（时间倒序）。
+func (s *MemoryStore) ChangesOf(personaID string) ([]persona.PersonaChange, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if _, ok := s.personas[personaID]; !ok {
+		return nil, fmt.Errorf("人格 %s 不存在", personaID)
+	}
+	return s.changesOfLocked(personaID), nil
+}
+
+// changesOfLocked 取某人格最近的变更记录（时间倒序）。调用方需持有锁。
+func (s *MemoryStore) changesOfLocked(personaID string) []persona.PersonaChange {
+	out := make([]persona.PersonaChange, 0, persona.SnapshotChangeLimit)
+	for i := len(s.changes) - 1; i >= 0 && len(out) < persona.SnapshotChangeLimit; i-- {
+		if s.changes[i].PersonaID != personaID {
+			continue
+		}
+		out = append(out, s.changes[i])
+	}
+	return out
 }
 
 // Close 让内存实现也满足 io.Closer：上层关闭存储时不必区分实现。
@@ -143,6 +179,21 @@ func (s *MemoryStore) SetActivePersona(id string) error {
 		return fmt.Errorf("人格 %s 不存在", id)
 	}
 	s.activeID = id
+	return nil
+}
+
+// ThinkingDisabled 实现 Store：内存里读到的永远是本次进程内设过的值。
+func (s *MemoryStore) ThinkingDisabled() (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.thinkingDisabled, nil
+}
+
+// SetThinkingDisabled 实现 Store。
+func (s *MemoryStore) SetThinkingDisabled(disabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.thinkingDisabled = disabled
 	return nil
 }
 

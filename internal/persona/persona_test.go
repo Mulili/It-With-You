@@ -227,4 +227,38 @@ func TestParsePersonaFileStrict(t *testing.T) {
 	}
 }
 
+// 给前端的结构体必须带全 json tag：漏了就会被序列化成 Go 字段名（Key / Label / Multi），
+// 而前端读的是小写——症状是"槽位下拉一片空白"，而且不报任何错，极难定位。
+// 这条把"给前端的字段名契约"钉住：名字是小写，前端才读得到。
+func TestSlotSpecJSONFieldNames(t *testing.T) {
+	b, err := json.Marshal(MetaInfo())
+	if err != nil {
+		t.Fatalf("序列化 Meta 失败: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatalf("反序列化 Meta 失败: %v", err)
+	}
+
+	for _, k := range []string{"slots", "seedTextRunes", "ruleValueRunes", "injectBudgetRunes"} {
+		if _, ok := raw[k]; !ok {
+			t.Errorf("Meta 缺字段 %q —— 前端读的就是这个名字", k)
+		}
+	}
+
+	slots, ok := raw["slots"].([]any)
+	if !ok || len(slots) == 0 {
+		t.Fatalf("Meta.slots 应当是非空数组，实际 %T", raw["slots"])
+	}
+	first, ok := slots[0].(map[string]any)
+	if !ok {
+		t.Fatalf("slots[0] 不是对象：%T", slots[0])
+	}
+	for _, k := range []string{"key", "label", "desc", "aliases", "kind", "multi"} {
+		if _, ok := first[k]; !ok {
+			t.Errorf("SlotSpec 缺字段 %q —— 前端 s.%s 只能读到 undefined", k, k)
+		}
+	}
+}
+
 func boolPtr(b bool) *bool { return &b }

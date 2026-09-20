@@ -2,12 +2,17 @@ package main
 
 import (
 	"agent-for-you-love/internal/config"
+	"agent-for-you-love/internal/db"
+	historystore "agent-for-you-love/internal/history/store"
 	"agent-for-you-love/internal/llm"
 	"agent-for-you-love/internal/persona/builtin"
 	"agent-for-you-love/internal/persona/store"
+	"context"
 	"embed"
 	"log"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
@@ -35,11 +40,20 @@ func main() {
 		log.Println("[llm] 未检测到 COMPANION_LLM_API_KEY，发消息时才会报错")
 	}
 
-	// 人格存储：优先 PostgreSQL，连不上就退回内存实现（内置人格照常可用）。
-	// OpenStore 刻意不返回错误——数据库没起来不该让桌宠起不来。
-	personaStore := store.OpenStore(store.DSNFromEnv(), loadBuiltinPersonas())
+	// 数据库：建池 + 建表 + 校验版本。连不上不阻止启动——人格退回内存、记忆整体停用。
+	pool := openDB()
 
-	app := NewApp(llm.NewOpenAIProvider(llmCfg), personaStore)
+	// 人格存储：给了连接池就用 PG，否则退回内存实现（内置人格照常可用）
+	personaStore := store.OpenStore(pool, loadBuiltinPersonas())
+
+	// 历史存储：与人格共用同一个连接池（同一个库，三块数据都在上面）
+	historyStore := historystore.Open(pool)
+
+	// 嵌入服务（阶段4 的记忆检索用）。与对话分开配，因为它们通常是两个服务。
+	// 同样不让它影响启动：探测失败只是记忆功能停用，对话照常。
+	probeEmbedder()
+
+	app := NewApp(llm.NewOpenAIProvider(llmCfg), personaStore, historyStore)
 
 	err := wails.Run(&options.App{
 		Title:         "AI 桌面伴侣",
@@ -97,6 +111,52 @@ func main() {
 	if err != nil {
 		log.Fatalf("应用启动失败: %v", err)
 	}
+}
+
+// openDB 连库并保证表结构就位；失败只记日志并返回 nil。
+//
+// 返回 nil 表示"没有可用的数据库"，由上层各自决定怎么降级：人格退回内存实现照常可用，
+// 记忆功能整体停用——两种姿态不同，所以这里不替它们做决定。
+func openDB() *pgxpool.Pool {
+	dsn := db.DSNFromEnv()
+	if dsn == "" {
+		log.Printf("[db] 未配置 COMPANION_PG_DSN，数据只存在内存里（进程重启即丢）")
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), db.ConnectTimeout)
+	defer cancel()
+
+	pool, err := db.Open(ctx, dsn)
+	if err != nil {
+		log.Printf("[db] 数据库不可用，数据只存在内存里：%v", err)
+		return nil
+	}
+	log.Printf("[db] 数据库就绪（表结构 v%d）", db.SchemaVersion)
+	return pool
+}
+
+// probeEmbedder 在启动时确认嵌入服务可用，并把结果写进日志。
+//
+// 这里**不返回错误、也不阻止启动**：嵌入只是记忆功能的前提，对话并不依赖它。
+// 探测的意义是把"服务没起""维度不匹配"这类问题在启动日志里说清楚，而不是留到
+// 用户第一次写记忆时，由 pgvector 报一个与嵌入看不出关系的错（expected 1024 dimensions）。
+//
+// 同步探测是刻意的：本机 Ollama 没启动时，连接被拒是瞬时的，不会拖慢启动；
+// 只有把 base_url 指到不可达的远程地址，才会真的等满这 5 秒。
+func probeEmbedder() {
+	cfg := llm.EmbedConfigFromEnv()
+	e := llm.NewOpenAIEmbedder(cfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := e.Verify(ctx); err != nil {
+		log.Printf("[embed] 嵌入服务不可用（%s @ %s）: %v", cfg.Model, cfg.BaseURL, err)
+		log.Printf("[embed] 记忆功能将停用，对话不受影响；本机装 Ollama 后 `ollama pull bge-m3` 可恢复")
+		return
+	}
+	log.Printf("[embed] 嵌入服务就绪：%s @ %s（%d 维）", cfg.Model, cfg.BaseURL, cfg.Dim)
 }
 
 // loadBuiltinPersonas 读取内置人格；失败只记日志，不让应用起不来。

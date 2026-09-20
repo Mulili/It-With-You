@@ -10,8 +10,40 @@ export function Cancel() {
   return window['go']['main']['App']['Cancel']();
 }
 
+export function CreatePersona(arg1, arg2) {
+  return window['go']['main']['App']['CreatePersona'](arg1, arg2);
+}
+
+export function DeletePersona(arg1) {
+  return window['go']['main']['App']['DeletePersona'](arg1);
+}
+
+export function DeleteRule(arg1) {
+  return window['go']['main']['App']['DeleteRule'](arg1);
+}
+
+export function ExportPersonaToFile(arg1) {
+  return window['go']['main']['App']['ExportPersonaToFile'](arg1);
+}
+
+export function GetPersonaChanges(arg1) {
+  return window['go']['main']['App']['GetPersonaChanges'](arg1);
+}
+
+export function GetPersonaMeta() {
+  return window['go']['main']['App']['GetPersonaMeta']();
+}
+
+export function GetPersonaRules(arg1) {
+  return window['go']['main']['App']['GetPersonaRules'](arg1);
+}
+
 export function GetPersonaSnapshot() {
   return window['go']['main']['App']['GetPersonaSnapshot']();
+}
+
+export function GetSettings() {
+  return window['go']['main']['App']['GetSettings']();
 }
 
 export function HideWindow() {
@@ -22,8 +54,24 @@ export function History() {
   return window['go']['main']['App']['History']();
 }
 
+export function ImportPersonaFromFile() {
+  return window['go']['main']['App']['ImportPersonaFromFile']();
+}
+
 export function Quit() {
   return window['go']['main']['App']['Quit']();
+}
+
+export function RenamePersona(arg1, arg2) {
+  return window['go']['main']['App']['RenamePersona'](arg1, arg2);
+}
+
+export function SaveRule(arg1) {
+  return window['go']['main']['App']['SaveRule'](arg1);
+}
+
+export function SaveSeedText(arg1, arg2) {
+  return window['go']['main']['App']['SaveSeedText'](arg1, arg2);
 }
 
 export function Say(arg1) {
@@ -36,6 +84,14 @@ export function SetActivePersona(arg1) {
 
 export function SetMenuOpen(arg1) {
   return window['go']['main']['App']['SetMenuOpen'](arg1);
+}
+
+export function SetRuleEnabled(arg1, arg2) {
+  return window['go']['main']['App']['SetRuleEnabled'](arg1, arg2);
+}
+
+export function SetThinkingDisabled(arg1) {
+  return window['go']['main']['App']['SetThinkingDisabled'](arg1);
 }
 
 export function ShowWindow() {

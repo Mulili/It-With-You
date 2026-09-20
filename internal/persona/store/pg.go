@@ -2,14 +2,13 @@ package store
 
 import (
 	"context"
-	_ "embed"
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"time"
 
+	"agent-for-you-love/internal/db"
 	"agent-for-you-love/internal/persona"
 	"agent-for-you-love/internal/persona/builtin"
 
@@ -18,46 +17,21 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// SchemaVersion 是当前代码期望的表结构版本（对应 schema.sql）。
-const SchemaVersion = 1
-
-// envDSN 是人格库连接串所在的环境变量名。
-const envDSN = "COMPANION_PG_DSN"
-
-// ConnectTimeout 是启动时连接数据库的超时：桌面应用不该为了等数据库卡住启动。
-const ConnectTimeout = 3 * time.Second
-
-// QueryTimeout 是单次查询的超时。Store 的方法签名不带 ctx（要直接暴露给前端），
-// 所以在这里统一加一层保护，避免数据库卡住时把界面拖死。
-const QueryTimeout = 5 * time.Second
-
-// DSNFromEnv 读取人格库连接串；为空表示没配置（会退回内存存储）。
-func DSNFromEnv() string { return strings.TrimSpace(os.Getenv(envDSN)) }
-
-//go:embed schema.sql
-var schemaSQL string
-
-// OpenStore 打开人格存储：优先 PostgreSQL，连不上就退回内存实现。
+// OpenStore 打开人格存储：给了可用的连接池就用 PG，否则退回内存实现。
 //
 // 刻意不返回错误：数据库没起来不该让桌宠起不来（对齐 main.go 对"缺 API Key 只提示不 Fatal"
 // 的处理姿态）。退回内存后内置人格照常可用，只是自建人格不持久——
 // Snapshot.StorageReady 会告诉前端"数据库未连接"。
-func OpenStore(dsn string, builtins []builtin.Entry) persona.Store {
-	if dsn == "" {
-		log.Printf("[persona] 未配置 %s，人格只存在内存里（进程重启即丢）", envDSN)
-		return NewMemoryStore(builtins, false)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), ConnectTimeout)
-	defer cancel()
-
-	store, err := NewPgStore(ctx, dsn, builtins)
-	if err != nil {
-		log.Printf("[persona] 数据库不可用，退回内存存储：%v", err)
+//
+// 连接池由 main 通过 internal/db 建好再传进来：同一个库上还有会话与记忆，三者共用池。
+// pool 为 nil 表示没配或连不上。
+func OpenStore(pool *pgxpool.Pool, builtins []builtin.Entry) persona.Store {
+	if pool == nil {
+		log.Printf("[persona] 没有可用的数据库连接，人格只存在内存里（进程重启即丢）")
 		return NewMemoryStore(builtins, false)
 	}
 	log.Printf("[persona] 数据库就绪，人格持久化已启用")
-	return store
+	return NewPgStore(pool, builtins)
 }
 
 // PgStore 是 Store 的 PostgreSQL 实现。
@@ -71,21 +45,8 @@ type PgStore struct {
 	builtinByID map[string]builtin.Entry
 }
 
-// NewPgStore 连接数据库、准备表结构（幂等），返回可用的存储。
-func NewPgStore(ctx context.Context, dsn string, builtins []builtin.Entry) (*PgStore, error) {
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("创建连接池失败: %w", err)
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("连接失败: %w", err)
-	}
-	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("初始化表结构失败: %w", err)
-	}
-
+// NewPgStore 用已有的连接池组装人格存储。表结构由 internal/db 在 Open 时保证就位。
+func NewPgStore(pool *pgxpool.Pool, builtins []builtin.Entry) *PgStore {
 	s := &PgStore{
 		pool:        pool,
 		builtins:    builtins,
@@ -94,39 +55,16 @@ func NewPgStore(ctx context.Context, dsn string, builtins []builtin.Entry) (*PgS
 	for _, b := range builtins {
 		s.builtinByID[b.Persona.ID] = b
 	}
-	if err := s.checkSchemaVersion(ctx); err != nil {
-		pool.Close()
-		return nil, err
-	}
-	return s, nil
+	return s
 }
 
 // Close 关闭连接池（应用退出时调用）。
+//
+// 池是这个库上所有 store（人格 / 会话 / 记忆）共用的，但关闭只需一次，
+// 而应用退出时只有这一条路径在关，所以由人格 store 代劳——
+// 不为"谁该负责关闭"再引入一层所有者概念。pgxpool 的 Close 可重复调用。
 func (s *PgStore) Close() error {
 	s.pool.Close()
-	return nil
-}
-
-// checkSchemaVersion 比对表结构版本：0 = 首次初始化；库比程序新 = 拒绝启动。
-func (s *PgStore) checkSchemaVersion(ctx context.Context) error {
-	var version int
-	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version); err != nil {
-		return fmt.Errorf("读取表结构版本失败: %w", err)
-	}
-	switch {
-	case version == 0:
-		if _, err := s.pool.Exec(ctx,
-			`INSERT INTO schema_version (version, applied_at) VALUES ($1, $2)`,
-			SchemaVersion, time.Now().UnixMilli()); err != nil {
-			return fmt.Errorf("写入表结构版本失败: %w", err)
-		}
-		log.Printf("[persona] 数据库表结构初始化为 v%d", SchemaVersion)
-	case version > SchemaVersion:
-		return fmt.Errorf("数据库表结构是 v%d，比程序期望的 v%d 新，请升级程序", version, SchemaVersion)
-	case version < SchemaVersion:
-		// 目前只有 v1，还没有迁移步骤；将来在这里按版本顺序补
-		log.Printf("[persona] 数据库表结构 v%d 落后于程序 v%d（暂无需迁移）", version, SchemaVersion)
-	}
 	return nil
 }
 
@@ -166,6 +104,38 @@ func (s *PgStore) Snapshot() persona.Snapshot {
 		RecentChanges: changes,
 		StorageReady:  true,
 	}
+}
+
+// RulesOf 实现 Store：返回指定人格的规则（已排序）。
+//
+// 内置人格取其注入时带进来的那份（不查库）；自建人格先确认存在，避免把
+// "人格 ID 打错了"和"这个人格还没规则"混成同一个空结果。
+func (s *PgStore) RulesOf(personaID string) ([]persona.PersonaRule, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	if _, ok := s.builtinByID[personaID]; !ok {
+		if _, err := s.loadPersona(ctx, personaID); err != nil {
+			return nil, err
+		}
+	}
+	return s.rulesOf(ctx, personaID)
+}
+
+// ChangesOf 实现 Store：返回指定人格的最近变更记录（时间倒序）。
+//
+// 与 RulesOf 对称：自建人格先确认存在，避免把"人格 ID 打错了"和"这个人格还没改过"
+// 混成同一个空结果；内置人格跳过查库——它没有变更记录，recentChanges 直接返回空。
+func (s *PgStore) ChangesOf(personaID string) ([]persona.PersonaChange, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	if _, ok := s.builtinByID[personaID]; !ok {
+		if _, err := s.loadPersona(ctx, personaID); err != nil {
+			return nil, err
+		}
+	}
+	return s.recentChanges(ctx, personaID)
 }
 
 // SaveSeedText 改写主体人格文本。
@@ -220,6 +190,44 @@ func (s *PgStore) SetActivePersona(id string) error {
 		settingActivePersona, id)
 	if err != nil {
 		return fmt.Errorf("保存当前人格失败: %w", err)
+	}
+	return nil
+}
+
+// ThinkingDisabled 实现 Store：读 app_settings，没存过则为 false。
+//
+// 把"没这个 key"当成 false（而不是报错或当 true）是刻意的：官方默认就是思考开启，
+// 所以首次启动不需要写库，行为也和老版本一致。
+func (s *PgStore) ThinkingDisabled() (bool, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	var v string
+	err := s.pool.QueryRow(ctx,
+		`SELECT value FROM app_settings WHERE key = $1`, settingThinkingDisabled).Scan(&v)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("读取思考开关失败: %w", err)
+	}
+	return v == settingTrue, nil
+}
+
+// SetThinkingDisabled 实现 Store。
+func (s *PgStore) SetThinkingDisabled(disabled bool) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	v := settingFalse
+	if disabled {
+		v = settingTrue
+	}
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO app_settings (key, value) VALUES ($1, $2)
+		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+		settingThinkingDisabled, v); err != nil {
+		return fmt.Errorf("保存思考开关失败: %w", err)
 	}
 	return nil
 }
@@ -547,11 +555,23 @@ func (s *PgStore) ImportFile(f persona.PersonaFile) (persona.Persona, error) {
 
 // ---------- 内部工具 ----------
 
-// settingActivePersona 是 app_settings 里"当前人格"的 key。
-const settingActivePersona = "active_persona_id"
+// app_settings 里各设置的 key。这张表是通用的 key-value，所以值一律存成字符串。
+const (
+	// settingActivePersona 是"当前生效的人格"。
+	settingActivePersona = "active_persona_id"
+	// settingThinkingDisabled 是思考模式开关。**没有这个 key** 表示"从没设置过"，
+	// 语义上等于 false（跟随官方默认：思考模式开启）。
+	settingThinkingDisabled = "thinking_disabled"
+)
+
+// app_settings 里布尔值的两种写法。
+const (
+	settingTrue  = "true"
+	settingFalse = "false"
+)
 
 func (s *PgStore) ctx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), QueryTimeout)
+	return context.WithTimeout(context.Background(), db.QueryTimeout)
 }
 
 // inTx 跑一个事务：出错自动回滚。
@@ -738,8 +758,18 @@ func (s *PgStore) activePersonaID(ctx context.Context, personas []persona.Person
 }
 
 // recentChanges 读某人格最近的变更记录（按时间倒序）。
+//
+// 内置人格随 exe 分发、不落库，所以它没有变更记录——这是"空"，不是"错误"。
+// 这个判断必须在**这里**做（与 rulesOf 同一套路）：内置人格的 ID 形如 "builtin:lapwing"，
+// 直接拿去比 `persona_id = $1::uuid` 会被 PG 拒绝（22P02 无效的 uuid 输入语法）。
+//
+// 早先只在 ChangesOf 里判断，Snapshot 那条路径漏了——而 Snapshot 读的是**当前人格**，
+// 一启动就可能是内置人格，于是每次打开菜单都在日志里刷 22P02（表现为变更记录静默为空）。
 func (s *PgStore) recentChanges(ctx context.Context, personaID string) ([]persona.PersonaChange, error) {
 	if personaID == "" {
+		return nil, nil
+	}
+	if _, ok := s.builtinByID[personaID]; ok {
 		return nil, nil
 	}
 	rows, err := s.pool.Query(ctx,

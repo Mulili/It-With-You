@@ -3,11 +3,12 @@ package main
 import (
 	"testing"
 
+	"agent-for-you-love/internal/history"
+	historystore "agent-for-you-love/internal/history/store"
 	"agent-for-you-love/internal/llm"
 	"agent-for-you-love/internal/persona"
 	"agent-for-you-love/internal/persona/builtin"
 	"agent-for-you-love/internal/persona/store"
-	"agent-for-you-love/internal/ui"
 )
 
 // 这一个内置人格够用：验证"删除自建人格后历史怎么清"不需要更多数据。
@@ -25,51 +26,78 @@ func testBuiltins() []builtin.Entry {
 }
 
 // 这些测试不需要 Wails 运行时：事件发送有 a.ctx == nil 的保护，只会走日志。
-func newPersonaApp(t *testing.T) (*App, persona.Store) {
+//
+// 历史用内存实现：这一组关心的是"人格与历史怎么联动"，而不是 PG 本身
+// （PG 那条路径由 internal/history/store 的集成测试覆盖）。
+func newPersonaApp(t *testing.T) (*App, persona.Store, history.Store) {
 	t.Helper()
 	st := store.NewMemoryStore(testBuiltins(), true)
-	return NewApp(nil, st), st
+	hist := historystore.NewMemoryStore()
+	return NewApp(nil, st, hist), st, hist
 }
 
-// 删除人格必须同时清掉它在内存里的对话历史：那些记录的 personaID 已失效，
-// 留着既不显示、又永远占内存——就是孤儿数据。
+// 删除人格必须同时清掉它的对话历史：那些消息的 personaID 已失效，
+// 留着既不显示、又永远占空间——就是孤儿数据。
 func TestDeletePersonaClearsItsHistory(t *testing.T) {
-	app, st := newPersonaApp(t)
+	app, st, hist := newPersonaApp(t)
 
 	id, err := st.CreatePersona("临时人格", "")
 	if err != nil {
 		t.Fatalf("新建人格失败: %v", err)
 	}
 
-	app.records = []record{
-		{id: "m1", personaID: "builtin:a", message: llm.Message{Role: llm.RoleUser, Content: "甲的对话"}, at: 1, status: ui.StatusOK},
-		{id: "m2", personaID: id, message: llm.Message{Role: llm.RoleUser, Content: "临时的对话"}, at: 2, status: ui.StatusOK},
-		{id: "m3", personaID: id, message: llm.Message{Role: llm.RoleAssistant, Content: "临时的回复"}, at: 3, status: ui.StatusOK},
+	// 给两个人格各写一条历史（各用各自的会话）
+	seed := func(personaID, text string) history.Session {
+		t.Helper()
+		sess, err := hist.EnsureSession(personaID)
+		if err != nil {
+			t.Fatalf("建会话失败: %v", err)
+		}
+		if _, err := hist.AppendMessage(history.Message{
+			SessionID: sess.ID, PersonaID: personaID,
+			Role: llm.RoleUser, Content: text, Status: history.StatusOK,
+		}); err != nil {
+			t.Fatalf("写消息失败: %v", err)
+		}
+		return sess
 	}
+	seed("builtin:a", "甲的对话")
+	sess := seed(id, "临时的对话")
 
 	if err := app.DeletePersona(id); err != nil {
 		t.Fatalf("删除人格失败: %v", err)
 	}
 
-	for _, r := range app.records {
-		if r.personaID == id {
-			t.Fatalf("删除后仍有它的历史记录：%+v", r)
-		}
+	gone, err := hist.RecentMessages(id, 10)
+	if err != nil {
+		t.Fatalf("读历史失败: %v", err)
 	}
-	if len(app.records) != 1 || app.records[0].personaID != "builtin:a" {
-		t.Fatalf("别的人格的历史被误伤了：%+v", app.records)
+	if len(gone) != 0 {
+		t.Fatalf("删除后仍有它的历史：%+v", gone)
+	}
+
+	kept, err := hist.RecentMessages("builtin:a", 10)
+	if err != nil {
+		t.Fatalf("读历史失败: %v", err)
+	}
+	if len(kept) != 1 || kept[0].PersonaID != "builtin:a" {
+		t.Fatalf("别的人格的历史被误伤了：%+v", kept)
 	}
 
 	// 删除时被掐掉的那一轮可能在删除之后才收尾，这条"迟到的半截回复"不能再进历史
-	app.appendAssistant(id, "迟到的半截回复", ui.StatusCanceled)
-	if len(app.records) != 1 {
-		t.Fatalf("已删除人格的回复不该再进历史：%+v", app.records)
+	app.appendAssistant(sess.ID, id, "迟到的半截回复", history.StatusCanceled)
+	after, err := hist.RecentMessages(id, 10)
+	if err != nil {
+		t.Fatalf("读历史失败: %v", err)
+	}
+	if len(after) != 0 {
+		t.Fatalf("已删除人格的回复不该再进历史：%+v", after)
 	}
 }
 
 // 内置人格只读：存储层就该拦住，别指望 UI 一定先判一次。
 func TestDeleteBuiltinPersonaRefused(t *testing.T) {
-	app, _ := newPersonaApp(t)
+	app, _, _ := newPersonaApp(t)
 	if err := app.DeletePersona("builtin:a"); err == nil {
 		t.Fatal("内置人格应当不可删除")
 	}
@@ -77,7 +105,7 @@ func TestDeleteBuiltinPersonaRefused(t *testing.T) {
 
 // 删除当前人格后，存储层会回退到第一个内置人格；回执里要能说出切到了谁。
 func TestDeleteActivePersonaFallsBack(t *testing.T) {
-	app, st := newPersonaApp(t)
+	app, st, _ := newPersonaApp(t)
 
 	id, err := st.CreatePersona("会被删掉的", "builtin:a")
 	if err != nil {
@@ -97,7 +125,7 @@ func TestDeleteActivePersonaFallsBack(t *testing.T) {
 
 // 设置页要能改"非当前人格"，所以 SaveSeedText 必须带 personaID 而不是只看当前人格。
 func TestSaveSeedTextTargetsGivenPersona(t *testing.T) {
-	app, st := newPersonaApp(t)
+	app, st, _ := newPersonaApp(t)
 
 	id, err := st.CreatePersona("另一个", "builtin:a")
 	if err != nil {

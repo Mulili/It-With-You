@@ -1,10 +1,12 @@
--- 人格系统的表结构（阶段3 v1）
+-- 整个库的表结构（阶段4 v2）
 --
--- 时间统一用 bigint（Unix 毫秒）：与应用内 Persona/PersonaRule 的时间口径一致，
--- 避免 Go 与 PG 之间来回换算（阶段4 若要做时间范围查询，毫秒也够用）。
+-- 时间统一用 bigint（Unix 毫秒）：与应用内的时间口径一致，避免 Go 与 PG 之间来回换算。
 --
--- 本文件由 PgStore 在连接成功后执行，语句都是幂等的（IF NOT EXISTS），
+-- 本文件由 internal/db 在连接成功后执行，语句都是幂等的（IF NOT EXISTS），
 -- 所以重复启动、升级都不需要额外处理。
+--
+-- 需要 pgvector 扩展的表**不在这里**，放在 schema_vector.sql——
+-- 缺扩展时只让那部分失败，不连累人格与历史。
 
 CREATE TABLE IF NOT EXISTS personas (
     id          uuid PRIMARY KEY,
@@ -57,7 +59,47 @@ CREATE TABLE IF NOT EXISTS persona_changes (
 
 CREATE INDEX IF NOT EXISTS persona_changes_persona_idx ON persona_changes (persona_id, created_at DESC);
 
--- 杂项设置（当前生效的人格、阶段4 的嵌入模型选择等）
+-- ---------- 阶段4：会话 ----------
+--
+-- 会话是历史的组织单位：历史落库后按会话分组，而"只发当前会话的消息"天然给出了
+-- 上下文边界（替代了原先"只发最近 N 轮"的截断方案）。
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id         uuid PRIMARY KEY,
+    -- NOT NULL：会话必然属于某个具体人格（你是在跟某一个人聊）。
+    -- 与 memories 的两分法（可空）形成对照：**经历私有，事实公共**
+    persona_id uuid   NOT NULL REFERENCES personas (id) ON DELETE CASCADE,
+    -- title / summary 由会话收尾时一次调用生成（懒结算）
+    title      text   NOT NULL DEFAULT '',
+    summary    text   NOT NULL DEFAULT '',
+    started_at bigint NOT NULL,
+    -- NULL = 还没收尾（懒结算要扫这个状态）
+    ended_at   bigint,
+    created_at bigint NOT NULL,
+    updated_at bigint NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS sessions_persona_idx ON sessions (persona_id, started_at DESC);
+-- 部分索引：收尾时只扫"还没结束"的会话，比全列索引小得多
+CREATE INDEX IF NOT EXISTS sessions_open_idx ON sessions (ended_at) WHERE ended_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS messages (
+    id         uuid PRIMARY KEY,
+    session_id uuid   NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+    persona_id uuid   NOT NULL REFERENCES personas (id) ON DELETE CASCADE,
+    -- role: system / user / assistant（system 不进这张表，见 app.go 的说明）
+    role       text   NOT NULL,
+    content    text   NOT NULL,
+    -- status: ok / canceled（半截回复也留痕，但可区分）
+    status     text   NOT NULL,
+    created_at bigint NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS messages_session_idx ON messages (session_id, created_at);
+
+-- ---------- 设置与版本 ----------
+
+-- 杂项设置（当前生效的人格、思考开关等）
 CREATE TABLE IF NOT EXISTS app_settings (
     key   text PRIMARY KEY,
     value text NOT NULL

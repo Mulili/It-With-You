@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"agent-for-you-love/internal/history"
 	"agent-for-you-love/internal/llm"
 	"agent-for-you-love/internal/persona"
 	errorcode "agent-for-you-love/internal/pkg/errorCode"
@@ -30,50 +31,54 @@ type App struct {
 	provider llm.Provider
 	// personas 是人格存储。阶段3 用内存实现，⑥ 换成 PG（同一接口）。
 	personas persona.Store
+	// history 是对话历史（阶段4）：PG 是**唯一真源**，不再留内存副本。
+	//
+	// 敢不留副本，是因为写入频率很低（每轮两条）、读取也低（每轮一次拼上下文 +
+	// 打开菜单时一次）；而"两份数据要成对维护"的代价很高——漏一处就永久不同步，
+	// 症状又是"菜单里少一条"这种极难定位的问题。
+	history history.Store
 
 	mu sync.Mutex
-	// records 是会话历史的唯一真源，阶段2.5 只放内存：隐藏窗口不销毁进程，
-	// 所以"关闭窗口不丢历史"这条验收成立；进程重启即丢，持久化留到阶段3 / 阶段4。
-	//
-	// 两个出口都从它投影而来，不另存副本——两份数据要成对 append，
-	// 漏一处就会永久不同步，而症状是"菜单里少一条"这种极难定位的问题：
-	//   - 发给模型：projectMessages（阶段4 的上下文截断加在那里）
-	//   - 给前端菜单：History（截到最近 ui.HistoryDisplayLimit 条）
-	records []record
 	// prevCancel 是上一轮流的取消函数。context.CancelFunc 可重复调用，所以不必清理，
 	// 每次新请求直接覆盖即可——省掉了"谁负责清空"的并发问题。
 	prevCancel context.CancelFunc
-	msgSeq     int
+	// msgSeq 生成**轮次 ID**：前端用它过滤掉上一轮请求的残留片段。
+	//
+	// 它与消息 ID 不是一回事：消息 ID 是 uuid、由 history 存储层生成、要落库；
+	// 轮次 ID 只在一轮请求内有效，重启后从头数也无所谓。
+	msgSeq int
 	// deletedPersonas 记住已被删除的人格 ID：删人格时那一轮可能还在收尾，
 	// 它的"半截回复"不能再写进历史（personaID 已失效，写进去就是孤儿数据）。
 	// 集合很小且只在删人格时增长，不做清理。
 	deletedPersonas map[string]bool
-}
 
-// record 是内部记录：除了 llm.Message 还带上展示需要的编号、时间与状态。
-//
-// 这些字段必须留在这里，不能加进 llm.Message——后者会被整段序列化进请求体，
-// 加什么字段都会原样发给模型。
-type record struct {
-	id string
-	// personaID 标识这条消息属于哪个人格。
+	// thinkingDisabled 是用户的思考模式开关（应用级设置，缓存在内存里）。
 	//
-	// 历史按人格隔离：在用户眼里每个人格都是一个独立个体，把 A 的对话带进 B 的上下文
-	// 就是污染（B 会知道它本不该知道的事）。所以读历史、拼上下文、写回复都要认这个字段。
-	personaID string
-	message   llm.Message
-	at        int64
-	status    string
+	// 缓存的理由：Ask 每轮都要用它决定带不带 thinking 字段，不该每次都查一遍库；
+	// 而写入口只有 SetThinkingDisabled 一处，所以缓存不会走样。
+	thinkingDisabled bool
 }
 
-// nextID 返回进程内自增的记录编号。调用方必须持有 a.mu。
+// nextID 返回进程内自增的轮次编号。
 func (a *App) nextID() string {
 	a.msgSeq++
 	return fmt.Sprintf("m%d", a.msgSeq)
 }
 
-func NewApp(provider llm.Provider, personas persona.Store) *App {
-	return &App{provider: provider, personas: personas}
+func NewApp(provider llm.Provider, personas persona.Store, hist history.Store) *App {
+	a := &App{provider: provider, personas: personas, history: hist}
+	// 思考开关读一次就缓存在内存：Ask 每轮都要用它，不该每次都查库。
+	// 读失败按默认（false = 跟随官方默认的"思考开启"）继续——一个设置读不到，
+	// 不该让整个应用起不来。
+	if personas != nil {
+		disabled, err := personas.ThinkingDisabled()
+		if err != nil {
+			log.Printf("[app] 读取思考开关失败，按默认（开启思考）处理: %v", err)
+		} else {
+			a.thinkingDisabled = disabled
+		}
+	}
+	return a
 }
 
 // startup 由 Wails 在应用启动时调用，此后 runtime 才可用。
@@ -95,10 +100,17 @@ func (a *App) startup(ctx context.Context) {
 // shutdown 由 Wails 在应用退出时调用。
 func (a *App) shutdown(ctx context.Context) {
 	ui.StopTray()
-	// 存储若持有资源（PG 连接池），在这里释放；内存实现也实现了 Close，是空操作
+	// 存储若持有资源（PG 连接池），在这里释放。两个 store 都实现了 io.Closer，
+	// 但真正关池的只有 persona：池是全应用共用的那一个，history 的 Close 是空操作——
+	// 若它也去关，先被调到的那个就会把池关掉、另一个立刻失效。
 	if c, ok := a.personas.(io.Closer); ok {
 		if err := c.Close(); err != nil {
 			log.Printf("[persona] 关闭存储失败: %v", err)
+		}
+	}
+	if c, ok := a.history.(io.Closer); ok {
+		if err := c.Close(); err != nil {
+			log.Printf("[history] 关闭存储失败: %v", err)
 		}
 	}
 	log.Println("[app] 已退出")
@@ -128,6 +140,9 @@ func (a *App) Ask(text string) (string, error) {
 	if a.ctx == nil {
 		return "", errorcode.New(errorcode.BadRequest, "应用尚未准备就绪")
 	}
+	if a.history == nil {
+		return "", errorcode.New(errorcode.BadRequest, "历史存储未就绪")
+	}
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return "", nil
@@ -142,24 +157,63 @@ func (a *App) Ask(text string) (string, error) {
 	a.prevCancel = cancel
 	// 这一轮归属"当前人格"：历史按人格隔离，回复也要写回它所属的那一份
 	personaID := a.activePersonaID()
-	// 这一轮的 ID 同时就是这条 user 记录的 ID，流式事件也用它，前端据此过滤片段
+	// 轮次 ID：前端据此过滤片段，与落库的消息 ID 无关
 	id := a.nextID()
-	a.records = append(a.records, record{
-		id:        id,
-		personaID: personaID,
-		message:   llm.Message{Role: llm.RoleUser, Content: text},
-		at:        time.Now().UnixMilli(),
-		status:    ui.StatusOK, // 用户这句话在发出时就是完整的
-	})
-	// 拷贝一份给 goroutine：之后 records 还会被 append，共享底层数组会读到意料之外的内容。
-	msgs := a.buildMessages(personaID, a.recordsOf(personaID))
+	// 思考开关是 a 的字段，在锁内取出来交给 goroutine，别让后台再去碰它
+	noThinking := a.thinkingDisabled
 	a.mu.Unlock()
 
-	go a.stream(ctx, id, personaID, msgs)
+	// 先确定"这一轮写进哪个会话"：上个话题没聊完就接着它，聊完了就开新的
+	sess, err := a.history.EnsureSession(personaID)
+	if err != nil {
+		return "", fmt.Errorf("准备会话失败: %w", err)
+	}
+
+	// 用户这句话**先写库、再读**：这样读出来的消息列表天然包含它，
+	// 不必在拼上下文时手工追加——少一处容易漏的地方。
+	if _, err := a.history.AppendMessage(history.Message{
+		SessionID: sess.ID,
+		PersonaID: personaID,
+		Role:      llm.RoleUser,
+		Content:   text,
+		Status:    history.StatusOK, // 用户这句话在发出时就是完整的
+	}); err != nil {
+		// 写不进去就不往下走：历史是硬性要求，缺一条会让后续上下文错位
+		return "", fmt.Errorf("保存消息失败: %w", err)
+	}
+
+	msgs, err := a.sessionMessages(sess.ID)
+	if err != nil {
+		return "", err
+	}
+	full := a.buildMessages(personaID, msgs)
+
+	go a.stream(ctx, id, sess.ID, personaID, full, noThinking)
 	// 顺带看一眼这句话里有没有"长期要求"（粗筛命中才会真的调一次模型）。
 	// 它有自己的 ctx 与超时，不会因为用户紧接着发下一句而被取消。
 	go a.handleDirective(text)
 	return id, nil
+}
+
+// sessionMessages 读出一个会话的消息，转成发给模型的形式（时间正序）。
+func (a *App) sessionMessages(sessionID string) ([]llm.Message, error) {
+	rows, err := a.history.MessagesOf(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("读取会话消息失败: %w", err)
+	}
+	return toLLMMessages(rows), nil
+}
+
+// toLLMMessages 把存储层的消息投影成发给模型的消息。
+//
+// 只取 role 与 content：时间、状态这些是**给人看**的字段，而 llm.Message 会被整段
+// 序列化进请求体，多带一个字段就多发一份无用数据（还可能让模型误解）。
+func toLLMMessages(rows []history.Message) []llm.Message {
+	out := make([]llm.Message, 0, len(rows))
+	for _, m := range rows {
+		out = append(out, llm.Message{Role: m.Role, Content: m.Content})
+	}
+	return out
 }
 
 // Cancel 中止正在进行的回复（前端「停止」按钮）。
@@ -172,42 +226,30 @@ func (a *App) Cancel() {
 	}
 }
 
-// projectMessages 把内部记录投影成发给模型的消息。
-//
-// 现在只是把 message 摘出来，但它有意做成一函数而不是一段内联代码：
-// 阶段3 要在头部拼人格 System Prompt、阶段4 要「只发最近 N 轮」，
-// 那两件事都加在这里，而不是去动 records 本身。
-//
-// 纯函数、不碰锁：调用方持有 a.mu 时使用。
-func projectMessages(records []record) []llm.Message {
-	msgs := make([]llm.Message, 0, len(records))
-	for _, r := range records {
-		msgs = append(msgs, r.message)
-	}
-	return msgs
-}
-
 // History 返回**当前人格**最近的对话，供前端菜单展示（只读，拉模式）。
 //
 // 按人格过滤是刻意的：人格在用户眼里是独立个体，A 的对话不该出现在 B 的历史里。
-// 返回的是新切片，与内部 records 不共享底层数组，前端随便改都影响不到真源。
+// 这里取的是**跨会话**的最近若干条（按会话分组展示留到界面那一步）。
+//
+// 读失败返回空列表而不是错误：菜单是"看一眼"的东西，为它弹错误反而更吵；
+// 真出错时日志里有完整原因。
 func (a *App) History() []ui.HistoryItem {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	mine := a.recordsOf(a.activePersonaID())
-	start := len(mine) - ui.HistoryDisplayLimit
-	if start < 0 {
-		start = 0
+	if a.history == nil {
+		return nil
 	}
-	items := make([]ui.HistoryItem, 0, len(mine)-start)
-	for _, r := range mine[start:] {
+	rows, err := a.history.RecentMessages(a.activePersonaID(), ui.HistoryDisplayLimit)
+	if err != nil {
+		log.Printf("[history] 读取历史失败: %v", err)
+		return nil
+	}
+	items := make([]ui.HistoryItem, 0, len(rows))
+	for _, m := range rows {
 		items = append(items, ui.HistoryItem{
-			ID:     r.id,
-			Role:   r.message.Role,
-			Text:   r.message.Content,
-			At:     r.at,
-			Status: r.status,
+			ID:     m.ID,
+			Role:   m.Role,
+			Text:   m.Content,
+			At:     m.CreatedAt,
+			Status: m.Status,
 		})
 	}
 	return items
@@ -221,46 +263,35 @@ func (a *App) activePersonaID() string {
 	return a.personas.Snapshot().ActiveID
 }
 
-// recordsOf 取出某个人格的历史。调用方需持有 a.mu。
-func (a *App) recordsOf(personaID string) []record {
-	out := make([]record, 0, len(a.records))
-	for _, r := range a.records {
-		if r.personaID == personaID {
-			out = append(out, r)
-		}
-	}
-	return out
-}
-
-// buildMessages 组装发给模型的消息：人格 system（若有）+ **该人格的**对话历史。
+// buildMessages 组装发给模型的消息：人格 system（若有）+ **当前会话的**消息。
 //
-// 三件事刻意如此：
-//   - system **不写进 records**：用户不该在历史列表里看到系统提示词，切换人格也才会立即生效；
+// 四点刻意如此：
+//   - system **不写进历史**：用户不该在历史列表里看到系统提示词，切换人格也才会立即生效；
 //   - 人格每轮现拼：所以改人格、改规则、用户提了新要求，下一轮就生效，不需要重启；
-//   - 只喂当前人格的历史：别的人格聊过的内容不该出现在它的上下文里；
+//   - 只喂**当前会话**：这是会话化最大的收益——上下文边界天然给出，
+//     不再需要"只发最近 N 轮"那种截断。更早的话题要靠记忆召回，而不是一路全带上；
 //   - 预算截断发生在 persona.BuildSystemPrompt 内（超预算先截 recent 层，主体与 core 永不截）。
-func (a *App) buildMessages(personaID string, mine []record) []llm.Message {
-	history := projectMessages(mine)
+func (a *App) buildMessages(personaID string, msgs []llm.Message) []llm.Message {
 	if a.personas == nil {
-		return history
+		return msgs
 	}
 
 	snap := a.personas.Snapshot()
 	active, ok := findPersona(snap.Personas, personaID)
 	if !ok {
-		return history
+		return msgs
 	}
 	system, dropped := persona.BuildSystemPrompt(active, snap.Rules)
 	if dropped > 0 {
 		log.Printf("[persona] 「%s」的 recent 层有 %d 条规则超出注入预算，本轮未注入", active.Name, dropped)
 	}
 	if strings.TrimSpace(system) == "" {
-		return history
+		return msgs
 	}
 
-	msgs := make([]llm.Message, 0, len(history)+1)
-	msgs = append(msgs, llm.Message{Role: llm.RoleSystem, Content: system})
-	return append(msgs, history...)
+	out := make([]llm.Message, 0, len(msgs)+1)
+	out = append(out, llm.Message{Role: llm.RoleSystem, Content: system})
+	return append(out, msgs...)
 }
 
 // findPersona 按 ID 找人。
@@ -367,10 +398,85 @@ func (a *App) writablePersona() (id string, copiedFrom string, err error) {
 //
 // 读走"一次拿全"、写走细粒度方法：小浮层里多次往返会有肉眼可见的卡顿。
 func (a *App) GetPersonaSnapshot() (persona.Snapshot, error) {
-	if a.personas == nil {
-		return persona.Snapshot{}, fmt.Errorf("人格存储未就绪")
+	if err := a.requireStore(); err != nil {
+		return persona.Snapshot{}, err
 	}
 	return a.personas.Snapshot(), nil
+}
+
+// GetPersonaRules 返回**指定**人格的规则。
+//
+// 快照里只有当前人格的规则，而编辑器要能改任意人格（含非当前人格）——
+// 否则"想改 Miku 的规则"就得先切到 Miku，而切换会掐掉正在生成的那一轮、清空气泡，
+// 副作用太大，不该由"编辑"这个动作触发。
+func (a *App) GetPersonaRules(personaID string) ([]persona.PersonaRule, error) {
+	if err := a.requireStore(); err != nil {
+		return nil, err
+	}
+	return a.personas.RulesOf(personaID)
+}
+
+// GetPersonaMeta 返回编辑器的静态元信息：槽位清单 + 各字段长度上限。
+//
+// 由后端提供而不是前端硬编码：槽位表与上限值是"唯一真相"，前端下拉、字数提示、
+// 导入校验都该用同一份；否则加了槽位只改了 Go 那边，UI 里就选不到它。
+func (a *App) GetPersonaMeta() persona.Meta {
+	return persona.MetaInfo()
+}
+
+// GetPersonaChanges 返回指定人格的最近变更记录（时间倒序）。
+//
+// 与 GetPersonaRules 同理：快照只带当前人格的变更，而编辑器要能看任意人格的。
+func (a *App) GetPersonaChanges(personaID string) ([]persona.PersonaChange, error) {
+	if err := a.requireStore(); err != nil {
+		return nil, err
+	}
+	return a.personas.ChangesOf(personaID)
+}
+
+// ---------- 应用级设置（⑨）----------
+
+// AppSettings 是「设置」浮层需要的全局设置。
+//
+// 刻意与 persona.Snapshot 分开：那个快照装的是"某个人格"的数据，而思考开关不属于任何人格，
+// 混进去会让"读某个人格的快照"顺带读到全局状态。
+type AppSettings struct {
+	// ThinkingDisabled 为 true 表示用户关掉了思考模式；默认 false = 跟随官方默认（思考开启）
+	ThinkingDisabled bool `json:"thinkingDisabled"`
+}
+
+// GetSettings 返回全局设置。
+func (a *App) GetSettings() AppSettings {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return AppSettings{ThinkingDisabled: a.thinkingDisabled}
+}
+
+// SetThinkingDisabled 保存思考模式开关。
+//
+// 关掉它的收益（见 operation.md 问题7）：首字更快（不必先算完思维链）、思考 token 不再计费，
+// 且 temperature / top_p 这些"跳脱感"旋钮恢复生效——思考模式下它们会**静默失效**。
+//
+// 默认不关：这是用户的偏好，不替他做决定。
+// 只作用于对话通路（Ask）；内部抽取（handleDirective）不受影响，那条链路靠准确性吃饭。
+func (a *App) SetThinkingDisabled(disabled bool) error {
+	if err := a.requireStore(); err != nil {
+		return err
+	}
+	if err := a.personas.SetThinkingDisabled(disabled); err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	a.thinkingDisabled = disabled
+	a.mu.Unlock()
+
+	state := "已开启思考模式"
+	if disabled {
+		state = "已关闭思考模式"
+	}
+	log.Printf("[app] %s（只影响对话，人格抽取不受影响）", state)
+	return nil
 }
 
 // SetActivePersona 切换当前生效的人格。
@@ -455,20 +561,19 @@ func (a *App) DeletePersona(id string) error {
 	if err := a.personas.DeletePersona(id); err != nil {
 		return err
 	}
+	// 历史在 PG 侧有外键 CASCADE 兜着，但这里仍显式清一次：
+	// 不让"数据被清掉"这件事依赖一个看不见的外键行为，内存实现也走同一条路径
+	if a.history != nil {
+		if err := a.history.DeletePersona(id); err != nil {
+			log.Printf("[history] 清理已删除人格的历史失败: %v", err)
+		}
+	}
 
 	a.mu.Lock()
 	if a.deletedPersonas == nil {
 		a.deletedPersonas = make(map[string]bool)
 	}
 	a.deletedPersonas[id] = true
-	// 显式新建切片而不是原地过滤：原地复用底层数组会给"同时持有旧切片"的地方埋雷
-	kept := make([]record, 0, len(a.records))
-	for _, r := range a.records {
-		if r.personaID != id {
-			kept = append(kept, r)
-		}
-	}
-	a.records = kept
 	a.mu.Unlock()
 
 	// 删掉的若是当前人格，存储层已把当前人格回退到第一个内置人格，回执里说清切到了谁
@@ -678,10 +783,12 @@ func (a *App) ruleLabel(ruleID string) (label, personaID string) {
 
 // stream 消费 Provider 的通道，边收边推事件。
 //
-// personaID 是这一轮所属的人格：回复要写回它的历史——即使用户中途切了人格，
-// 这条回复仍然属于"当初被问的那个人"。
-func (a *App) stream(ctx context.Context, id, personaID string, msgs []llm.Message) {
-	ch, err := a.provider.ChatStream(ctx, msgs)
+// sessionID 决定这条回复写进哪段会话；personaID 决定它属于哪个人格——
+// 即使用户中途切了人格、或聊开了新话题，这条回复仍然属于"当初被问的那个人、那一次对话"。
+//
+// noThinking 是这一轮的思考开关（由 Ask 在锁内读出后传入，不在这里读 a 的字段）。
+func (a *App) stream(ctx context.Context, id, sessionID, personaID string, msgs []llm.Message, noThinking bool) {
+	ch, err := a.provider.ChatStream(ctx, msgs, llm.ChatOptions{DisableThinking: noThinking})
 	if err != nil {
 		// 走到这里说明请求还没发出去（缺 Key、网络不通、4xx）。历史里保留用户这句，方便重试。
 		runtime.EventsEmit(a.ctx, ui.EventChatError, ui.ChatErrorPayload{ID: id, Message: err.Error()})
@@ -694,7 +801,7 @@ func (a *App) stream(ctx context.Context, id, personaID string, msgs []llm.Messa
 			if errors.Is(chunk.Err, context.Canceled) {
 				// 用户点了停止、发了新问题、或切了人格——这不是错误，安静收场。
 				// 已收到的半截内容照样进历史，但标成 canceled：菜单要能把它和正常回复区分开。
-				a.appendAssistant(personaID, full.String(), ui.StatusCanceled)
+				a.appendAssistant(sessionID, personaID, full.String(), ui.StatusCanceled)
 				return
 			}
 			runtime.EventsEmit(a.ctx, ui.EventChatError, ui.ChatErrorPayload{ID: id, Message: chunk.Err.Error()})
@@ -707,30 +814,39 @@ func (a *App) stream(ctx context.Context, id, personaID string, msgs []llm.Messa
 		runtime.EventsEmit(a.ctx, ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: chunk.Content})
 	}
 
-	a.appendAssistant(personaID, full.String(), ui.StatusOK)
+	a.appendAssistant(sessionID, personaID, full.String(), ui.StatusOK)
 	runtime.EventsEmit(a.ctx, ui.EventChatDone, ui.ChatDonePayload{ID: id})
 }
 
-// appendAssistant 把这一轮的回复写进**它所属人格**的历史。
+// appendAssistant 把这一轮的回复写进**它所属的会话**。
 // status 区分"正常说完"与"被用户打断"。
-func (a *App) appendAssistant(personaID, content, status string) {
+//
+// 写失败只记日志、不外抛：回复已经流式展示给用户了，收不回来；
+// 而且这个函数跑在 goroutine 里，也没有调用方能接住错误。
+func (a *App) appendAssistant(sessionID, personaID, content, status string) {
 	if content == "" {
 		return
 	}
+
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	deleted := a.deletedPersonas[personaID]
+	a.mu.Unlock()
 	// 人格刚被删掉：这条回复属于一个已不存在的人，写进去就是孤儿数据
 	//（删人格时会掐掉那一轮，但它的收尾可能晚于删除动作）
-	if a.deletedPersonas[personaID] {
+	if deleted {
 		return
 	}
-	a.records = append(a.records, record{
-		id:        a.nextID(),
-		personaID: personaID,
-		message:   llm.Message{Role: llm.RoleAssistant, Content: content},
-		at:        time.Now().UnixMilli(),
-		status:    status,
-	})
+
+	// 写库是 IO，不持锁做：锁内只读那个小 map
+	if _, err := a.history.AppendMessage(history.Message{
+		SessionID: sessionID,
+		PersonaID: personaID,
+		Role:      llm.RoleAssistant,
+		Content:   content,
+		Status:    status,
+	}); err != nil {
+		log.Printf("[history] 写入回复失败（回复已展示给用户，无法回退）: %v", err)
+	}
 }
 
 // ShowWindow 显示窗口。

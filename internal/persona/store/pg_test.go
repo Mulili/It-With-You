@@ -2,11 +2,11 @@ package store
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
 	"agent-for-you-love/internal/config"
+	"agent-for-you-love/internal/db"
 	"agent-for-you-love/internal/persona"
 	"agent-for-you-love/internal/persona/builtin"
 )
@@ -21,7 +21,7 @@ import (
 func openTestPgStore(t *testing.T) *PgStore {
 	t.Helper()
 	config.LoadDotEnvUpward()
-	dsn := DSNFromEnv()
+	dsn := db.DSNFromEnv()
 	if dsn == "" {
 		t.Skip("未配置 COMPANION_PG_DSN，跳过 PG 集成测试")
 	}
@@ -33,10 +33,11 @@ func openTestPgStore(t *testing.T) *PgStore {
 	if err != nil {
 		t.Fatalf("加载内置人格失败: %v", err)
 	}
-	store, err := NewPgStore(ctx, dsn, builtins)
+	pool, err := db.Open(ctx, dsn)
 	if err != nil {
 		t.Fatalf("连接数据库失败: %v", err)
 	}
+	store := NewPgStore(pool, builtins)
 	t.Cleanup(func() { _ = store.Close() })
 	return store
 }
@@ -142,40 +143,147 @@ func TestPgStoreRoundTrip(t *testing.T) {
 	}
 }
 
-// 降级路径：DSN 缺失或连不上时，必须退回内存实现并标记 StorageReady=false，
+// 内置人格的 ID 形如 "builtin:lapwing"，**不是 uuid**。三条读路径都必须把它当"内存里那份"处理，
+// 而不是拿去查库——否则 PG 会以 22P02（无效的 uuid 输入语法）拒绝。
+//
+// 这个 bug 内存实现测不出来（它根本不校验 uuid），只有真连上 PG 才暴露：
+// 症状是日志里反复刷 22P02，而界面上只是"变更记录为空"，看不出是错误。
+func TestPgStoreBuiltinReadPaths(t *testing.T) {
+	s := openTestPgStore(t)
+
+	builtins, err := builtin.Load()
+	if err != nil {
+		t.Fatalf("加载内置人格失败: %v", err)
+	}
+	if len(builtins) == 0 {
+		t.Fatal("没有可用的内置人格")
+	}
+	id := builtins[0].Persona.ID
+
+	// Snapshot 读的是"当前人格"，所以要真的切过去才能覆盖那条路径；
+	// 切之前记下原值，跑完恢复——测试不该改变用户的实际使用状态
+	before := s.Snapshot().ActiveID
+	t.Cleanup(func() {
+		if before != "" {
+			_ = s.SetActivePersona(before)
+		}
+	})
+	if err := s.SetActivePersona(id); err != nil {
+		t.Fatalf("切到内置人格失败: %v", err)
+	}
+
+	snap := s.Snapshot()
+	if snap.ActiveID != id {
+		t.Errorf("当前人格应当是 %s，实际 %s", id, snap.ActiveID)
+	}
+	if len(snap.Rules) == 0 {
+		t.Error("内置人格的规则应取注入时带进来的那份，不该为空")
+	}
+	if len(snap.RecentChanges) != 0 {
+		t.Errorf("内置人格不该有变更记录，实际 %d 条", len(snap.RecentChanges))
+	}
+
+	rules, err := s.RulesOf(id)
+	if err != nil {
+		t.Fatalf("读内置人格的规则报错: %v", err)
+	}
+	if len(rules) == 0 {
+		t.Error("内置人格的规则不该为空")
+	}
+
+	changes, err := s.ChangesOf(id)
+	if err != nil {
+		t.Fatalf("读内置人格的变更记录报错: %v", err)
+	}
+	if len(changes) != 0 {
+		t.Errorf("内置人格不该有变更记录，实际 %d 条", len(changes))
+	}
+}
+
+// 阶段0 的最后一项验收：pgvector 必须**真的启用**（扩展文件就位 ≠ 已启用）。
+//
+// 这条现在就验、而不是留到阶段4：阶段4 的 memories 表要用 vector 列 + HNSW 索引，
+// 到那时才发现"扩展没装/版本不对"会白折腾一轮。顺带把三件套一起验掉——
+// 向量类型、HNSW 索引、余弦距离算子，缺哪一块都是阶段4 的硬阻塞。
+//
+// 临时表用完即删（含失败路径），不在用户的库里留垃圾。
+func TestPgVectorExtensionReady(t *testing.T) {
+	s := openTestPgStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var version string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT extversion FROM pg_extension WHERE extname = 'vector'`).Scan(&version); err != nil {
+		t.Fatalf("pgvector 未在库中启用（%v）；执行：psql -U postgres -d companion -c \"CREATE EXTENSION IF NOT EXISTS vector;\"", err)
+	}
+	t.Logf("pgvector 已启用，版本 %s", version)
+
+	const probe = "_vec_probe_test"
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(context.Background(), `DROP TABLE IF EXISTS `+probe)
+	})
+
+	if _, err := s.pool.Exec(ctx, `CREATE TABLE `+probe+` (id int, embedding vector(1536))`); err != nil {
+		t.Fatalf("vector 类型不可用: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `CREATE INDEX ON `+probe+` USING hnsw (embedding vector_cosine_ops)`); err != nil {
+		t.Fatalf("HNSW 索引不可用: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO `+probe+` VALUES (1, array_fill(0.1, ARRAY[1536])::vector)`); err != nil {
+		t.Fatalf("写入向量失败: %v", err)
+	}
+
+	// 0.1 与 0.2 是共线的同向向量，余弦距离应当≈0（留浮点余量）
+	var dist float64
+	if err := s.pool.QueryRow(ctx,
+		`SELECT embedding <=> array_fill(0.2, ARRAY[1536])::vector FROM `+probe).Scan(&dist); err != nil {
+		t.Fatalf("余弦距离算子不可用: %v", err)
+	}
+	if dist < 0 || dist > 1e-6 {
+		t.Errorf("同向向量的余弦距离应当≈0，实际 %v", dist)
+	}
+}
+
+// 降级路径：没有可用连接池时必须退回内存实现并标记 StorageReady=false，
 // 而不是让应用起不来。
+//
+// 注意职责已按 internal/db 的引入拆开了：**连接本身**由 db.Open 负责
+// （连不上就报错，不自己降级），人格这边只负责"拿到 nil 池时退回内存"。
+// 所以这两件事分在两处断言。
 func TestOpenStoreFallsBackToMemory(t *testing.T) {
 	builtins, err := builtin.Load()
 	if err != nil {
 		t.Fatalf("加载内置人格失败: %v", err)
 	}
 
-	for _, dsn := range []string{"", "postgres://nobody@127.0.0.1:1/nothing"} {
-		store := OpenStore(dsn, builtins)
-		if _, ok := store.(*MemoryStore); !ok {
-			t.Errorf("dsn=%q 时应当退回内存实现，实际 %T", dsn, store)
-		}
-		snap := store.Snapshot()
-		if snap.StorageReady {
-			t.Errorf("dsn=%q 时应当标记 StorageReady=false", dsn)
-		}
-		if len(snap.Personas) == 0 {
-			t.Errorf("dsn=%q 时内置人格应当照常可用", dsn)
-		}
-		if snap.ActiveID == "" {
-			t.Errorf("dsn=%q 时应当有默认生效人格", dsn)
-		}
-		t.Logf("dsn=%q → %T，内置人格 %d 个，默认人格 %s", dsn, store, len(snap.Personas), snap.ActiveID)
+	store := OpenStore(nil, builtins)
+	if _, ok := store.(*MemoryStore); !ok {
+		t.Errorf("没有连接池时应当退回内存实现，实际 %T", store)
 	}
-}
+	snap := store.Snapshot()
+	if snap.StorageReady {
+		t.Error("退回内存后应当标记 StorageReady=false")
+	}
+	if len(snap.Personas) == 0 {
+		t.Error("退回内存后内置人格应当照常可用")
+	}
+	if snap.ActiveID == "" {
+		t.Error("应当有默认生效人格")
+	}
+	t.Logf("→ %T，内置人格 %d 个，默认人格 %s", store, len(snap.Personas), snap.ActiveID)
 
-// 表结构版本比程序新时必须拒绝启动，而不是带着可能不兼容的结构跑下去。
-func TestPgStoreRejectsNewerSchema(t *testing.T) {
-	// 这条不依赖数据库：用一个明显不存在的版本号演示判断逻辑
-	if SchemaVersion < 1 {
-		t.Fatalf("SchemaVersion 应当 >= 1，实际 %d", SchemaVersion)
-	}
-	if !strings.Contains(schemaSQL, "CREATE TABLE IF NOT EXISTS personas") {
-		t.Error("schema.sql 里应当包含 personas 建表语句")
+	// 另一半：连接串为空或不可达时，db.Open 必须报错——main 据此决定降级
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, dsn := range []string{"", "postgres://nobody@127.0.0.1:1/nothing"} {
+		pool, err := db.Open(ctx, dsn)
+		if err == nil {
+			pool.Close()
+			t.Errorf("dsn=%q 时 db.Open 应当报错", dsn)
+			continue
+		}
+		t.Logf("dsn=%q → 按预期报错: %v", dsn, err)
 	}
 }
