@@ -4,15 +4,18 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
-	"path"
 	"sort"
-	"strings"
 
 	"agent-for-you-love/internal/persona"
+
+	"github.com/google/uuid"
 )
 
 // Entry 是一个内置人格及其规则。
-// 内置人格不落库（随 exe 分发、只读），所以规则跟着主体一起返回。
+//
+// 内置人格**只读**，内容（种子文本与规则）的权威来源始终是 exe 里的 json、不落库；
+// 库里只留一行"锚点"给它占位（见 persona/store 的 ensureBuiltinRows）。
+// 所以规则跟着主体一起返回，而不是从库里读。
 type Entry struct {
 	Persona persona.Persona
 	Rules   []persona.PersonaRule
@@ -55,9 +58,11 @@ func Load() ([]Entry, error) {
 		}
 		seen[f.Persona.Name] = name
 
-		// ID 由文件名推得，保证跨重启稳定：app_settings 里存的就是它，
-		// 若用随机 uuid，每次启动都会认为"当前人格不存在了"。
-		id := "builtin:" + strings.TrimSuffix(path.Base(name), ".json")
+		// id 必须由文件写死，理由见 validateBuiltinID
+		if err := validateBuiltinID(f.Persona.ID, name); err != nil {
+			return nil, err
+		}
+		id := f.Persona.ID
 
 		out = append(out, Entry{
 			Persona: persona.Persona{
@@ -72,4 +77,21 @@ func Load() ([]Entry, error) {
 		})
 	}
 	return out, nil
+}
+
+// validateBuiltinID 校验内置人格的 id：非空且是合法 uuid。
+//
+// 为什么不能由文件名推出来（以前的做法是 "builtin:" + 文件名）：那个 id 现在要在
+// personas 表里当外键锚点，所以必须是 uuid；更重要的是它必须**永久稳定**——
+// 改动它会让已经存在的历史与记忆变成孤儿（指向一个不存在的人格），
+// 而这件事从文件上看完全看不出来。所以把话说在这里，宁可启动就报错。
+func validateBuiltinID(id, fileName string) error {
+	if id == "" {
+		return fmt.Errorf("%s: 缺少 persona.id。内置人格必须写一个固定 uuid —— "+
+			"它在 personas 表里是历史与记忆的外键锚点，改动会让已有数据变成孤儿", fileName)
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		return fmt.Errorf("%s: persona.id = %q 不是合法 uuid：%v", fileName, id, err)
+	}
+	return nil
 }

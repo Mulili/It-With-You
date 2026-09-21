@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"unicode/utf8"
+
+	"agent-for-you-love/internal/llm"
 )
 
 // directiveHints 是本地粗筛的关键词。
@@ -84,7 +86,7 @@ func DirectivePrompt(userText string) (system, user string) {
 // 返回 error 表示"这次抽取不可用"（不是合法 json、缺字段、取值越界、疑似越权），
 // 调用方应当记日志后放弃；返回 IsDirective=false 表示"模型认为这不是长期要求"，属于正常收场。
 func ParseDirective(raw string) (Directive, error) {
-	cleaned := stripCodeFence(raw)
+	cleaned := llm.StripCodeFence(raw)
 
 	var d Directive
 	if err := json.Unmarshal([]byte(cleaned), &d); err != nil {
@@ -109,22 +111,6 @@ func ParseDirective(raw string) (Directive, error) {
 	d.Slot = CanonicalizeSlot(d.Slot)
 	d.Value = value
 	return d, nil
-}
-
-// stripCodeFence 去掉模型偶尔加上的 ```json ... ``` 包裹。
-// 提示词里已经要求不要包，但实际仍会偶发——不做这层容错就会白丢一次抽取。
-func stripCodeFence(raw string) string {
-	s := strings.TrimSpace(raw)
-	if !strings.HasPrefix(s, "```") {
-		return s
-	}
-	s = strings.TrimPrefix(s, "```")
-	s = strings.TrimPrefix(s, "json")
-	s = strings.TrimPrefix(s, "JSON")
-	if i := strings.LastIndex(s, "```"); i >= 0 {
-		s = s[:i]
-	}
-	return strings.TrimSpace(s)
 }
 
 // injectionVerbs / injectionTargets 组成越权粗筛：**动词与目标同时出现**才算可疑。

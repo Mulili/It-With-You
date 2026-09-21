@@ -1,11 +1,12 @@
 package builtin_test
 
 import (
-	"strings"
 	"testing"
 
 	"agent-for-you-love/internal/persona"
 	"agent-for-you-love/internal/persona/builtin"
+
+	"github.com/google/uuid"
 )
 
 // 内置人格是随 exe 分发的数据，坏文件必须在开发期就被拦住。
@@ -20,10 +21,18 @@ func TestBuiltinPersonasValid(t *testing.T) {
 	}
 
 	names := make(map[string]bool, len(list))
+	ids := make(map[string]bool, len(list))
 	for _, bp := range list {
-		if !strings.HasPrefix(bp.Persona.ID, "builtin:") {
-			t.Errorf("内置人格 ID 应以 builtin: 开头，实际是 %q", bp.Persona.ID)
+		// id 必须是合法 uuid 且唯一：它在 personas 表里当外键锚点，
+		// 改动一次就会让已存在的历史与记忆变成孤儿
+		if _, err := uuid.Parse(bp.Persona.ID); err != nil {
+			t.Errorf("内置人格 ID 必须是合法 uuid，实际是 %q：%v", bp.Persona.ID, err)
 		}
+		if ids[bp.Persona.ID] {
+			t.Errorf("内置人格 ID 重复: %s", bp.Persona.ID)
+		}
+		ids[bp.Persona.ID] = true
+
 		if !bp.Persona.IsBuiltin || bp.Persona.Origin != persona.OriginBuiltin {
 			t.Errorf("%s 的 IsBuiltin/Origin 没被正确设置: %+v", bp.Persona.ID, bp.Persona)
 		}

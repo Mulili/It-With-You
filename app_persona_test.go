@@ -46,23 +46,27 @@ func TestDeletePersonaClearsItsHistory(t *testing.T) {
 		t.Fatalf("新建人格失败: %v", err)
 	}
 
-	// 给两个人格各写一条历史（各用各自的会话）
-	seed := func(personaID, text string) history.Session {
+	// 给两个人格各写一条历史（各用各自的会话与片）
+	seed := func(personaID, text string) (history.Session, history.Chunk) {
 		t.Helper()
 		sess, err := hist.EnsureSession(personaID)
 		if err != nil {
 			t.Fatalf("建会话失败: %v", err)
 		}
+		c, err := hist.EnsureChunk(sess.ID, history.ChunkMaxRunes)
+		if err != nil {
+			t.Fatalf("取当前片失败: %v", err)
+		}
 		if _, err := hist.AppendMessage(history.Message{
-			SessionID: sess.ID, PersonaID: personaID,
+			SessionID: sess.ID, ChunkID: c.ID, PersonaID: personaID,
 			Role: llm.RoleUser, Content: text, Status: history.StatusOK,
 		}); err != nil {
 			t.Fatalf("写消息失败: %v", err)
 		}
-		return sess
+		return sess, c
 	}
 	seed("builtin:a", "甲的对话")
-	sess := seed(id, "临时的对话")
+	sess, chunk := seed(id, "临时的对话")
 
 	if err := app.DeletePersona(id); err != nil {
 		t.Fatalf("删除人格失败: %v", err)
@@ -85,7 +89,7 @@ func TestDeletePersonaClearsItsHistory(t *testing.T) {
 	}
 
 	// 删除时被掐掉的那一轮可能在删除之后才收尾，这条"迟到的半截回复"不能再进历史
-	app.appendAssistant(sess.ID, id, "迟到的半截回复", history.StatusCanceled)
+	app.appendAssistant(sess.ID, chunk.ID, id, "迟到的半截回复", history.StatusCanceled)
 	after, err := hist.RecentMessages(id, 10)
 	if err != nil {
 		t.Fatalf("读历史失败: %v", err)

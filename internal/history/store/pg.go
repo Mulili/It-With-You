@@ -49,6 +49,28 @@ func (s *PgStore) ctx() (context.Context, context.CancelFunc) {
 // 让 NULL 透到 Go 会逼每个调用点都处理一遍可空性，不如在 SQL 边界上收敛掉。
 const sessionColumns = `id, persona_id, title, summary, started_at, COALESCE(ended_at, 0), created_at, updated_at`
 
+// chunkColumns 是读片的列清单，与各处的 Scan 顺序一一对应。
+const chunkColumns = `id, session_id, persona_id, seq, started_at, COALESCE(ended_at, 0), summary, created_at, updated_at`
+
+// scanChunk 把一行读成片。
+func scanChunk(row pgx.Row) (history.Chunk, error) {
+	var c history.Chunk
+	err := row.Scan(&c.ID, &c.SessionID, &c.PersonaID, &c.Seq,
+		&c.StartedAt, &c.EndedAt, &c.Summary, &c.CreatedAt, &c.UpdatedAt)
+	return c, err
+}
+
+// nullIfEmpty 把空字符串转成 SQL NULL。
+//
+// 用途只有一个：chunk_id 在老行（v3 之前写入的）里是空的，而给 uuid 列传 ""
+// 会让 pgx 直接报错——传 nil 才是"没有值"。
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 // EnsureSession 实现 history.Store。
 func (s *PgStore) EnsureSession(personaID string) (history.Session, error) {
 	ctx, cancel := s.ctx()
@@ -92,6 +114,91 @@ func (s *PgStore) EnsureSession(personaID string) (history.Session, error) {
 	return sess, nil
 }
 
+// EnsureChunk 实现 history.Store。
+func (s *PgStore) EnsureChunk(sessionID string, maxRunes int) (history.Chunk, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	// 找当前片（未收尾）。每个会话最多一片，部分索引 session_chunks_open_idx 服务这条查询
+	row := s.pool.QueryRow(ctx, `
+		SELECT `+chunkColumns+`
+		FROM session_chunks
+		WHERE session_id = $1 AND ended_at IS NULL
+		ORDER BY seq DESC
+		LIMIT 1`, sessionID)
+
+	cur, err := scanChunk(row)
+	switch {
+	case err == nil:
+		size, err := s.chunkRunes(ctx, cur.ID)
+		if err != nil {
+			return history.Chunk{}, err
+		}
+		if maxRunes <= 0 || size < maxRunes {
+			return cur, nil
+		}
+		// 到阈值了：先把当前片收尾再开新片。
+		// **这一步发生在写入下一条用户消息之前**，所以片边界落在用户发言处，
+		// 一个问答对不会被从中间切开。
+		now := history.NowMillis()
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE session_chunks SET ended_at = $2, updated_at = $2 WHERE id = $1`,
+			cur.ID, now); err != nil {
+			return history.Chunk{}, fmt.Errorf("收尾当前片失败: %w", err)
+		}
+	case errors.Is(err, pgx.ErrNoRows):
+		// 还没有片，下面直接建第一片
+	default:
+		return history.Chunk{}, fmt.Errorf("查询当前片失败: %w", err)
+	}
+
+	var nextSeq int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(MAX(seq), 0) + 1 FROM session_chunks WHERE session_id = $1`,
+		sessionID).Scan(&nextSeq); err != nil {
+		return history.Chunk{}, fmt.Errorf("计算片序号失败: %w", err)
+	}
+	// persona_id 从会话取：片冗余它是为了让"某人格当前片"不必 JOIN，
+	// 但值必须与会话一致，所以在这里现取而不是让调用方传
+	var personaID string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT persona_id FROM sessions WHERE id = $1`, sessionID).Scan(&personaID); err != nil {
+		return history.Chunk{}, fmt.Errorf("读取会话所属人格失败: %w", err)
+	}
+
+	now := history.NowMillis()
+	c := history.Chunk{
+		ID:        uuid.NewString(),
+		SessionID: sessionID,
+		PersonaID: personaID,
+		Seq:       nextSeq,
+		StartedAt: now,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO session_chunks (id, session_id, persona_id, seq, started_at, ended_at, summary, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, NULL, '', $6, $7)`,
+		c.ID, c.SessionID, c.PersonaID, c.Seq, c.StartedAt, c.CreatedAt, c.UpdatedAt); err != nil {
+		return history.Chunk{}, fmt.Errorf("新建片失败: %w", err)
+	}
+	return c, nil
+}
+
+// chunkRunes 返回该片的字符数。
+//
+// 在 SQL 里算而不是把消息全取回 Go 再数：片可能有几百条消息，而每次发消息都要判一次大小，
+// 来回传这些数据不值得。PG 的 length() 按**字符**计数（不是字节），与 Go 侧的 rune 口径一致。
+func (s *PgStore) chunkRunes(ctx context.Context, chunkID string) (int, error) {
+	var total int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(SUM(length(content)), 0) FROM messages WHERE chunk_id = $1`,
+		chunkID).Scan(&total); err != nil {
+		return 0, fmt.Errorf("统计片大小失败: %w", err)
+	}
+	return total, nil
+}
+
 // AppendMessage 实现 history.Store。
 func (s *PgStore) AppendMessage(m history.Message) (string, error) {
 	ctx, cancel := s.ctx()
@@ -107,10 +214,12 @@ func (s *PgStore) AppendMessage(m history.Message) (string, error) {
 		m.Status = history.StatusOK
 	}
 
+	// chunk_id 可能是空串（v3 之前写入的老行没有分片）；给 uuid 列传 "" 会报错，转成 NULL
 	if _, err := s.pool.Exec(ctx, `
-		INSERT INTO messages (id, session_id, persona_id, role, content, status, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		m.ID, m.SessionID, m.PersonaID, m.Role, m.Content, m.Status, m.CreatedAt); err != nil {
+		INSERT INTO messages (id, session_id, chunk_id, persona_id, role, content, status, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		m.ID, m.SessionID, nullIfEmpty(m.ChunkID), m.PersonaID,
+		m.Role, m.Content, m.Status, m.CreatedAt); err != nil {
 		return "", fmt.Errorf("写入消息失败: %w", err)
 	}
 
@@ -123,24 +232,26 @@ func (s *PgStore) AppendMessage(m history.Message) (string, error) {
 	return m.ID, nil
 }
 
-// MessagesOf 实现 history.Store。
-func (s *PgStore) MessagesOf(sessionID string) ([]history.Message, error) {
+// ChunkMessages 实现 history.Store。
+func (s *PgStore) ChunkMessages(chunkID string) ([]history.Message, error) {
 	ctx, cancel := s.ctx()
 	defer cancel()
 
 	// 取尾部 limit 条（最近的）再翻回正序：直接写 ORDER BY created_at ASC LIMIT n
-	// 会取到会话**开头**的 n 条，正好是反的——这是个很容易写错、且错了也不报错的地方。
+	// 会取到片**开头**的 n 条，正好是反的——这是个很容易写错、且错了也不报错的地方。
+	//
+	// chunk_id 用 COALESCE 兜成空串：老行里它是 NULL，扫进 Go 的 string 会失败。
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, session_id, persona_id, role, content, status, created_at FROM (
-			SELECT id, session_id, persona_id, role, content, status, created_at
+		SELECT id, session_id, COALESCE(chunk_id::text, ''), persona_id, role, content, status, created_at FROM (
+			SELECT id, session_id, chunk_id, persona_id, role, content, status, created_at
 			FROM messages
-			WHERE session_id = $1
+			WHERE chunk_id = $1
 			ORDER BY created_at DESC
 			LIMIT $2
 		) t
-		ORDER BY created_at ASC`, sessionID, history.ContextMessagesLimit)
+		ORDER BY created_at ASC`, chunkID, history.ContextMessagesLimit)
 	if err != nil {
-		return nil, fmt.Errorf("读取会话消息失败: %w", err)
+		return nil, fmt.Errorf("读取片消息失败: %w", err)
 	}
 	defer rows.Close()
 	return scanMessages(rows)
@@ -152,8 +263,8 @@ func (s *PgStore) RecentMessages(personaID string, limit int) ([]history.Message
 	defer cancel()
 
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, session_id, persona_id, role, content, status, created_at FROM (
-			SELECT id, session_id, persona_id, role, content, status, created_at
+		SELECT id, session_id, COALESCE(chunk_id::text, ''), persona_id, role, content, status, created_at FROM (
+			SELECT id, session_id, chunk_id, persona_id, role, content, status, created_at
 			FROM messages
 			WHERE persona_id = $1
 			ORDER BY created_at DESC
@@ -172,7 +283,7 @@ func scanMessages(rows pgx.Rows) ([]history.Message, error) {
 	out := make([]history.Message, 0, 32)
 	for rows.Next() {
 		var m history.Message
-		if err := rows.Scan(&m.ID, &m.SessionID, &m.PersonaID,
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.ChunkID, &m.PersonaID,
 			&m.Role, &m.Content, &m.Status, &m.CreatedAt); err != nil {
 			return nil, fmt.Errorf("解析消息失败: %w", err)
 		}
@@ -215,13 +326,65 @@ func (s *PgStore) ListSessions(personaID string, limit int) ([]history.Session, 
 	return out, nil
 }
 
+// ListChunks 实现 history.Store。
+func (s *PgStore) ListChunks(sessionID string) ([]history.Chunk, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+chunkColumns+`
+		FROM session_chunks
+		WHERE session_id = $1
+		ORDER BY seq ASC`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("读取片列表失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]history.Chunk, 0, 4)
+	for rows.Next() {
+		var c history.Chunk
+		if err := rows.Scan(&c.ID, &c.SessionID, &c.PersonaID, &c.Seq,
+			&c.StartedAt, &c.EndedAt, &c.Summary, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("解析片失败: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历片失败: %w", err)
+	}
+	return out, nil
+}
+
+// EndSession 实现 history.Store。
+//
+// WHERE 里的 ended_at IS NULL 让它天然幂等：已经结束的会话不会被改第二次时间。
+// 这也顺带挡住了一个并发场景——同一个话题可能被连续两轮都判成"结束"。
+func (s *PgStore) EndSession(sessionID string) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE sessions SET ended_at = $2, updated_at = $2 WHERE id = $1 AND ended_at IS NULL`,
+		sessionID, history.NowMillis()); err != nil {
+		return fmt.Errorf("结束会话失败: %w", err)
+	}
+	return nil
+}
+
 // DeletePersona 实现 history.Store。
 func (s *PgStore) DeletePersona(personaID string) error {
 	ctx, cancel := s.ctx()
 	defer cancel()
 
-	// 只删会话，messages 由 ON DELETE CASCADE 跟着走（外键在 schema 里定义）
-	if _, err := s.pool.Exec(ctx, `DELETE FROM sessions WHERE persona_id = $1`, personaID); err != nil {
+	// 先删片再删会话：messages 的外键指向片、片指向会话，从叶子往根删读起来更清楚。
+	// CASCADE 其实兜得住，但显式写出来意图明确。
+	if _, err := s.pool.Exec(ctx,
+		`DELETE FROM session_chunks WHERE persona_id = $1`, personaID); err != nil {
+		return fmt.Errorf("删除历史分片失败: %w", err)
+	}
+	if _, err := s.pool.Exec(ctx,
+		`DELETE FROM sessions WHERE persona_id = $1`, personaID); err != nil {
 		return fmt.Errorf("删除历史失败: %w", err)
 	}
 	return nil

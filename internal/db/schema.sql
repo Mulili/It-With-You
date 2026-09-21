@@ -83,9 +83,41 @@ CREATE INDEX IF NOT EXISTS sessions_persona_idx ON sessions (persona_id, started
 -- 部分索引：收尾时只扫"还没结束"的会话，比全列索引小得多
 CREATE INDEX IF NOT EXISTS sessions_open_idx ON sessions (ended_at) WHERE ended_at IS NULL;
 
+-- 会话内的片：长会话按体量切开，避免"边打游戏边聊一整天"导致上下文被截断。
+--
+-- 为什么需要它：会话边界由"话题聊完"给出，但连续闲聊可能一整天不结束。只靠会话做边界，
+-- 超长会话要么被静默截断（中间内容既进不了上下文、也进不了长期记忆），要么顶爆上下文。
+-- 所以加一层**不依赖语义**的兜底：按体量切片，且片边界永远落在用户发言之前
+--（保证一个问答对不被从中间切开）。
+CREATE TABLE IF NOT EXISTS session_chunks (
+    id         uuid PRIMARY KEY,
+    session_id uuid    NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+    -- 冗余 persona_id：与 messages 同理，让"某人格当前片"这类查询不必 JOIN
+    persona_id uuid    NOT NULL REFERENCES personas (id) ON DELETE CASCADE,
+    -- seq 是会话内的片序号，从 1 开始
+    seq        integer NOT NULL,
+    started_at bigint  NOT NULL,
+    -- NULL = 还是当前片（每个会话最多一片）
+    ended_at   bigint,
+    -- 摘要由片收尾时一次生成（抽取式，见 operation.md），未生成为空
+    summary    text    NOT NULL DEFAULT '',
+    created_at bigint  NOT NULL,
+    updated_at bigint  NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS session_chunks_seq_idx ON session_chunks (session_id, seq);
+-- 部分索引：找"当前片"只扫未收尾的几行
+CREATE INDEX IF NOT EXISTS session_chunks_open_idx ON session_chunks (persona_id) WHERE ended_at IS NULL;
+-- 部分索引：收尾懒结算要扫"已关闭但还没摘要"的片
+CREATE INDEX IF NOT EXISTS session_chunks_pending_idx ON session_chunks (ended_at)
+    WHERE ended_at IS NOT NULL AND summary = '';
+
 CREATE TABLE IF NOT EXISTS messages (
     id         uuid PRIMARY KEY,
     session_id uuid   NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+    -- chunk_id 指向所属的片。**可空**是为了兼容 v3 之前写入的老行（那时还没有分片）；
+    -- 新写入的一定非空。这里不写 NOT NULL，否则老库加不上这条约束
+    chunk_id   uuid REFERENCES session_chunks (id) ON DELETE CASCADE,
     persona_id uuid   NOT NULL REFERENCES personas (id) ON DELETE CASCADE,
     -- role: system / user / assistant（system 不进这张表，见 app.go 的说明）
     role       text   NOT NULL,
@@ -95,7 +127,20 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at bigint NOT NULL
 );
 
+-- v3 增量迁移：给老库的 messages 补上 chunk_id。
+--
+-- **必须紧跟在建表语句之后、索引之前**：CREATE TABLE IF NOT EXISTS 对已存在的表是直接跳过，
+-- 所以老库的 messages 不会凭空多出这一列；而下面的 messages_chunk_idx 引用了它——
+-- 顺序反了就会报「字段 chunk_id 不存在」，且错误发生在启动建表阶段，看着跟索引毫无关系。
+--
+-- 老行补不上 chunk_id（那时还没有分片概念），所以这一列允许为空：
+-- 它们仍能按 session_id 读出来，只是不参与"按片拼上下文"。
+ALTER TABLE messages
+    ADD COLUMN IF NOT EXISTS chunk_id uuid REFERENCES session_chunks (id) ON DELETE CASCADE;
+
 CREATE INDEX IF NOT EXISTS messages_session_idx ON messages (session_id, created_at);
+-- 拼上下文是按片取的，这条索引直接服务它
+CREATE INDEX IF NOT EXISTS messages_chunk_idx ON messages (chunk_id, created_at);
 
 -- ---------- 设置与版本 ----------
 
@@ -110,3 +155,18 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version    integer PRIMARY KEY,
     applied_at bigint  NOT NULL
 );
+
+-- ---------- 增量迁移（幂等）----------
+--
+-- 为什么需要这一段：CREATE TABLE IF NOT EXISTS 只对**新库**有效——表已存在时它会直接跳过，
+-- 所以"给老表加一列"必须用 ALTER。
+--
+-- 约定：**加列的 ALTER 写在对应表定义的正下方**（就近放置，避免"建表—建索引—补列"
+-- 的顺序被跨文件段落打乱）；这里只放跨表的结构调整。
+--
+-- 注意：本段只处理"结构"，不搬数据；需要搬的会单独写明。
+
+-- v3：会话级的 session_index 改成片级的 chunk_index（粒度变了，所以顺带换名）。
+-- 它在 v2 里只建好了、从未写入过数据（写入逻辑在第 3 步才做），可以直接删。
+-- 这条是幂等的：表不存在时无事发生，也不会误删 chunk_index。
+DROP TABLE IF EXISTS session_index;

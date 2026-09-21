@@ -55,7 +55,38 @@ func NewPgStore(pool *pgxpool.Pool, builtins []builtin.Entry) *PgStore {
 	for _, b := range builtins {
 		s.builtinByID[b.Persona.ID] = b
 	}
+	s.ensureBuiltinRows(builtins)
 	return s
+}
+
+// ensureBuiltinRows 给每个内置人格在 personas 表里留一行"锚点"。
+//
+// 为什么需要：sessions / messages / memories 的 persona_id 都有外键约束，
+// 而用户完全可能一直用内置人格聊——没有这一行，那些写入会被外键拒绝，
+// 症状是"内置人格发不出消息、也看不到历史"（见 operation.md 问题9）。
+//
+// 这一行**只做锚点**：内容（种子文本、规则）的权威来源始终是 exe 里的 json，
+// 所以 seed_text 留空、读取时也以内存那份为准（listPersonas 会跳过库里的这行）；
+// 只把 name / origin 同步过来，便于直接在库表里看出这一行是谁。
+// 用 DO UPDATE 而不是 DO NOTHING：改 json 里的显示名后，库里的锚点会跟着走。
+func (s *PgStore) ensureBuiltinRows(builtins []builtin.Entry) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	now := time.Now().UnixMilli()
+	for _, b := range builtins {
+		_, err := s.pool.Exec(ctx, `
+			INSERT INTO personas (id, name, seed_text, origin, avatar_path, created_at, updated_at)
+			VALUES ($1, $2, '', $3, '', $4, $4)
+			ON CONFLICT (id) DO UPDATE
+			   SET name = EXCLUDED.name, origin = EXCLUDED.origin, updated_at = EXCLUDED.updated_at`,
+			b.Persona.ID, b.Persona.Name, persona.OriginBuiltin, now)
+		if err != nil {
+			// 刻意不在这里降级退回内存：那会让**已存在的人格**也读不到，副作用更大。
+			// 写清后果即可——真写不进去时，用户发消息会拿到明确的报错。
+			log.Printf("[persona] 内置人格「%s」的锚点行写入失败（历史与记忆会受影响）：%v", b.Persona.Name, err)
+		}
+	}
 }
 
 // Close 关闭连接池（应用退出时调用）。
@@ -716,6 +747,11 @@ func (s *PgStore) listPersonas(ctx context.Context) ([]persona.Persona, error) {
 		if err := rows.Scan(&p.ID, &p.Name, &p.SeedText, &p.Origin, &p.AvatarPath,
 			&p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("解析人格失败: %w", err)
+		}
+		// 内置人格在库里只有一行"锚点"（seed_text 是空的），内容以内存那份为准。
+		// 不跳过就会出现同一个 ID 两份：一份有内容、一份是空壳。
+		if _, isBuiltin := s.builtinByID[p.ID]; isBuiltin {
+			continue
 		}
 		out = append(out, p)
 	}

@@ -18,6 +18,27 @@ import (
 //
 // 测试只碰它自己建的临时人格（名字带时间戳，结束时删掉），不动内置人格与用户已有数据。
 
+// 内置人格必须在 personas 表里占一行：sessions / messages / memories 的 persona_id
+// 都有外键约束，少了这一行，用内置人格聊天时写入会被数据库拒绝
+// （症状是"发不出消息、也看不到历史"，见 operation.md 问题9）。这条守的正是那个 bug 的根因。
+func TestBuiltinRowsExist(t *testing.T) {
+	s := openTestPgStore(t)
+	ctx := context.Background()
+
+	for _, b := range s.builtins {
+		var exists bool
+		if err := s.pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM personas WHERE id = $1::uuid)`,
+			b.Persona.ID).Scan(&exists); err != nil {
+			t.Fatalf("查询锚点行失败: %v", err)
+		}
+		if !exists {
+			t.Errorf("内置人格「%s」（%s）缺少 personas 锚点行，历史与记忆会写不进去",
+				b.Persona.Name, b.Persona.ID)
+		}
+	}
+}
+
 func openTestPgStore(t *testing.T) *PgStore {
 	t.Helper()
 	config.LoadDotEnvUpward()

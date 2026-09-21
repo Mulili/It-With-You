@@ -16,7 +16,7 @@ import (
 func TestSchemaFilesCoverAllTables(t *testing.T) {
 	core := []string{
 		"personas", "persona_rules", "persona_changes",
-		"sessions", "messages",
+		"sessions", "session_chunks", "messages",
 		"app_settings", "schema_version",
 	}
 	for _, table := range core {
@@ -25,7 +25,7 @@ func TestSchemaFilesCoverAllTables(t *testing.T) {
 		}
 	}
 
-	vector := []string{"memories", "session_index"}
+	vector := []string{"memories", "chunk_index"}
 	for _, table := range vector {
 		if !strings.Contains(schemaVectorSQL, "CREATE TABLE IF NOT EXISTS "+table) {
 			t.Errorf("schema_vector.sql 缺少建表语句：%s", table)
@@ -42,10 +42,10 @@ func TestSchemaFilesCoverAllTables(t *testing.T) {
 	}
 }
 
-// 加了会话与记忆四张表之后版本必须往上走，否则老库不会被标记为已升级。
+// 加了会话分片之后版本必须往上走，否则老库不会被标记为已升级。
 func TestSchemaVersionCoversNewTables(t *testing.T) {
-	if SchemaVersion < 2 {
-		t.Fatalf("加了 sessions/messages/memories/session_index 之后 SchemaVersion 应当至少为 2，实际 %d", SchemaVersion)
+	if SchemaVersion < 3 {
+		t.Fatalf("加了会话分片（session_chunks / chunk_index）之后 SchemaVersion 应当至少为 3，实际 %d", SchemaVersion)
 	}
 }
 
@@ -75,18 +75,19 @@ func TestTablesExistAfterOpen(t *testing.T) {
 
 	want := []string{
 		"personas", "persona_rules", "persona_changes",
-		"sessions", "messages", "app_settings", "schema_version",
+		"sessions", "session_chunks", "messages",
+		"app_settings", "schema_version",
 	}
 
 	// 向量表是**可选**的：没装 pgvector 扩展时它们建不出来，而这是允许的状态
-	// （记忆功能停用，其余照常）。所以先看扩展在不在，再决定要不要断言它们。
+	//（记忆功能停用，其余照常）。所以先看扩展在不在，再决定要不要断言它们。
 	var hasVector bool
 	if err := pool.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')`).Scan(&hasVector); err != nil {
 		t.Fatalf("检查 vector 扩展失败: %v", err)
 	}
 	if hasVector {
-		want = append(want, "memories", "session_index")
+		want = append(want, "memories", "chunk_index")
 	} else {
 		t.Log("未安装 pgvector 扩展，跳过向量表断言")
 	}

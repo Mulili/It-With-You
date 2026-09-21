@@ -25,6 +25,10 @@ import (
 // 它跑在独立 ctx 上（不挂 prevCancel）：用户发下一句不该把"记住我的要求"这件事掐掉。
 const DirectiveTimeout = 30 * time.Second
 
+// TopicJudgeTimeout 是话题边界判断的超时。与指令抽取同级：
+// 两者都是短小的 JSON 调用，慢过这个时间就没有意义了。
+const TopicJudgeTimeout = 30 * time.Second
+
 type App struct {
 	ctx      context.Context
 	win      *ui.Window
@@ -39,6 +43,12 @@ type App struct {
 	history history.Store
 
 	mu sync.Mutex
+	// judgeMu 串行化「话题边界」判断。
+	//
+	// 每轮都会起一个后台判断，用户连发几句时它们会并发跑、却在改同一段会话的状态。
+	// 用 TryLock 而不是 Lock：抢不到就跳过这次——判断依据是"最新的几句"，
+	// 跳过旧的那次没有损失，而排队只会让判断越来越滞后。
+	judgeMu sync.Mutex
 	// prevCancel 是上一轮流的取消函数。context.CancelFunc 可重复调用，所以不必清理，
 	// 每次新请求直接覆盖即可——省掉了"谁负责清空"的并发问题。
 	prevCancel context.CancelFunc
@@ -163,16 +173,23 @@ func (a *App) Ask(text string) (string, error) {
 	noThinking := a.thinkingDisabled
 	a.mu.Unlock()
 
-	// 先确定"这一轮写进哪个会话"：上个话题没聊完就接着它，聊完了就开新的
+	// 先确定"这一轮写进哪段会话的哪一片"：
+	// 话题没聊完就接着上一段；而片写到阈值时会在**这次发言之前**切开、另起一片——
+	// 所以片边界永远落在用户发言处，一个问答对不会被从中间切开。
 	sess, err := a.history.EnsureSession(personaID)
 	if err != nil {
 		return "", fmt.Errorf("准备会话失败: %w", err)
+	}
+	chunk, err := a.history.EnsureChunk(sess.ID, history.ChunkMaxRunes)
+	if err != nil {
+		return "", fmt.Errorf("准备分片失败: %w", err)
 	}
 
 	// 用户这句话**先写库、再读**：这样读出来的消息列表天然包含它，
 	// 不必在拼上下文时手工追加——少一处容易漏的地方。
 	if _, err := a.history.AppendMessage(history.Message{
 		SessionID: sess.ID,
+		ChunkID:   chunk.ID,
 		PersonaID: personaID,
 		Role:      llm.RoleUser,
 		Content:   text,
@@ -182,24 +199,82 @@ func (a *App) Ask(text string) (string, error) {
 		return "", fmt.Errorf("保存消息失败: %w", err)
 	}
 
-	msgs, err := a.sessionMessages(sess.ID)
+	msgs, err := a.chunkMessages(chunk.ID)
 	if err != nil {
 		return "", err
 	}
 	full := a.buildMessages(personaID, msgs)
 
-	go a.stream(ctx, id, sess.ID, personaID, full, noThinking)
+	go a.stream(ctx, id, sess.ID, chunk.ID, personaID, full, noThinking)
 	// 顺带看一眼这句话里有没有"长期要求"（粗筛命中才会真的调一次模型）。
 	// 它有自己的 ctx 与超时，不会因为用户紧接着发下一句而被取消。
 	go a.handleDirective(text)
+	// 再顺带判断这一句是否结束了当前话题。同样是后台任务：判定之后，
+	// 下一轮 EnsureSession 就不会再复用这段会话，新会话自然开始（边界滞后一轮，无妨）。
+	go a.judgeTopic(sess.ID, tailMessages(msgs, history.TopicJudgeContextLimit))
 	return id, nil
 }
 
-// sessionMessages 读出一个会话的消息，转成发给模型的形式（时间正序）。
-func (a *App) sessionMessages(sessionID string) ([]llm.Message, error) {
-	rows, err := a.history.MessagesOf(sessionID)
+// tailMessages 取最后 n 条消息（不足则全给）。
+//
+// 返回的是子切片：底层数组来自 Ask 里刚读出来的新切片，之后不会再被改，
+// 所以交给 goroutine 是安全的。
+func tailMessages(msgs []llm.Message, n int) []llm.Message {
+	if n <= 0 || len(msgs) <= n {
+		return msgs
+	}
+	return msgs[len(msgs)-n:]
+}
+
+// judgeTopic 是每轮跑一次的后台判断：这一句是否结束了当前话题。
+//
+// 为什么每轮都调、不能像人格指令那样先做本地粗筛："话题结束"没有可靠的词面特征
+// （详见 history.TopicPrompt 的说明）。为什么异步：串在回复后面会让用户每轮多等一两秒，
+// 而判定滞后一轮完全无妨——结束掉的会话下一轮不会被复用，新会话自然开始。
+func (a *App) judgeTopic(sessionID string, recent []llm.Message) {
+	if a.history == nil || a.ctx == nil || len(recent) == 0 {
+		return
+	}
+	// 抢不到锁说明上一次判断还没跑完，跳过这次（理由见 judgeMu 的注释）
+	if !a.judgeMu.TryLock() {
+		return
+	}
+	defer a.judgeMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(a.ctx, TopicJudgeTimeout)
+	defer cancel()
+
+	system, user := history.TopicPrompt(recent)
+	out, err := a.provider.Chat(ctx, []llm.Message{
+		{Role: llm.RoleSystem, Content: system},
+		{Role: llm.RoleUser, Content: user},
+	}, llm.ChatOptions{JSON: true})
 	if err != nil {
-		return nil, fmt.Errorf("读取会话消息失败: %w", err)
+		log.Printf("[history] 话题判断调用失败: %v", err)
+		return
+	}
+
+	v, err := history.ParseTopicVerdict(out)
+	if err != nil {
+		log.Printf("[history] 话题判断结果不可用: %v（模型原始输出：%s）", err, out)
+		return
+	}
+	if !v.Ended {
+		return // 话题还在继续，安静收场
+	}
+
+	if err := a.history.EndSession(sessionID); err != nil {
+		log.Printf("[history] 结束会话失败: %v", err)
+		return
+	}
+	log.Printf("[history] 话题结束，已收尾这一段会话（%s）", v.Reason)
+}
+
+// chunkMessages 读出一个片的全部消息，转成发给模型的形式（时间正序）。
+func (a *App) chunkMessages(chunkID string) ([]llm.Message, error) {
+	rows, err := a.history.ChunkMessages(chunkID)
+	if err != nil {
+		return nil, fmt.Errorf("读取片消息失败: %w", err)
 	}
 	return toLLMMessages(rows), nil
 }
@@ -263,13 +338,13 @@ func (a *App) activePersonaID() string {
 	return a.personas.Snapshot().ActiveID
 }
 
-// buildMessages 组装发给模型的消息：人格 system（若有）+ **当前会话的**消息。
+// buildMessages 组装发给模型的消息：人格 system（若有）+ **当前片的**消息。
 //
 // 四点刻意如此：
 //   - system **不写进历史**：用户不该在历史列表里看到系统提示词，切换人格也才会立即生效；
 //   - 人格每轮现拼：所以改人格、改规则、用户提了新要求，下一轮就生效，不需要重启；
-//   - 只喂**当前会话**：这是会话化最大的收益——上下文边界天然给出，
-//     不再需要"只发最近 N 轮"那种截断。更早的话题要靠记忆召回，而不是一路全带上；
+//   - 只喂**当前片**：分片带来的收益就在这里——上下文边界天然给出，
+//     不再需要"只发最近 N 轮"那种截断。更早的内容要靠记忆召回，而不是一路全带上；
 //   - 预算截断发生在 persona.BuildSystemPrompt 内（超预算先截 recent 层，主体与 core 永不截）。
 func (a *App) buildMessages(personaID string, msgs []llm.Message) []llm.Message {
 	if a.personas == nil {
@@ -783,11 +858,11 @@ func (a *App) ruleLabel(ruleID string) (label, personaID string) {
 
 // stream 消费 Provider 的通道，边收边推事件。
 //
-// sessionID 决定这条回复写进哪段会话；personaID 决定它属于哪个人格——
+// sessionID / chunkID 决定这条回复写进哪段会话的哪一片；personaID 决定它属于哪个人格——
 // 即使用户中途切了人格、或聊开了新话题，这条回复仍然属于"当初被问的那个人、那一次对话"。
 //
 // noThinking 是这一轮的思考开关（由 Ask 在锁内读出后传入，不在这里读 a 的字段）。
-func (a *App) stream(ctx context.Context, id, sessionID, personaID string, msgs []llm.Message, noThinking bool) {
+func (a *App) stream(ctx context.Context, id, sessionID, chunkID, personaID string, msgs []llm.Message, noThinking bool) {
 	ch, err := a.provider.ChatStream(ctx, msgs, llm.ChatOptions{DisableThinking: noThinking})
 	if err != nil {
 		// 走到这里说明请求还没发出去（缺 Key、网络不通、4xx）。历史里保留用户这句，方便重试。
@@ -801,7 +876,7 @@ func (a *App) stream(ctx context.Context, id, sessionID, personaID string, msgs 
 			if errors.Is(chunk.Err, context.Canceled) {
 				// 用户点了停止、发了新问题、或切了人格——这不是错误，安静收场。
 				// 已收到的半截内容照样进历史，但标成 canceled：菜单要能把它和正常回复区分开。
-				a.appendAssistant(sessionID, personaID, full.String(), ui.StatusCanceled)
+				a.appendAssistant(sessionID, chunkID, personaID, full.String(), ui.StatusCanceled)
 				return
 			}
 			runtime.EventsEmit(a.ctx, ui.EventChatError, ui.ChatErrorPayload{ID: id, Message: chunk.Err.Error()})
@@ -814,16 +889,16 @@ func (a *App) stream(ctx context.Context, id, sessionID, personaID string, msgs 
 		runtime.EventsEmit(a.ctx, ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: chunk.Content})
 	}
 
-	a.appendAssistant(sessionID, personaID, full.String(), ui.StatusOK)
+	a.appendAssistant(sessionID, chunkID, personaID, full.String(), ui.StatusOK)
 	runtime.EventsEmit(a.ctx, ui.EventChatDone, ui.ChatDonePayload{ID: id})
 }
 
-// appendAssistant 把这一轮的回复写进**它所属的会话**。
+// appendAssistant 把这一轮的回复写进**它所属的那一片**。
 // status 区分"正常说完"与"被用户打断"。
 //
 // 写失败只记日志、不外抛：回复已经流式展示给用户了，收不回来；
 // 而且这个函数跑在 goroutine 里，也没有调用方能接住错误。
-func (a *App) appendAssistant(sessionID, personaID, content, status string) {
+func (a *App) appendAssistant(sessionID, chunkID, personaID, content, status string) {
 	if content == "" {
 		return
 	}
@@ -840,6 +915,7 @@ func (a *App) appendAssistant(sessionID, personaID, content, status string) {
 	// 写库是 IO，不持锁做：锁内只读那个小 map
 	if _, err := a.history.AppendMessage(history.Message{
 		SessionID: sessionID,
+		ChunkID:   chunkID,
 		PersonaID: personaID,
 		Role:      llm.RoleAssistant,
 		Content:   content,

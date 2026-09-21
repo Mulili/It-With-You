@@ -8,29 +8,35 @@
 -- 换嵌入模型 = 改这一列 + 重算所有向量，不是改配置就能切。
 -- 启动时 llm.Embedder 的 Verify 会拿实际返回的维度与配置比对，不一致直接报在日志里。
 
--- ---------- 会话索引：摘要做指针 ----------
+-- ---------- 片索引：摘要做指针（v3 起按**片**建，不再按会话）----------
 --
--- 两段式的第一段：向量库里存的是"摘要 + session_id"，命中后回 messages 表取原文。
--- 于是"回忆"看到的是真实对话，不是模型编的。
+-- 两段式的第一段：向量库里存的是"片摘要 + chunk_id"，命中后回 messages 取该片的原文。
+--
+-- 粒度为什么是"片"而不是"会话"：一次会话可能聊好几个小时（尤其边玩边聊），
+-- 整段会话压成一条索引，摘要必然糊成"我们聊了很多东西"，检索时什么都匹配不上。
+-- 按片（约 2 万字符量级）建，每条索引对应的主题才足够具体。
 
-CREATE TABLE IF NOT EXISTS session_index (
-    -- 与 sessions 一一对应，所以直接用 session_id 做主键：天然防重复
-    session_id uuid PRIMARY KEY REFERENCES sessions (id) ON DELETE CASCADE,
-    -- 冗余 persona_id 是有意的反范式：检索要按人格过滤，
-    -- 若靠 JOIN sessions 过滤，过滤会发生在 HNSW 取完 Top-N 之后，
+CREATE TABLE IF NOT EXISTS chunk_index (
+    -- 与 session_chunks 一一对应，所以直接用 chunk_id 做主键：天然防重复
+    chunk_id   uuid PRIMARY KEY REFERENCES session_chunks (id) ON DELETE CASCADE,
+    -- 冗余 session_id / persona_id 是有意的反范式：
+    -- 前者用于"命中片后回溯它属于哪次对话"（片作为组归属于会话），
+    -- 后者用于按人格过滤——若靠 JOIN 过滤，过滤会发生在 HNSW 取完 Top-N 之后，
     -- 可能出现"取了 10 条、过滤后只剩 1 条"
+    session_id uuid   NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
     persona_id uuid   NOT NULL REFERENCES personas (id) ON DELETE CASCADE,
     summary    text   NOT NULL,
     embedding  vector(1024) NOT NULL,
     created_at bigint NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS session_index_embedding_idx ON session_index USING hnsw (embedding vector_cosine_ops);
-CREATE INDEX IF NOT EXISTS session_index_persona_idx   ON session_index (persona_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS chunk_index_embedding_idx ON chunk_index USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS chunk_index_persona_idx   ON chunk_index (persona_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS chunk_index_session_idx   ON chunk_index (session_id);
 
 -- ---------- 记忆：提炼出的事实 ----------
 --
--- 与 session_index 分开而不是共表：两者用法根本不同（一个直接注入、一个只是指针），
+-- 与 chunk_index 分开而不是共表：两者用法根本不同（一个直接注入、一个只是指针），
 -- 混在一起会互相淹没——摘要天然更长、信息更密，检索时容易把精炼的事实挤下去。
 
 CREATE TABLE IF NOT EXISTS memories (

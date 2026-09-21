@@ -17,6 +17,7 @@ import (
 type MemoryStore struct {
 	mu       sync.RWMutex
 	sessions []history.Session
+	chunks   []history.Chunk
 	messages []history.Message
 }
 
@@ -49,6 +50,74 @@ func (s *MemoryStore) EnsureSession(personaID string) (history.Session, error) {
 	return sess, nil
 }
 
+// EnsureChunk 实现 history.Store。
+func (s *MemoryStore) EnsureChunk(sessionID string, maxRunes int) (history.Chunk, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := len(s.chunks) - 1; i >= 0; i-- {
+		c := s.chunks[i]
+		if c.SessionID != sessionID || c.EndedAt != 0 {
+			continue
+		}
+		// 没到阈值就接着用它
+		if maxRunes <= 0 || s.chunkRunesLocked(c.ID) < maxRunes {
+			return c, nil
+		}
+		// 到了就把它收尾，再往下走开新片。这一步发生在**写入下一条用户消息之前**，
+		// 所以片边界落在用户发言处——一个问答对不会被从中间切开。
+		now := history.NowMillis()
+		s.chunks[i].EndedAt = now
+		s.chunks[i].UpdatedAt = now
+		break
+	}
+
+	now := history.NowMillis()
+	c := history.Chunk{
+		ID:        uuid.NewString(),
+		SessionID: sessionID,
+		PersonaID: s.sessionPersonaLocked(sessionID),
+		Seq:       s.nextSeqLocked(sessionID),
+		StartedAt: now,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	s.chunks = append(s.chunks, c)
+	return c, nil
+}
+
+// chunkRunesLocked 返回该片的字符数。调用方需持锁。
+func (s *MemoryStore) chunkRunesLocked(chunkID string) int {
+	total := 0
+	for _, m := range s.messages {
+		if m.ChunkID == chunkID {
+			total += len([]rune(m.Content))
+		}
+	}
+	return total
+}
+
+// nextSeqLocked 返回该会话下一个片序号（从 1 开始）。调用方需持锁。
+func (s *MemoryStore) nextSeqLocked(sessionID string) int {
+	max := 0
+	for _, c := range s.chunks {
+		if c.SessionID == sessionID && c.Seq > max {
+			max = c.Seq
+		}
+	}
+	return max + 1
+}
+
+// sessionPersonaLocked 找出会话所属的人格。调用方需持锁。
+func (s *MemoryStore) sessionPersonaLocked(sessionID string) string {
+	for _, sess := range s.sessions {
+		if sess.ID == sessionID {
+			return sess.PersonaID
+		}
+	}
+	return ""
+}
+
 // AppendMessage 实现 history.Store。
 func (s *MemoryStore) AppendMessage(m history.Message) (string, error) {
 	s.mu.Lock()
@@ -67,16 +136,20 @@ func (s *MemoryStore) AppendMessage(m history.Message) (string, error) {
 	return m.ID, nil
 }
 
-// MessagesOf 实现 history.Store。
-func (s *MemoryStore) MessagesOf(sessionID string) ([]history.Message, error) {
+// ChunkMessages 实现 history.Store。
+func (s *MemoryStore) ChunkMessages(chunkID string) ([]history.Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	out := make([]history.Message, 0, 8)
 	for _, m := range s.messages {
-		if m.SessionID == sessionID {
+		if m.ChunkID == chunkID {
 			out = append(out, m)
 		}
+	}
+	// 条数兜底与 PG 侧口径一致：取尾部（最近的）
+	if len(out) > history.ContextMessagesLimit {
+		out = out[len(out)-history.ContextMessagesLimit:]
 	}
 	return out, nil
 }
@@ -119,6 +192,41 @@ func (s *MemoryStore) ListSessions(personaID string, limit int) ([]history.Sessi
 	return out, nil
 }
 
+// ListChunks 实现 history.Store。
+func (s *MemoryStore) ListChunks(sessionID string) ([]history.Chunk, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]history.Chunk, 0, 4)
+	for _, c := range s.chunks {
+		if c.SessionID == sessionID {
+			out = append(out, c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	return out, nil
+}
+
+// EndSession 实现 history.Store。
+//
+// 找不到会话时返回 nil 而不是错误：这个操作是幂等的，而"哪一轮算话题结束"是
+// **异步**判断出来的——并发下会话可能已经被删掉（人格被删）或已经结束过，
+// 把这种情况当错误只会让日志变吵。
+func (s *MemoryStore) EndSession(sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := history.NowMillis()
+	for i := range s.sessions {
+		if s.sessions[i].ID == sessionID && s.sessions[i].EndedAt == 0 {
+			s.sessions[i].EndedAt = now
+			s.sessions[i].UpdatedAt = now
+			return nil
+		}
+	}
+	return nil
+}
+
 // DeletePersona 实现 history.Store。
 func (s *MemoryStore) DeletePersona(personaID string) error {
 	s.mu.Lock()
@@ -131,6 +239,14 @@ func (s *MemoryStore) DeletePersona(personaID string) error {
 		}
 	}
 	s.sessions = keptSessions
+
+	keptChunks := make([]history.Chunk, 0, len(s.chunks))
+	for _, c := range s.chunks {
+		if c.PersonaID != personaID {
+			keptChunks = append(keptChunks, c)
+		}
+	}
+	s.chunks = keptChunks
 
 	keptMessages := make([]history.Message, 0, len(s.messages))
 	for _, m := range s.messages {

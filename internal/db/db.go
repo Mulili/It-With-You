@@ -25,7 +25,9 @@ import (
 // 因为建表语句全部幂等，升级就等于重新执行一遍再把版本号补上。
 //
 //	v1 → v2：加 sessions / messages（阶段4 会话）与 memories / session_index（记忆检索）
-const SchemaVersion = 2
+//	v2 → v3：加 session_chunks（会话内分片）、messages 加 chunk_id；
+//	        会话级的 session_index 改为片级的 chunk_index
+const SchemaVersion = 3
 
 // envDSN 是连接串所在的环境变量名。
 const envDSN = "COMPANION_PG_DSN"

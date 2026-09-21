@@ -25,8 +25,18 @@ type PersonaFile struct {
 }
 
 // PersonaFileHead 是文件里的人格头，只带"可携带"的字段。
-// 不含 id 与时间戳：沿用来源 ID 会与已有数据撞 ID，时间戳也该由导入方生成。
+//
+// 不含时间戳：导入方会重新生成。id 则是一个**有例外的例外**——
+// 导出文件刻意不带 id（沿用来源 ID 会与已有数据撞 ID），所以 BuildFile 不填它；
+// 而内置人格**必须**写死它，理由见 ID 字段的注释。
 type PersonaFileHead struct {
+	// ID 只在内置人格文件里出现：导出时不写，导入时忽略（导入方生成新 id）。
+	//
+	// 内置人格为什么必须有固定 id：它在 personas 表里要占一行（sessions / messages /
+	// memories 的 persona_id 有外键约束，而用户完全可能一直用内置人格聊），
+	// 而这一行需要一个**跨重启、跨版本都不变**的 uuid。
+	// 从文件名推 id 做不到这点——改个文件名就会让已存在的历史变成孤儿。
+	ID         string `json:"id,omitempty"`
 	Name       string `json:"name"`
 	SeedText   string `json:"seedText"`
 	Origin     string `json:"origin,omitempty"`
