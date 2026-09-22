@@ -5,6 +5,7 @@ import (
 	"agent-for-you-love/internal/db"
 	historystore "agent-for-you-love/internal/history/store"
 	"agent-for-you-love/internal/llm"
+	memorystore "agent-for-you-love/internal/memory/store"
 	"agent-for-you-love/internal/persona/builtin"
 	"agent-for-you-love/internal/persona/store"
 	"context"
@@ -49,14 +50,18 @@ func main() {
 	// 历史存储：与人格共用同一个连接池（同一个库，三块数据都在上面）
 	historyStore := historystore.Open(pool)
 
-	// 嵌入服务（阶段4 的记忆检索用）。与对话分开配，因为它们通常是两个服务。
-	// 同样不让它影响启动：探测失败只是记忆功能停用，对话照常。
-	probeEmbedder()
+	// 记忆存储：同样共用这个连接池。注意"存储可用"与"嵌入可用"是两件事——
+	// 后者不可用时，上层根本不会走到这里（记忆功能整体停用）
+	memoryStore := memorystore.Open(pool)
 
-	app := NewApp(llm.NewOpenAIProvider(llmCfg), personaStore, historyStore)
+	// 嵌入服务（阶段4 的记忆检索用）。与对话分开配，因为它们通常是两个服务。
+	// 探测失败返回 nil：记忆功能整体停用，对话照常，且启动不被打断。
+	embedder := probeEmbedder()
+
+	app := NewApp(llm.NewOpenAIProvider(llmCfg), personaStore, historyStore, memoryStore, embedder)
 
 	err := wails.Run(&options.App{
-		Title:         "AI 桌面伴侣",
+		Title:         "常驻助手",
 		Width:         340,
 		Height:        460,
 		Frameless:     true, // 无边框：去掉标题栏，桌宠才能"浮"在桌面上
@@ -136,15 +141,18 @@ func openDB() *pgxpool.Pool {
 	return pool
 }
 
-// probeEmbedder 在启动时确认嵌入服务可用，并把结果写进日志。
+// probeEmbedder 在启动时确认嵌入服务可用，并返回可用的嵌入器（不可用则返回 nil）。
 //
 // 这里**不返回错误、也不阻止启动**：嵌入只是记忆功能的前提，对话并不依赖它。
 // 探测的意义是把"服务没起""维度不匹配"这类问题在启动日志里说清楚，而不是留到
 // 用户第一次写记忆时，由 pgvector 报一个与嵌入看不出关系的错（expected 1024 dimensions）。
 //
+// 返回 nil 而不是返回"一个不可用的嵌入器"，是为了让上层只需要判空：
+// 否则每个调用点都得自己记得"先探测再用"。
+//
 // 同步探测是刻意的：本机 Ollama 没启动时，连接被拒是瞬时的，不会拖慢启动；
 // 只有把 base_url 指到不可达的远程地址，才会真的等满这 5 秒。
-func probeEmbedder() {
+func probeEmbedder() llm.Embedder {
 	cfg := llm.EmbedConfigFromEnv()
 	e := llm.NewOpenAIEmbedder(cfg)
 
@@ -153,10 +161,12 @@ func probeEmbedder() {
 
 	if err := e.Verify(ctx); err != nil {
 		log.Printf("[embed] 嵌入服务不可用（%s @ %s）: %v", cfg.Model, cfg.BaseURL, err)
-		log.Printf("[embed] 记忆功能将停用，对话不受影响；本机装 Ollama 后 `ollama pull bge-m3` 可恢复")
-		return
+		log.Printf("[embed] 记忆功能将停用（不抽取、不写索引），对话与人格不受影响；" +
+			"本机装 Ollama 后 `ollama pull bge-m3` 可恢复")
+		return nil
 	}
 	log.Printf("[embed] 嵌入服务就绪：%s @ %s（%d 维）", cfg.Model, cfg.BaseURL, cfg.Dim)
+	return e
 }
 
 // loadBuiltinPersonas 读取内置人格；失败只记日志，不让应用起不来。

@@ -19,10 +19,18 @@ type MemoryStore struct {
 	// entries 把向量和记忆捆在一起存。分成两个平行切片的话，增删时任何一处漏改
 	// 都会让它们错位——而错位后算出来的是"别人的相似度"，且完全不报错。
 	entries []entry
+	// chunkIndex 按 chunk_id 存片索引。用 map 而不是切片：PG 那边靠主键保证
+	// "一片只有一条"，这边得自己找个等价物，而 map 的键天然就是它。
+	chunkIndex map[string]indexEntry
 }
 
 type entry struct {
 	m   memory.Memory
+	vec []float32
+}
+
+type indexEntry struct {
+	ci  memory.ChunkIndex
 	vec []float32
 }
 
@@ -96,6 +104,26 @@ func (s *MemoryStore) List(personaID string, limit int) ([]memory.Memory, error)
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+// IndexChunk 实现 memory.Store。
+func (s *MemoryStore) IndexChunk(ci memory.ChunkIndex, vec []float32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.chunkIndex == nil {
+		s.chunkIndex = make(map[string]indexEntry)
+	}
+	// 覆盖时保留原有的 created_at，与 PG 的 ON CONFLICT DO UPDATE 保持一致
+	// （两个实现在"重放会不会刷新索引时间"上分叉，会导致契约测试看到不同结果）
+	if old, ok := s.chunkIndex[ci.ChunkID]; ok && ci.CreatedAt == 0 {
+		ci.CreatedAt = old.ci.CreatedAt
+	}
+	if ci.CreatedAt == 0 {
+		ci.CreatedAt = memory.NowMillis()
+	}
+	s.chunkIndex[ci.ChunkID] = indexEntry{ci: ci, vec: vec}
+	return nil
 }
 
 // DeletePersona 实现 memory.Store。

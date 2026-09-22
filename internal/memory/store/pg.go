@@ -107,6 +107,28 @@ func (s *PgStore) Save(m memory.Memory, vec []float32, threshold float64) (memor
 // 不如在 SQL 边界上收敛掉（与 history 那边同一套路）。
 const memoryColumns = `id, COALESCE(persona_id::text, ''), content, kind, importance, evidence, COALESCE(follow_up_at, 0), COALESCE(last_recalled_at, 0), created_at, updated_at`
 
+// IndexChunk 实现 memory.Store。
+func (s *PgStore) IndexChunk(ci memory.ChunkIndex, vec []float32) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	if ci.CreatedAt == 0 {
+		ci.CreatedAt = memory.NowMillis()
+	}
+	// 冲突时只覆盖摘要与向量，**保留原有的 created_at**：它表示"这片是什么时候被索引的"，
+	// 而重放不该把它刷新成现在（否则排查"索引是什么时候建的"就永远看到的是最近一次重放）
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO chunk_index (chunk_id, session_id, persona_id, summary, embedding, created_at)
+		VALUES ($1, $2, $3, $4, $5::vector, $6)
+		ON CONFLICT (chunk_id) DO UPDATE
+		   SET summary = EXCLUDED.summary,
+		       embedding = EXCLUDED.embedding`,
+		ci.ChunkID, ci.SessionID, ci.PersonaID, ci.Summary, vectorLiteral(vec), ci.CreatedAt); err != nil {
+		return fmt.Errorf("写入片索引失败: %w", err)
+	}
+	return nil
+}
+
 // List 实现 memory.Store。
 func (s *PgStore) List(personaID string, limit int) ([]memory.Memory, error) {
 	ctx, cancel := s.ctx()

@@ -63,6 +63,28 @@ type Memory struct {
 	UpdatedAt      int64 `json:"updatedAt"`
 }
 
+// ChunkIndex 是「片索引」：向量库里的一条**指针**，指向 session_chunks 里的一片。
+//
+// 它不是记忆本身，而是回忆的入口：检索先在这里按语义找到"聊过的那件事"，
+// 再顺着 ChunkID 回 messages 取**真实原文**——于是"她提起过去的事"用的是当时真实说过的话，
+// 不是模型自己编的回忆。
+//
+// 它和 Memory 放在同一个包里，是因为两者共同构成记忆检索的两条线（经历线与事实线），
+// 且同处 schema_vector.sql：缺 pgvector 时它们是一起停用的。两条线的分工见 operation.md「检索」。
+type ChunkIndex struct {
+	// ChunkID 与 session_chunks 一一对应，所以它直接当主键——天然防重复
+	ChunkID string
+	// SessionID / PersonaID 是冗余字段（反范式），见 schema_vector.sql 里的说明：
+	// 前者用于"命中片后回溯它属于哪次对话"，后者用于按人格过滤而不必 JOIN
+	SessionID string
+	PersonaID string
+	// Summary 是抽取式片摘要的渲染文本。**嵌入的就是它**：
+	// 检索命中的东西必须与注入的东西是同一份，否则"匹配上了"和"看到了"会对不上
+	Summary string
+	// CreatedAt 是这条索引建立的时间
+	CreatedAt int64
+}
+
 // SaveResult 说明一次保存的结果，让调用方能如实记日志。
 type SaveResult struct {
 	ID string
@@ -90,6 +112,12 @@ type Store interface {
 	// 给"它记得什么"那个界面用。它与检索的区别是：这里不按相关性排序，只按时间倒序——
 	// 用户想看的是"你都记了些什么"，而不是"什么最相关"。
 	List(personaID string, limit int) ([]Memory, error)
+
+	// IndexChunk 写入一条片索引；同一片重复写是**覆盖**（chunk_id 是主键）。
+	//
+	// 幂等是有意的：结算的最后一步才写"已结算"的标记（见 app 层 settleChunk 的写库顺序），
+	// 在那之前的任何失败都会让下一轮整体重放，而重放必须能覆盖而不是撞主键。
+	IndexChunk(ci ChunkIndex, vec []float32) error
 
 	// DeletePersona 删除该人格的**私有**记忆。
 	//

@@ -71,6 +71,14 @@ func nullIfEmpty(s string) any {
 	return s
 }
 
+// nullIfLimit 把"不限"（limit <= 0）转成 SQL NULL——PG 的 LIMIT NULL 就是不限。
+func nullIfLimit(limit int) any {
+	if limit <= 0 {
+		return nil
+	}
+	return limit
+}
+
 // EnsureSession 实现 history.Store。
 func (s *PgStore) EnsureSession(personaID string) (history.Session, error) {
 	ctx, cancel := s.ctx()
@@ -233,12 +241,16 @@ func (s *PgStore) AppendMessage(m history.Message) (string, error) {
 }
 
 // ChunkMessages 实现 history.Store。
-func (s *PgStore) ChunkMessages(chunkID string) ([]history.Message, error) {
+func (s *PgStore) ChunkMessages(chunkID string, limit int) ([]history.Message, error) {
 	ctx, cancel := s.ctx()
 	defer cancel()
 
 	// 取尾部 limit 条（最近的）再翻回正序：直接写 ORDER BY created_at ASC LIMIT n
 	// 会取到片**开头**的 n 条，正好是反的——这是个很容易写错、且错了也不报错的地方。
+	//
+	// limit <= 0 传 NULL 下去：PG 的 LIMIT NULL 就是"不限"，于是两种情况共用一条 SQL。
+	// （分成两条写的话，"有没有上限"这个差异会散落在两处 ORDER BY / LIMIT 里，
+	// 而它们恰是最容易写反的地方。）
 	//
 	// chunk_id 用 COALESCE 兜成空串：老行里它是 NULL，扫进 Go 的 string 会失败。
 	rows, err := s.pool.Query(ctx, `
@@ -249,7 +261,7 @@ func (s *PgStore) ChunkMessages(chunkID string) ([]history.Message, error) {
 			ORDER BY created_at DESC
 			LIMIT $2
 		) t
-		ORDER BY created_at ASC`, chunkID, history.ContextMessagesLimit)
+		ORDER BY created_at ASC`, chunkID, nullIfLimit(limit))
 	if err != nil {
 		return nil, fmt.Errorf("读取片消息失败: %w", err)
 	}
@@ -364,10 +376,83 @@ func (s *PgStore) EndSession(sessionID string) error {
 	ctx, cancel := s.ctx()
 	defer cancel()
 
+	now := history.NowMillis()
 	if _, err := s.pool.Exec(ctx,
 		`UPDATE sessions SET ended_at = $2, updated_at = $2 WHERE id = $1 AND ended_at IS NULL`,
-		sessionID, history.NowMillis()); err != nil {
+		sessionID, now); err != nil {
 		return fmt.Errorf("结束会话失败: %w", err)
+	}
+
+	// 顺手把这个会话的当前片也收尾（理由见 history.Store 的接口注释：
+	// 会话的最后一片若停在"未收尾"，它就永远拿不到摘要）。
+	// 不加"会话本来就没结束"的条件：会话已结束时这一步是空操作，而万一有片在会话结束后
+	// 才被开出来，这里也能兜住——代价只是一次 UPDATE。
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE session_chunks SET ended_at = $2, updated_at = $2 WHERE session_id = $1 AND ended_at IS NULL`,
+		sessionID, now); err != nil {
+		return fmt.Errorf("收尾会话的当前片失败: %w", err)
+	}
+	return nil
+}
+
+// PendingChunks 实现 history.Store。
+func (s *PgStore) PendingChunks(limit int) ([]history.Chunk, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	// 三个条件缺一不可：已收尾、还没摘要、**里面真的有消息**。
+	// 最后一条是为了让空片不再被反复扫到（它们结算不出任何东西）。
+	// 按 ended_at 正序：先聊完的先结算，与"回忆"的时间感一致。
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+chunkColumns+`
+		FROM session_chunks c
+		WHERE c.ended_at IS NOT NULL AND c.summary = ''
+		  AND EXISTS (SELECT 1 FROM messages m WHERE m.chunk_id = c.id)
+		ORDER BY c.ended_at
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("扫描待结算的片失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]history.Chunk, 0, 4)
+	for rows.Next() {
+		c, err := scanChunk(rows)
+		if err != nil {
+			return nil, fmt.Errorf("解析待结算的片失败: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历待结算的片失败: %w", err)
+	}
+	return out, nil
+}
+
+// SetChunkSummary 实现 history.Store。
+func (s *PgStore) SetChunkSummary(chunkID, summary string) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE session_chunks SET summary = $2, updated_at = $3 WHERE id = $1`,
+		chunkID, summary, history.NowMillis()); err != nil {
+		return fmt.Errorf("写片摘要失败: %w", err)
+	}
+	return nil
+}
+
+// SetSessionTitleIfEmpty 实现 history.Store。
+func (s *PgStore) SetSessionTitleIfEmpty(sessionID, title string) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	// WHERE 里的 title = '' 就是"只写第一次"：SQL 一次搞定，不需要先读再判
+	//（先读再判会有"两个片同时结算"的竞争窗口）
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE sessions SET title = $2, updated_at = $3 WHERE id = $1 AND title = ''`,
+		sessionID, title, history.NowMillis()); err != nil {
+		return fmt.Errorf("写会话标题失败: %w", err)
 	}
 	return nil
 }

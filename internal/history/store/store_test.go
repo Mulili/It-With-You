@@ -9,6 +9,8 @@ import (
 	"agent-for-you-love/internal/db"
 	"agent-for-you-love/internal/history"
 	"agent-for-you-love/internal/llm"
+	"agent-for-you-love/internal/memory"
+	memorystore "agent-for-you-love/internal/memory/store"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -62,6 +64,35 @@ func runStoreContract(t *testing.T, s history.Store) {
 		}
 	}
 
+	// 待结算列表按片 ID 判断"在不在里面"：同一时刻可能有好几片挂在里面
+	//（前面的子测试会留下已收尾的片），断言具体条数会互相干扰
+	pendingHas := func(t *testing.T, chunkID string) bool {
+		t.Helper()
+		list, err := s.PendingChunks(100)
+		if err != nil {
+			t.Fatalf("读待结算列表失败: %v", err)
+		}
+		for _, c := range list {
+			if c.ID == chunkID {
+				return true
+			}
+		}
+		return false
+	}
+	// freshChunk 收掉当前的会话，再开一段干净的（片里没有历史消息）——
+	// 需要精确计数的子测试用它，否则前面写进去的消息会让断言变得含糊
+	freshChunk := func(t *testing.T, personaID string) (history.Session, history.Chunk) {
+		t.Helper()
+		cur, err := s.EnsureSession(personaID)
+		if err != nil {
+			t.Fatalf("取会话失败: %v", err)
+		}
+		if err := s.EndSession(cur.ID); err != nil {
+			t.Fatalf("结束会话失败: %v", err)
+		}
+		return newChunk(t, personaID)
+	}
+
 	t.Run("EnsureSession 复用同一段未收尾的会话", func(t *testing.T) {
 		first, err := s.EnsureSession(testPersonaA)
 		if err != nil {
@@ -98,7 +129,7 @@ func runStoreContract(t *testing.T, s history.Store) {
 			appendTo(t, c, text)
 		}
 
-		msgs, err := s.ChunkMessages(c.ID)
+		msgs, err := s.ChunkMessages(c.ID, history.ContextMessagesLimit)
 		if err != nil {
 			t.Fatalf("读消息失败: %v", err)
 		}
@@ -116,7 +147,7 @@ func runStoreContract(t *testing.T, s history.Store) {
 
 		// 片隔离：另一个人格的片里不该有这些消息
 		_, other := newChunk(t, testPersonaB)
-		others, err := s.ChunkMessages(other.ID)
+		others, err := s.ChunkMessages(other.ID, history.ContextMessagesLimit)
 		if err != nil {
 			t.Fatalf("读消息失败: %v", err)
 		}
@@ -191,7 +222,7 @@ func runStoreContract(t *testing.T, s history.Store) {
 	})
 
 	t.Run("读不存在的片返回空而不是错误", func(t *testing.T) {
-		msgs, err := s.ChunkMessages("00000000-0000-0000-0000-00000000dead")
+		msgs, err := s.ChunkMessages("00000000-0000-0000-0000-00000000dead", history.ContextMessagesLimit)
 		if err != nil {
 			t.Fatalf("不该报错: %v", err)
 		}
@@ -232,6 +263,107 @@ func runStoreContract(t *testing.T, s history.Store) {
 		}
 	})
 
+	// limit <= 0 是给收尾结算用的：它要整片原文。这不是"多取几条"的细节——
+	// 摘要的保真度上限就是原文的完整度，短句闲聊很容易在 2 万字符里塞下 500 条以上消息，
+	// 若沿用拼上下文那个上限，摘要会从中间开始、开头的内容永远进不了记忆
+	t.Run("ChunkMessages 的 limit<=0 表示取回整片", func(t *testing.T) {
+		_, c := freshChunk(t, testPersonaA)
+		for _, text := range []string{"一", "二", "三"} {
+			appendTo(t, c, text)
+		}
+
+		all, err := s.ChunkMessages(c.ID, 0)
+		if err != nil {
+			t.Fatalf("读消息失败: %v", err)
+		}
+		if len(all) != 3 {
+			t.Errorf("limit<=0 应当取回整片（3 条），实际 %d 条", len(all))
+		}
+
+		tail, err := s.ChunkMessages(c.ID, 2)
+		if err != nil {
+			t.Fatalf("读消息失败: %v", err)
+		}
+		if len(tail) != 2 || tail[0].Content != "二" || tail[1].Content != "三" {
+			t.Errorf("给了 limit 应当取**尾部**若干条，实际 %d 条", len(tail))
+		}
+	})
+
+	// 会话的最后一片必须跟着收尾：否则它永远停在"未收尾"，而懒结算扫的正是
+	// "已收尾但没摘要"的片——那片就永远拿不到摘要、也永远不会被抽成事实
+	t.Run("EndSession 会顺手收尾当前片", func(t *testing.T) {
+		sess, c := freshChunk(t, testPersonaB)
+		appendTo(t, c, "这句话要在会话收尾之后还能被结算到")
+
+		// 还没收尾 → 不在待结算里
+		if pendingHas(t, c.ID) {
+			t.Error("会话还没结束，当前片不该出现在待结算里")
+		}
+
+		if err := s.EndSession(sess.ID); err != nil {
+			t.Fatalf("结束会话失败: %v", err)
+		}
+		chunks, err := s.ListChunks(sess.ID)
+		if err != nil {
+			t.Fatalf("读片列表失败: %v", err)
+		}
+		for _, ch := range chunks {
+			if ch.EndedAt == 0 {
+				t.Error("会话结束后不该还有未收尾的片")
+			}
+		}
+		if !pendingHas(t, c.ID) {
+			t.Error("片收尾之后就该出现在待结算里")
+		}
+
+		// 摘要一写，它就该从待结算里消失——这就是"结算完成"的判据
+		if err := s.SetChunkSummary(c.ID, "主题：随便聊聊"); err != nil {
+			t.Fatalf("写片摘要失败: %v", err)
+		}
+		if pendingHas(t, c.ID) {
+			t.Error("写过摘要的片不该继续留在待结算里：那会每轮都被重新结算一遍")
+		}
+	})
+
+	// 空片结算不出任何东西。把它排除在待结算之外，是为了不被"每轮扫到、每轮无事可做"
+	// 反复打扰——它也永远不会因为写了摘要而消失
+	t.Run("没有消息的片不算待结算", func(t *testing.T) {
+		sess, c := freshChunk(t, testPersonaC)
+		if err := s.EndSession(sess.ID); err != nil {
+			t.Fatalf("结束会话失败: %v", err)
+		}
+		if pendingHas(t, c.ID) {
+			t.Error("空片不该出现在待结算里")
+		}
+	})
+
+	// "一次会话一个题目"由存储层保证：后来的片即使也产出了标题，也改不掉已经写下的那个
+	t.Run("会话标题只写第一次", func(t *testing.T) {
+		sess, _ := freshChunk(t, testPersonaA)
+
+		if err := s.SetSessionTitleIfEmpty(sess.ID, "第一次的标题"); err != nil {
+			t.Fatalf("写会话标题失败: %v", err)
+		}
+		if err := s.SetSessionTitleIfEmpty(sess.ID, "后来的标题"); err != nil {
+			t.Fatalf("写会话标题失败: %v", err)
+		}
+
+		list, err := s.ListSessions(testPersonaA, history.DefaultSessionLimit)
+		if err != nil {
+			t.Fatalf("读会话列表失败: %v", err)
+		}
+		for _, got := range list {
+			if got.ID != sess.ID {
+				continue
+			}
+			if got.Title != "第一次的标题" {
+				t.Errorf("标题应当停在第一次写入的那个，实际 %q", got.Title)
+			}
+			return
+		}
+		t.Fatal("列表里找不到刚建的会话")
+	})
+
 	// 这条放在最后：它会把 A 的当前会话结束掉，而前面几个子测试依赖"会话可复用"
 	t.Run("EndSession 后不再复用这段会话，重复调用也无副作用", func(t *testing.T) {
 		sess, _ := newChunk(t, testPersonaA)
@@ -265,6 +397,65 @@ func TestPgStoreContract(t *testing.T) {
 		ensureTestPersona(t, pool, id)
 	}
 	runStoreContract(t, st)
+}
+
+// 片索引写在记忆库里（chunk_index 与 memories 同属 schema_vector.sql），
+// 但它挂在 session_chunks 上，而造一段真实历史要用本包的 Store——
+// 所以这条测试放在这里（memory/store 的测试没有 history 的夹具）。
+//
+// 验的是那一句 ON CONFLICT：结算的写库顺序靠它才能"整体重放"，
+// 若它写成普通 INSERT，重放时会撞主键，于是每次重试都在原地失败。
+func TestPgIndexChunkUpsert(t *testing.T) {
+	st, pool := openTestPgStore(t)
+	ensureTestPersona(t, pool, testPersonaA)
+
+	sess, err := st.EnsureSession(testPersonaA)
+	if err != nil {
+		t.Fatalf("建会话失败: %v", err)
+	}
+	chunk, err := st.EnsureChunk(sess.ID, history.ChunkMaxRunes)
+	if err != nil {
+		t.Fatalf("取当前片失败: %v", err)
+	}
+
+	memStore := memorystore.NewPgStore(pool)
+	ci := memory.ChunkIndex{
+		ChunkID: chunk.ID, SessionID: sess.ID, PersonaID: testPersonaA,
+		Summary: "主题：聊新买的键盘",
+	}
+	if err := memStore.IndexChunk(ci, makeVec(0)); err != nil {
+		t.Fatalf("写片索引失败: %v", err)
+	}
+
+	ci.Summary = "主题：又聊了一次键盘"
+	if err := memStore.IndexChunk(ci, makeVec(1)); err != nil {
+		t.Fatalf("覆盖片索引失败: %v", err)
+	}
+
+	var count int
+	var summary string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*), COALESCE(MAX(summary), '') FROM chunk_index WHERE chunk_id = $1`,
+		chunk.ID).Scan(&count, &summary); err != nil {
+		t.Fatalf("查片索引失败: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("同一片应当只有一条索引，实际 %d 条", count)
+	}
+	if summary != ci.Summary {
+		t.Errorf("重复写应当覆盖摘要，实际 %q", summary)
+	}
+}
+
+// 片索引的向量列维度必须与建表时一致（vector(1024)），否则 PG 直接拒绝写入。
+const embedDim = 1024
+
+// makeVec 造一个只有单个分量非零的向量：与 memory/store 的契约测试同一个套路，
+// 不依赖嵌入服务。
+func makeVec(index int) []float32 {
+	v := make([]float32, embedDim)
+	v[index] = 1
+	return v
 }
 
 // openTestPgStore 连库并返回 PG 实现 + 连接池（池给测试准备前置数据用）。

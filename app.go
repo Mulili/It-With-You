@@ -14,8 +14,10 @@ import (
 
 	"agent-for-you-love/internal/history"
 	"agent-for-you-love/internal/llm"
+	"agent-for-you-love/internal/memory"
 	"agent-for-you-love/internal/persona"
 	errorcode "agent-for-you-love/internal/pkg/errorCode"
+	"agent-for-you-love/internal/settle"
 	"agent-for-you-love/internal/ui"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -29,6 +31,18 @@ const DirectiveTimeout = 30 * time.Second
 // 两者都是短小的 JSON 调用，慢过这个时间就没有意义了。
 const TopicJudgeTimeout = 30 * time.Second
 
+// SettleTimeout 是收尾结算的超时。比上面两个大一个量级是有原因的：
+// 它们的输入只有几百 token，而这里的输入是**一整片原文**（约 2 万字符），
+// 输出也要几百到上千 token（摘要 + 事实），慢是正常的。
+const SettleTimeout = 90 * time.Second
+
+// settlePerRun 是一次扫描最多结算几片。
+//
+// 有上限是因为"积压"是真实存在的：升级后第一次启动、或离线一段时间再打开，
+// 待结算的片可能有好几片。一次全结算会在后台打出一串调用，而结算本来就不急——
+// 每轮顺带补几片，很快就追平了。
+const settlePerRun = 3
+
 type App struct {
 	ctx      context.Context
 	win      *ui.Window
@@ -41,6 +55,15 @@ type App struct {
 	// 打开菜单时一次）；而"两份数据要成对维护"的代价很高——漏一处就永久不同步，
 	// 症状又是"菜单里少一条"这种极难定位的问题。
 	history history.Store
+
+	// memories 是长期记忆（阶段4）：公共事实 + 本人格私有经历 + 片索引。
+	// 它与 history 共用同一个连接池，但**不是同一份数据**：history 存原文、按会话取；
+	// memories 存提炼出来的东西、按语义取。
+	memories memory.Store
+	// embedder 为 nil 表示嵌入服务不可用。此时**记忆功能整体停用**：
+	// 不结算、不抽取、不写索引，对话照常——抽了却嵌不出向量，等于白花一次调用。
+	// 这与"数据库连不上"的处理姿态不同：嵌入只服务记忆，而对话根本不经过它。
+	embedder llm.Embedder
 
 	mu sync.Mutex
 	// judgeMu 串行化「话题边界」判断。
@@ -62,6 +85,18 @@ type App struct {
 	// 集合很小且只在删人格时增长，不做清理。
 	deletedPersonas map[string]bool
 
+	// settleMu 串行化收尾结算。与 judgeMu 同一套路：抢不到就跳过这次——
+	// 结算不急着这一刻完成，下一轮还有机会。
+	settleMu sync.Mutex
+	// settleBad 记住"这一片结算过了、但输出不可用"的片 ID。
+	//
+	// 为什么需要它：扫待结算的条件是"已收尾且没有摘要"，输出不可用的片会一直留在里面，
+	// 于是每一轮都白烧一次调用。而这类失败是**确定的**（同样的输入还是同一份垃圾输出），
+	// 所以进程内不再重试；重启后会再给一次机会。
+	//
+	// 注意只记"输出不可用"，网络与嵌入的失败**不记**——那些是瞬时的，值得下一轮再试。
+	settleBad map[string]bool
+
 	// thinkingDisabled 是用户的思考模式开关（应用级设置，缓存在内存里）。
 	//
 	// 缓存的理由：Ask 每轮都要用它决定带不带 thinking 字段，不该每次都查一遍库；
@@ -75,8 +110,14 @@ func (a *App) nextID() string {
 	return fmt.Sprintf("m%d", a.msgSeq)
 }
 
-func NewApp(provider llm.Provider, personas persona.Store, hist history.Store) *App {
-	a := &App{provider: provider, personas: personas, history: hist}
+// NewApp 组装应用。
+//
+// embedder 传 nil 表示嵌入服务不可用，此时记忆功能整体停用（不结算、不抽取），
+// 对话与人格不受影响——见 App.embedder 的注释。
+func NewApp(provider llm.Provider, personas persona.Store, hist history.Store,
+	mems memory.Store, embedder llm.Embedder) *App {
+	a := &App{provider: provider, personas: personas, history: hist,
+		memories: mems, embedder: embedder}
 	// 思考开关读一次就缓存在内存：Ask 每轮都要用它，不该每次都查库。
 	// 读失败按默认（false = 跟随官方默认的"思考开启"）继续——一个设置读不到，
 	// 不该让整个应用起不来。
@@ -98,13 +139,17 @@ func (a *App) startup(ctx context.Context) {
 
 	ui.StartTray(ui.TrayOptions{
 		Icon:           trayIcon,
-		Tooltip:        "AI 桌面伴侣",
+		Tooltip:        "常驻助手",
 		OnToggleWindow: a.ToggleWindow,
-		OnSay:          func() { a.Say("你好，我是你的桌面伴侣～") },
+		OnSay:          func() { a.Say("我是助手哦") },
 		OnQuit:         a.Quit,
 	})
 
 	log.Println("[app] 启动完成：窗口 + 系统托盘就绪")
+
+	// 启动时把上次没结算完的补上：可能是上次退出得急，也可能是发消息那几轮没赶上。
+	// 放后台跑，不拖慢启动——结算一次要几秒，而它跟"能不能开始聊"没有关系。
+	go a.settlePending()
 }
 
 // shutdown 由 Wails 在应用退出时调用。
@@ -172,6 +217,13 @@ func (a *App) Ask(text string) (string, error) {
 	// 思考开关是 a 的字段，在锁内取出来交给 goroutine，别让后台再去碰它
 	noThinking := a.thinkingDisabled
 	a.mu.Unlock()
+
+	// 回头把上一段已聊完、却还没整理的补结算（见 settlePending）。
+	//
+	// 触发点选在**这里**（而不是写完这一轮之后）是有意的：待结算的片属于"上一段"，
+	// 它的最后一条回复是好几秒前写下的，此刻结算不会读到半截内容。
+	// 放在后面则可能和正在流式的这一轮撞上——读到刚写一半的片。
+	go a.settlePending()
 
 	// 先确定"这一轮写进哪段会话的哪一片"：
 	// 话题没聊完就接着上一段；而片写到阈值时会在**这次发言之前**切开、另起一片——
@@ -270,9 +322,174 @@ func (a *App) judgeTopic(sessionID string, recent []llm.Message) {
 	log.Printf("[history] 话题结束，已收尾这一段会话（%s）", v.Reason)
 }
 
+// ---------- 收尾结算（3b-2）----------
+
+// settlePending 是「收尾懒结算」：把已经聊完、却还没整理过的片整理成
+// 片摘要 + 会话标题 + 待存事实，分头写进 session_chunks / sessions / memories / chunk_index。
+//
+// 为什么不挂在"话题结束那一刻"：那一刻本来就没人知道——结束是**下一轮**才判出来的。
+// 于是搭下一轮的车：Ask 开头顺手扫一遍，启动时也扫一遍（见 startup）。
+// 这与"懒归档"是同一个姿态：不引入常驻定时器，桌面应用会休眠，绝对时间的定时器不可靠。
+//
+// 触发点是"片"而不是"会话"：片写满时就会被切走并收尾，那时它就已经可以结算了，
+// 不必等到整段会话聊完（会话可能一整天不结束）。
+func (a *App) settlePending() {
+	// 三个条件都要满足：没有历史就没得结算；没有记忆存储就没处写；
+	// 没有嵌入服务则**整体停用**——抽了却嵌不出向量，等于白花一次调用。
+	// 注意这是"记忆功能停用"，对话与人格不受任何影响。
+	if a.history == nil || a.memories == nil || a.embedder == nil || a.ctx == nil {
+		return
+	}
+	// 抢不到锁说明上一次还没跑完，跳过这次（理由同 judgeMu）
+	if !a.settleMu.TryLock() {
+		return
+	}
+	defer a.settleMu.Unlock()
+
+	pending, err := a.history.PendingChunks(settlePerRun)
+	if err != nil {
+		log.Printf("[settle] 扫描待结算的片失败: %v", err)
+		return
+	}
+	for _, c := range pending {
+		// 这一片之前试过、输出不可用：不再重试（理由见 App.settleBad 的注释）
+		if a.settleBadChunk(c.ID) {
+			continue
+		}
+		if err := a.settleChunk(c); err != nil {
+			log.Printf("[settle] 片 %s 结算失败: %v", c.ID, err)
+			if errors.Is(err, settle.ErrUnusable) {
+				a.markSettleBad(c.ID)
+			}
+		}
+	}
+}
+
+// settleChunk 结算一片。
+//
+// **写库顺序是有意的**：`session_chunks.summary` 放在最后写，它是"这一片已结算"的提交点。
+// 在它之前的每一步都只做可重放的事——事实有去重兜底（相似度命中就更新那一条）、
+// 片索引是覆盖写（chunk_id 是主键）、标题只写"还没有标题的那一次"。
+// 于是中途失败不会留下半截状态：下一轮整体重放一遍就行。
+//
+// 反过来（先写摘要、再嵌向量）的话，嵌入一旦失败，这一片就再也扫不到了——
+// 那些事实**永久丢失**，而且完全无声。
+func (a *App) settleChunk(c history.Chunk) error {
+	// limit 传 0 = 整片原文。不能用拼上下文那个上限：摘要的保真度上限就是原文的完整度，
+	// 而短句闲聊很容易在 2 万字符里塞下 500 条以上消息
+	rows, err := a.history.ChunkMessages(c.ID, 0)
+	if err != nil {
+		return err
+	}
+	msgs := toLLMMessages(rows)
+	if len(msgs) == 0 {
+		return nil // 空片（扫描时已排除），这里只是兜底
+	}
+
+	// 结算比话题判断重得多（输入是整片原文），所以自己的超时也更长
+	ctx, cancel := context.WithTimeout(a.ctx, SettleTimeout)
+	defer cancel()
+
+	system, user := settle.Prompt(msgs)
+	out, err := a.provider.Chat(ctx, []llm.Message{
+		{Role: llm.RoleSystem, Content: system},
+		{Role: llm.RoleUser, Content: user},
+	}, llm.ChatOptions{JSON: true})
+	if err != nil {
+		return fmt.Errorf("结算调用失败: %w", err)
+	}
+
+	res, err := settle.Parse(out, msgs)
+	if err != nil {
+		return fmt.Errorf("%w（模型原始输出：%s）", err, out)
+	}
+
+	summary := res.Summary()
+	// 摘要与全部事实**一次嵌入算完**：逐条发请求就是十几次网络往返
+	texts := make([]string, 0, 1+len(res.Facts))
+	texts = append(texts, summary)
+	for _, f := range res.Facts {
+		texts = append(texts, f.Content)
+	}
+	vecs, err := a.embedder.Embed(ctx, texts)
+	if err != nil {
+		return fmt.Errorf("嵌入失败: %w", err)
+	}
+
+	// 事实：about=user 的写公共（任何人格都该知道），about=persona 的写私有
+	//（那是"我和他之间的事"，只属于这一段关系）
+	for i, f := range res.Facts {
+		personaID := ""
+		if f.Private {
+			personaID = c.PersonaID
+		}
+		// 一条存不进去就整体作废（不写摘要、留待重放）：去重让重放是幂等的——
+		// 已经存下的那几条会被"更新"而不是各存一份，代价只是一次多余的调用。
+		// 反过来（跳过失败那条继续）会让这条事实**永久丢失且无声**，
+		// 与"错并不可逆"的取舍方向相反。
+		if _, err := a.memories.Save(memory.Memory{
+			PersonaID:  personaID,
+			Content:    f.Content,
+			Kind:       f.Kind,
+			Importance: f.Importance,
+			// 依据存**原话**而不是模型的转述：将来要核对"这条记忆是从哪儿来的"时，
+			// 只有原话能回到原文里去对
+			Evidence: f.Quote,
+		}, vecs[1+i], memory.DefaultDedupThreshold); err != nil {
+			return fmt.Errorf("保存记忆失败（%s）: %w", f.Content, err)
+		}
+	}
+
+	// 片索引：检索时靠它找到"聊过的那件事"，再顺着 chunk_id 回表取原文
+	if err := a.memories.IndexChunk(memory.ChunkIndex{
+		ChunkID:   c.ID,
+		SessionID: c.SessionID,
+		PersonaID: c.PersonaID,
+		Summary:   summary,
+	}, vecs[0]); err != nil {
+		return fmt.Errorf("写片索引失败: %w", err)
+	}
+
+	// 会话标题：只有第一片能写进去（后来者改不掉），所以失败也不值得中断结算
+	if res.Title != "" {
+		if err := a.history.SetSessionTitleIfEmpty(c.SessionID, res.Title); err != nil {
+			log.Printf("[settle] 写会话标题失败: %v", err)
+		}
+	}
+
+	// **提交点**：这一步成功之后，这一片就再也不会被扫到了
+	if err := a.history.SetChunkSummary(c.ID, summary); err != nil {
+		return fmt.Errorf("写片摘要失败: %w", err)
+	}
+
+	log.Printf("[settle] 已结算片 %s（要点 %d / 事实 %d / 未了 %d / 丢弃 %d）",
+		c.ID, len(res.KeyPoints), len(res.Facts), len(res.Unresolved), res.Dropped)
+	return nil
+}
+
+// settleBadChunk 判断这一片是否已经被判过"输出不可用"。
+func (a *App) settleBadChunk(chunkID string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.settleBad[chunkID]
+}
+
+// markSettleBad 记住这一片的输出不可用，本进程内不再重试。
+func (a *App) markSettleBad(chunkID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.settleBad == nil {
+		a.settleBad = make(map[string]bool)
+	}
+	a.settleBad[chunkID] = true
+}
+
 // chunkMessages 读出一个片的全部消息，转成发给模型的形式（时间正序）。
+//
+// limit 传 ContextMessagesLimit：那是给**上下文**兜底的上限。结算走的是另一条路
+// （见 settleChunk），它要整片原文，不受这个上限约束。
 func (a *App) chunkMessages(chunkID string) ([]llm.Message, error) {
-	rows, err := a.history.ChunkMessages(chunkID)
+	rows, err := a.history.ChunkMessages(chunkID, history.ContextMessagesLimit)
 	if err != nil {
 		return nil, fmt.Errorf("读取片消息失败: %w", err)
 	}

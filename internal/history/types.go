@@ -125,9 +125,13 @@ type Store interface {
 
 	// ChunkMessages 取该片的全部消息（按 CreatedAt 正序）——拼上下文用它。
 	//
+	// limit <= 0 表示**取全部**。收尾结算传 0：它要的是整片原文（摘要的保真度上限就是它）；
+	// 拼上下文传 ContextMessagesLimit：那个上限是给上下文兜底的，不是给结算用的。
+	//
 	// 注意：CreatedAt 是毫秒精度，所以**同一毫秒内写入的多条消息，相对顺序不保证**。
 	// 真实路径撞不上（用户敲字与模型生成之间隔着好几秒），但批量灌数据时要留意。
-	ChunkMessages(chunkID string) ([]Message, error)
+	// 超出 limit 时取**尾部**（最近的）：丢掉寒暄比丢掉"刚才说的那件事"代价小得多。
+	ChunkMessages(chunkID string, limit int) ([]Message, error)
 
 	// RecentMessages 取该人格最近的消息（跨会话、时间正序、最多 limit 条）——历史界面用它。
 	RecentMessages(personaID string, limit int) ([]Message, error)
@@ -138,11 +142,31 @@ type Store interface {
 	// ListChunks 列出该会话的片（按 seq 正序）。
 	ListChunks(sessionID string) ([]Chunk, error)
 
-	// EndSession 给会话打上结束时间（ended_at）。
+	// EndSession 给会话打上结束时间（ended_at），并**顺手收尾它的当前片**。
+	//
+	// 收尾当前片是必须做的，不是顺手：懒结算扫的是"已收尾但还没摘要"的片，
+	// 会话的最后一片若一直停在"未收尾"，就永远拿不到摘要、也永远不会被抽成事实——
+	// 那正是分片要修掉的盲区。
 	//
 	// 幂等：已经结束的会话再调一次不会改动它（条件是 ended_at IS NULL），
 	// 因为"哪一轮算结束"是异步判断出来的，重复判定很常见。
 	EndSession(sessionID string) error
+
+	// PendingChunks 取"等待结算"的片：已经收尾、还没有摘要、**里面真的有消息**。
+	//
+	// 收尾懒结算的入口。第三个条件是为了让空片不再被反复扫到：
+	// 它们结算不出任何东西，留着只会每轮白扫一遍。
+	PendingChunks(limit int) ([]Chunk, error)
+
+	// SetChunkSummary 写入片摘要。它是**一次结算的提交点**：
+	// 这一步成功之后，这片就不再出现在 PendingChunks 里（见 app 层 settleChunk 的写库顺序）。
+	SetChunkSummary(chunkID, summary string) error
+
+	// SetSessionTitleIfEmpty 写入会话标题，但**只在还没有标题时**。
+	//
+	// 于是"标题由第一片定下来"这件事由数据本身保证：后来的片即使也产出了标题，
+	// 也改不掉已经写下的那个（一次会话只该有一个题目）。
+	SetSessionTitleIfEmpty(sessionID, title string) error
 
 	// DeletePersona 删除该人格的全部会话、片与消息。
 	//

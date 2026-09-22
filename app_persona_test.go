@@ -6,6 +6,7 @@ import (
 	"agent-for-you-love/internal/history"
 	historystore "agent-for-you-love/internal/history/store"
 	"agent-for-you-love/internal/llm"
+	memorystore "agent-for-you-love/internal/memory/store"
 	"agent-for-you-love/internal/persona"
 	"agent-for-you-love/internal/persona/builtin"
 	"agent-for-you-love/internal/persona/store"
@@ -29,11 +30,14 @@ func testBuiltins() []builtin.Entry {
 //
 // 历史用内存实现：这一组关心的是"人格与历史怎么联动"，而不是 PG 本身
 // （PG 那条路径由 internal/history/store 的集成测试覆盖）。
+//
+// 记忆与嵌入都传空：embedder 为 nil 时收尾结算整体停用（见 settlePending），
+// 于是这一组测试不会因为后台去调模型或嵌入服务而变得不稳定。
 func newPersonaApp(t *testing.T) (*App, persona.Store, history.Store) {
 	t.Helper()
 	st := store.NewMemoryStore(testBuiltins(), true)
 	hist := historystore.NewMemoryStore()
-	return NewApp(nil, st, hist), st, hist
+	return NewApp(nil, st, hist, memorystore.NewMemoryStore(), nil), st, hist
 }
 
 // 删除人格必须同时清掉它的对话历史：那些消息的 personaID 已失效，

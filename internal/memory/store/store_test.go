@@ -218,6 +218,45 @@ func TestMemoryStoreContract(t *testing.T) {
 	runStoreContract(t, NewMemoryStore())
 }
 
+// 内存实现的片索引是 map，PG 那边靠 chunk_id 主键——两者都要满足"一片只有一条"。
+// PG 那侧因为 chunk_index 有外键挂在 session_chunks 上（需要一段真实历史），
+// 放在 history/store 的测试里验（TestPgIndexChunkUpsert）。
+func TestMemoryStoreIndexChunkUpsert(t *testing.T) {
+	s := NewMemoryStore()
+	ci := memory.ChunkIndex{
+		ChunkID:   "00000000-0000-0000-0000-0000000000c1",
+		SessionID: "00000000-0000-0000-0000-0000000000s1",
+		PersonaID: testPersonaA,
+		Summary:   "主题：第一版",
+	}
+	if err := s.IndexChunk(ci, makeVec(0, 1)); err != nil {
+		t.Fatalf("写片索引失败: %v", err)
+	}
+	firstAt := s.chunkIndex[ci.ChunkID].ci.CreatedAt
+
+	// 结算失败重放时会重复写同一片，所以这里必须是覆盖而不是新增
+	ci.Summary = "主题：第二版"
+	if err := s.IndexChunk(ci, makeVec(1, 1)); err != nil {
+		t.Fatalf("覆盖片索引失败: %v", err)
+	}
+
+	if len(s.chunkIndex) != 1 {
+		t.Fatalf("同一片应当只有一条索引，实际 %d 条", len(s.chunkIndex))
+	}
+	got := s.chunkIndex[ci.ChunkID]
+	if got.ci.Summary != "主题：第二版" {
+		t.Errorf("重复写应当覆盖摘要，实际 %q", got.ci.Summary)
+	}
+	// created_at 保留第一次的值：它表示"这片是什么时候被索引的"，
+	// 而重放不该把它刷新成现在（与 PG 的 ON CONFLICT DO UPDATE 对齐）
+	if got.ci.CreatedAt != firstAt {
+		t.Errorf("重复写不该刷新创建时间：%d → %d", firstAt, got.ci.CreatedAt)
+	}
+	if len(got.vec) != embedDim {
+		t.Errorf("向量应当被一起换掉，实际维度 %d", len(got.vec))
+	}
+}
+
 func TestPgStoreContract(t *testing.T) {
 	st, pool := openTestPgStore(t)
 	for _, id := range []string{testPersonaA, testPersonaB} {

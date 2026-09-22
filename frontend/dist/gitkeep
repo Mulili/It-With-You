@@ -1,0 +1,7 @@
+# 占位文件，别删
+#
+# main.go 里有 //go:embed all:frontend/dist，而 .gitignore 忽略 frontend/dist/* 的内容。
+# 没有这个文件，clone 下来就没有 dist 目录，go build 会直接报
+# "pattern all:frontend/dist: no matching files"。
+#
+# 注意：npm run build 会清空 dist，把这个文件一起删掉——每次前端构建后要把它放回来。

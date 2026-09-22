@@ -137,7 +137,7 @@ func (s *MemoryStore) AppendMessage(m history.Message) (string, error) {
 }
 
 // ChunkMessages 实现 history.Store。
-func (s *MemoryStore) ChunkMessages(chunkID string) ([]history.Message, error) {
+func (s *MemoryStore) ChunkMessages(chunkID string, limit int) ([]history.Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -147,9 +147,9 @@ func (s *MemoryStore) ChunkMessages(chunkID string) ([]history.Message, error) {
 			out = append(out, m)
 		}
 	}
-	// 条数兜底与 PG 侧口径一致：取尾部（最近的）
-	if len(out) > history.ContextMessagesLimit {
-		out = out[len(out)-history.ContextMessagesLimit:]
+	// 条数兜底与 PG 侧口径一致：取尾部（最近的）；limit <= 0 表示全部
+	if limit > 0 && len(out) > limit {
+		out = out[len(out)-limit:]
 	}
 	return out, nil
 }
@@ -221,6 +221,81 @@ func (s *MemoryStore) EndSession(sessionID string) error {
 		if s.sessions[i].ID == sessionID && s.sessions[i].EndedAt == 0 {
 			s.sessions[i].EndedAt = now
 			s.sessions[i].UpdatedAt = now
+			break
+		}
+	}
+
+	// 顺手把当前片也收尾。这一步**必须做**：懒结算扫的是"已收尾但没摘要"的片，
+	// 会话的最后一片若一直停在"未收尾"，那片就永远拿不到摘要、也永远不会被抽成事实。
+	// 循环放在会话那段之外（而不是 break 之前）：会话已经结束过时也要兜一次，
+	// 免得出现"会话结束了、片还开着"的孤儿片。
+	for i := range s.chunks {
+		if s.chunks[i].SessionID == sessionID && s.chunks[i].EndedAt == 0 {
+			s.chunks[i].EndedAt = now
+			s.chunks[i].UpdatedAt = now
+		}
+	}
+	return nil
+}
+
+// PendingChunks 实现 history.Store。
+func (s *MemoryStore) PendingChunks(limit int) ([]history.Chunk, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]history.Chunk, 0, 4)
+	for _, c := range s.chunks {
+		// 与 PG 侧口径一致：已收尾、还没摘要、且里面真的有消息
+		if c.EndedAt == 0 || c.Summary != "" || !s.hasMessageLocked(c.ID) {
+			continue
+		}
+		out = append(out, c)
+	}
+	// 按结束时间正序：先聊完的先结算（与 PG 的 ORDER BY ended_at 一致）
+	sort.Slice(out, func(i, j int) bool { return out[i].EndedAt < out[j].EndedAt })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// hasMessageLocked 判断该片里有没有消息。调用方需持锁。
+func (s *MemoryStore) hasMessageLocked(chunkID string) bool {
+	for _, m := range s.messages {
+		if m.ChunkID == chunkID {
+			return true
+		}
+	}
+	return false
+}
+
+// SetChunkSummary 实现 history.Store。
+//
+// 找不到片时安静收场（与 EndSession 同一姿态）：这一步只是"打标记"，
+// 片可能已经随着人格删除被级联清掉了，为此报错只会让日志变吵。
+func (s *MemoryStore) SetChunkSummary(chunkID, summary string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.chunks {
+		if s.chunks[i].ID == chunkID {
+			s.chunks[i].Summary = summary
+			s.chunks[i].UpdatedAt = history.NowMillis()
+			return nil
+		}
+	}
+	return nil
+}
+
+// SetSessionTitleIfEmpty 实现 history.Store。
+func (s *MemoryStore) SetSessionTitleIfEmpty(sessionID, title string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.sessions {
+		if s.sessions[i].ID == sessionID && s.sessions[i].Title == "" {
+			s.sessions[i].Title = title
+			s.sessions[i].UpdatedAt = history.NowMillis()
 			return nil
 		}
 	}
