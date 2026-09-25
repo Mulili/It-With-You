@@ -103,7 +103,7 @@ func ParseDirective(raw string) (Directive, error) {
 	if n := utf8.RuneCountInString(value); n > MaxRuleValueRunes {
 		return Directive{}, fmt.Errorf("取值长度 %d 超过上限 %d", n, MaxRuleValueRunes)
 	}
-	if looksLikeInjection(value) {
+	if LooksLikeInjection(value) {
 		// 不是安全边界，只是"明显在试图改写指令本身"的粗筛：这种内容不该被持久化成人格规则
 		return Directive{}, fmt.Errorf("取值看起来在试图改写指令本身，已拒绝：%q", value)
 	}
@@ -120,7 +120,14 @@ var (
 	injectionTargets = []string{"指令", "设定", "人格", "规则", "提示词", "prompt", "system"}
 )
 
-func looksLikeInjection(value string) bool {
+// LooksLikeInjection 是"这段内容明显在试图改写指令本身"的粗筛。
+//
+// 它**不是安全边界**（真注入要靠提示词结构与模型自己的判断），而是最后一道兜底：
+// 这类内容一旦被持久化成人格规则，往后每一轮都会生效，代价远高于拒掉一条正常取值的误伤。
+//
+// 导出是因为有两条路能把取值送进规则系统：用户明说（指令抽取）与模型自动抽（隐式演化）。
+// 同一类内容从两条路进来，闸门没有理由不一样。
+func LooksLikeInjection(value string) bool {
 	v := strings.ToLower(value)
 	hasVerb := false
 	for _, verb := range injectionVerbs {

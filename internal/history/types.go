@@ -40,10 +40,25 @@ const ChunkMaxRunes = 20000
 // ContextMessagesLimit 是单个片最多带上的消息条数。
 //
 // 与 ChunkMaxRunes 互补：那个管体量，这个管条数（一屏"嗯""哈哈"字符很少却能塞很多条）。
-// 两者都是**兜底**，真正的边界由分片给出。
 //
-// 超出时取**尾部**（最近的）而不是开头：丢掉寒暄比丢掉"刚才说的那件事"代价小得多。
+// ⚠️ 它必须 ≥ ChunkMaxMessages + 2，否则会出现"落在缝里"的消息（见 ChunkMaxMessages 的注释）。
 const ContextMessagesLimit = 500
+
+// ChunkMaxMessages 是单片最多几条消息：**与 ContextMessagesLimit 同一个量纲**，两条一起看。
+//
+// 为什么要它：只有**片**能触发结算。若只按字符切，一屏短消息（"嗯""哈哈"）能塞上千条
+// 而字符数远没到线，于是拼上下文时先撞上 ContextMessagesLimit 被裁掉开头——
+// 那些消息既不在上下文里，又因为片没收尾而进不了结算，**等于静默丢了**
+// （正是分片当初要消灭的那个 bug）。
+//
+// 为什么比 ContextMessagesLimit 少 2：判断发生在写入本轮消息**之前**，
+// 也就是说检查通过之后，这片还可能再多出"用户一条 + 回复一条"。
+// 留出这个余量，才能保证片内的条数**永远**不超过拼上下文的上限——
+// 否则最后那 1~2 条还是会被裁掉，缝依然在。
+const ChunkMaxMessages = ContextMessagesLimit - 2
+
+// 超出 ContextMessagesLimit 时取**尾部**（最近的）而不是开头：丢掉寒暄比丢掉"刚才说的那件事"代价小得多。
+// 有了 ChunkMaxMessages 之后这条兜底理论上不会再触发，留着是为了防"阈值被调歪"。
 
 // ErrNotFound 表示目标记录不存在。
 var ErrNotFound = errors.New("记录不存在")
@@ -113,12 +128,18 @@ type Store interface {
 	// EnsureSession 返回该人格最近一个未收尾的会话；没有就新建一个。
 	EnsureSession(personaID string) (Session, error)
 
-	// EnsureChunk 返回会话当前的片；当前片字符数达到 maxRunes 时，
-	// 先把它收尾（标记 ended_at）再开一片新的。
+	// EnsureChunk 返回会话当前的片；当前片**字符数达到 maxRunes 或条数达到 maxMessages** 时，
+	// 先把它收尾（标记 ended_at）再开一片新的。两个上限传 <= 0 表示该项不设限。
+	//
+	// 为什么两个上限都要（2026-09-24 补）：它们的量纲不同，而只有**片**能触发结算。
+	// 只按字符切的话，一屏"嗯""哈哈"能塞很多条却几乎不涨字符数，
+	// 于是拼上下文时先撞上 ContextMessagesLimit 被裁掉开头——
+	// 那些消息既不在上下文里，又因为片没收尾而进不了结算，就成了静默丢失
+	// （正是分片当初要消灭的那种 bug）。两个上限对齐之后，"离开上下文"与"可被结算"是同一件事。
 	//
 	// 判断发生在**写入下一条用户消息之前**，而不是等会话结束——会话可能一整天不结束。
 	// 也因此片边界永远落在用户发言之前，一个问答对不会被从中间切开。
-	EnsureChunk(sessionID string, maxRunes int) (Chunk, error)
+	EnsureChunk(sessionID string, maxRunes, maxMessages int) (Chunk, error)
 
 	// AppendMessage 追加一条消息，返回消息 ID（m.ID 为空时由实现生成）。
 	AppendMessage(m Message) (string, error)
@@ -133,7 +154,18 @@ type Store interface {
 	// 超出 limit 时取**尾部**（最近的）：丢掉寒暄比丢掉"刚才说的那件事"代价小得多。
 	ChunkMessages(chunkID string, limit int) ([]Message, error)
 
-	// RecentMessages 取该人格最近的消息（跨会话、时间正序、最多 limit 条）——历史界面用它。
+	// SessionMessages 取该会话的消息（按 CreatedAt 正序、最多 limit 条，超出取**尾部**）。
+	//
+	// 给"点开一条会话，看看当时聊了什么"用（历史菜单的第二级）。
+	// 与 ChunkMessages 的区别只在范围：那个是一条片，这个是整段会话（可能横跨好几个片）。
+	// 排序的精度问题与它一致（毫秒相同则相对顺序不保证）。
+	SessionMessages(sessionID string, limit int) ([]Message, error)
+
+	// RecentMessages 取该人格最近的消息（跨会话、时间正序、最多 limit 条）。
+	//
+	// 界面**不再用它**：历史已经改成"先列会话、点进去再看消息"（见 ui.HistorySession），
+	// 所以它现在只剩两个用武之地——删除人格后的清理校验（跨会话地确认"这个人的消息真没了"），
+	// 以及将来做摘录 / 导出时的跨会话取数。
 	RecentMessages(personaID string, limit int) ([]Message, error)
 
 	// ListSessions 列出该人格的会话（时间倒序）。

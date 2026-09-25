@@ -17,6 +17,28 @@ export namespace main {
 
 export namespace persona {
 	
+	export class Candidate {
+	    id: string;
+	    personaId: string;
+	    slot: string;
+	    value: string;
+	    evidence: string;
+	    createdAt: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new Candidate(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.personaId = source["personaId"];
+	        this.slot = source["slot"];
+	        this.value = source["value"];
+	        this.evidence = source["evidence"];
+	        this.createdAt = source["createdAt"];
+	    }
+	}
 	export class SlotSpec {
 	    key: string;
 	    label: string;
@@ -227,6 +249,44 @@ export namespace ui {
 	        this.text = source["text"];
 	        this.at = source["at"];
 	        this.status = source["status"];
+	    }
+	}
+	export class HistorySession {
+	    id: string;
+	    title: string;
+	    startedAt: number;
+	    endedAt: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new HistorySession(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.title = source["title"];
+	        this.startedAt = source["startedAt"];
+	        this.endedAt = source["endedAt"];
+	    }
+	}
+	export class MemoryItem {
+	    id: string;
+	    content: string;
+	    kind: string;
+	    private: boolean;
+	    createdAt: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new MemoryItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.content = source["content"];
+	        this.kind = source["kind"];
+	        this.private = source["private"];
+	        this.createdAt = source["createdAt"];
 	    }
 	}
 

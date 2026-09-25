@@ -137,7 +137,7 @@ func newSettleApp(t *testing.T, outs ...string) (*App, *fakeProvider, *fakeEmbed
 	if err != nil {
 		t.Fatalf("建会话失败: %v", err)
 	}
-	chunk, err := hist.EnsureChunk(sess.ID, history.ChunkMaxRunes)
+	chunk, err := hist.EnsureChunk(sess.ID, history.ChunkMaxRunes, history.ChunkMaxMessages)
 	if err != nil {
 		t.Fatalf("取当前片失败: %v", err)
 	}
@@ -298,7 +298,7 @@ func TestSettleDisabledWithoutEmbedder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建会话失败: %v", err)
 	}
-	chunk, err := hist.EnsureChunk(sess.ID, history.ChunkMaxRunes)
+	chunk, err := hist.EnsureChunk(sess.ID, history.ChunkMaxRunes, history.ChunkMaxMessages)
 	if err != nil {
 		t.Fatalf("取当前片失败: %v", err)
 	}

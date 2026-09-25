@@ -1,5 +1,5 @@
-// Package settle 是「收尾结算」：把一段已经聊完的对话整理成三样能长期使用的东西——
-// 片摘要（抽取式、带原话）、会话标题、待存事实。
+// Package settle 是「收尾结算」：把一段已经聊完的对话整理成几样能长期使用的东西——
+// 片摘要（抽取式、带原话）、会话标题、待存事实、**待采纳的行为规则候选**。
 //
 // 为什么单独成包：它只做"从原文里挑"，不碰数据库、也不调网络——输入是消息、输出是结构化结果。
 // 于是它的规则（原话必须回得到原文、抽取而非生成）可以用纯单元测试钉住；
@@ -8,6 +8,9 @@
 // 为什么是抽取而不是生成：生成式摘要必然丢细节、而且有编造风险——它会把两件事揉成一件，
 // 读起来还很通顺。而这份摘要会被当作"想起的那次谈话"注入上下文，
 // **编造出来的回忆比没有回忆更糟**。详见 operation.md「片摘要走「抽取」而不是「生成」」。
+//
+// 四样一次输出（而不是分几次调）：三次调用就是三倍成本与延迟，而它们读的是同一份原文。
+// 这也是「隐式演化」和「记忆抽取」共用一条管线的落点——两者的差别只在**分派到哪张表**。
 package settle
 
 import (
@@ -20,6 +23,7 @@ import (
 
 	"agent-for-you-love/internal/llm"
 	"agent-for-you-love/internal/memory"
+	"agent-for-you-love/internal/persona"
 )
 
 // 各字段的条数上限。
@@ -31,6 +35,9 @@ const (
 	MaxKeyPoints  = 8
 	MaxFacts      = 6
 	MaxUnresolved = 5
+	// MaxRuleCandidates 比别的都小得多：值得长期留的行为倾向本来就少，
+	// 而多出来的每一条都是候选区里的一条待办，会烦到用户（见 operation.md 的取舍）
+	MaxRuleCandidates = 3
 )
 
 // title / topic 是"一句话"字段，没有原话可以校验，跑飞了就会把摘要撑坏，所以截断。
@@ -74,12 +81,26 @@ type Fact struct {
 	Private bool
 }
 
+// RuleCandidate 是一条"关于你该怎么做"的长期倾向，抽出来放进候选区等用户定夺。
+//
+// 为什么不直接生效：规则改的是**行为方式**，一条错的会持续污染每一轮；
+// 而事实抽错了只影响"她记错一件事"。风险等级不同，所以它要过一道人的眼睛
+// （operation.md：显式为主、隐式落候选区、变更可见可回滚）。
+type RuleCandidate struct {
+	// Slot 是收敛后的规范槽位 key，且**必然是 volatile**（stable 层自动抽取无权写入）
+	Slot  string
+	Value string
+	// Quote 与其它条目同理：对不上原文就不要
+	Quote string
+}
+
 // Result 是一次结算的产物（已经过校验，字段可信）。
 type Result struct {
 	Title      string
 	Topic      string
 	KeyPoints  []KeyPoint
 	Facts      []Fact
+	Rules      []RuleCandidate
 	Unresolved []string
 	// Dropped 是被校验刷掉的条目数（原话对不上、类型不认识、超出上限）。
 	// 只用于日志——但它是"模型有没有在编"的唯一可观测信号，别省
@@ -89,6 +110,8 @@ type Result struct {
 // IsEmpty 表示这次整理什么都没得到。
 //
 // Title 不算数：只有标题没有内容的摘要，进了向量库也匹配不出东西。
+// **Rules 也不算数**：它是随摘要搭车出来的附加产物，而 Summary() 里不含它——
+// 若只抽出规则、摘要却是空的，那这份结算进不了向量库，留着等于凭空多一条"什么都没记住"的片。
 func (r Result) IsEmpty() bool {
 	return strings.TrimSpace(r.Topic) == "" && len(r.KeyPoints) == 0 &&
 		len(r.Facts) == 0 && len(r.Unresolved) == 0
@@ -134,8 +157,16 @@ func Prompt(msgs []llm.Message) (system, user string) {
 	b.WriteString("    importance：1~5。5 = 健康、亲人、重大变故；4 = 明确的喜恶或重要约定；\n")
 	b.WriteString("                3 = 一般经历；2 = 日常小事； 1 = 无关紧要的内容 \n")
 	b.WriteString("    quote：支持这条事实的原话\n")
-	b.WriteString("- unresolved：这段里还没说完、或答应过还没做的事，没有就给空数组\n\n")
-	b.WriteString("铁律：\n")
+	b.WriteString("- unresolved：这段里还没说完、或答应过还没做的事，没有就给空数组\n")
+	b.WriteString("- rules：用户在这段里透出的、**希望你以后怎么说话做事**的长期倾向。每条包含：\n")
+	b.WriteString("    slot：只能从下面选（不是关于用户的喜好，而是关于你自己的行为）\n")
+	for _, s := range volatileSlots() {
+		fmt.Fprintf(&b, "        %s = %s\n", s.Key, s.Label)
+	}
+	b.WriteString("    value：写成一句可以直接执行的指示（例如「说话简短一点」）\n")
+	b.WriteString("    quote：支持它的原话\n")
+	b.WriteString("    这类要求很少见，没有就给空数组；**别把一次性的要求写进来**\n")
+	b.WriteString("\n铁律：\n")
 	b.WriteString("1. quote 必须是原文里**一字不差**出现过的话，不许改写，不许把两句话拼起来\n")
 	b.WriteString("2. 找不到原文依据的内容宁可不写——对不上原文的条目会被直接丢掉\n")
 	b.WriteString("3. 只输出一个 json 对象，不要解释，也不要包在代码块里\n\n")
@@ -143,6 +174,7 @@ func Prompt(msgs []llm.Message) (system, user string) {
 	b.WriteString(`{"title":"…","topic":"…",`)
 	b.WriteString(`"key_points":[{"point":"…","quote":"…"}],`)
 	b.WriteString(`"facts":[{"content":"…","about":"user","kind":"fact","importance":3,"quote":"…"}],`)
+	b.WriteString(`"rules":[{"slot":"tone","value":"…","quote":"…"}],`)
 	b.WriteString(`"unresolved":["…"]}`)
 
 	return "你是对话整理器：只从原文里抽取，只输出 json。",
@@ -172,6 +204,7 @@ type rawResult struct {
 	Topic      string     `json:"topic"`
 	KeyPoints  []KeyPoint `json:"key_points"`
 	Facts      []rawFact  `json:"facts"`
+	Rules      []rawRule  `json:"rules"`
 	Unresolved []string   `json:"unresolved"`
 }
 
@@ -181,6 +214,12 @@ type rawFact struct {
 	Kind       string `json:"kind"`
 	Importance int    `json:"importance"`
 	Quote      string `json:"quote"`
+}
+
+type rawRule struct {
+	Slot  string `json:"slot"`
+	Value string `json:"value"`
+	Quote string `json:"quote"`
 }
 
 // about 的两个合法取值。
@@ -249,6 +288,21 @@ func Parse(raw string, source []llm.Message) (Result, error) {
 		})
 	}
 
+	for _, r := range rr.Rules {
+		if len(res.Rules) >= MaxRuleCandidates {
+			res.Dropped++
+			continue
+		}
+		slot, ok := canonicalVolatileSlot(r.Slot)
+		value := strings.TrimSpace(r.Value)
+		quote, quoted := matchQuote(r.Quote, text)
+		if !ok || value == "" || !quoted || !validRuleValue(value) {
+			res.Dropped++
+			continue
+		}
+		res.Rules = append(res.Rules, RuleCandidate{Slot: slot, Value: value, Quote: quote})
+	}
+
 	for _, u := range rr.Unresolved {
 		u = strings.TrimSpace(u)
 		if u == "" {
@@ -266,6 +320,47 @@ func Parse(raw string, source []llm.Message) (Result, error) {
 			ErrUnusable, utf8.RuneCountInString(raw))
 	}
 	return res, nil
+}
+
+// volatileSlots 返回**允许自动演化**的槽位。
+//
+// 权限矩阵（operation.md）：stable（身份 / 底线 / 禁忌）只有人工能写，自动抽取无权写入——
+// 那几样决定"她是谁"，被模型悄悄改掉是最难发现、也最不可逆的一种错。
+// 清单直接从 SlotSpecs() 过滤出来，于是它与 UI 下拉、导入校验共用一份数据，不会走样。
+func volatileSlots() []persona.SlotSpec {
+	all := persona.SlotSpecs()
+	out := make([]persona.SlotSpec, 0, len(all))
+	for _, s := range all {
+		if s.Kind == persona.KindVolatile {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// canonicalVolatileSlot 收敛槽位，并挡住"自动抽取不许写的那些槽位"。
+//
+// 为什么不能只靠 prompt 里那份白名单：模型可能自己造一个（address_self、taboo…），
+// 而 CanonicalizeSlot 会把**认不出来**的说法一律落到 other —— 那是 volatile，
+// 于是"自称"这种 stable 内容会绕个圈子被静默放行。所以这里看的是收敛结果的 kind。
+func canonicalVolatileSlot(raw string) (string, bool) {
+	key := persona.CanonicalizeSlot(raw)
+	spec, ok := persona.LookupSlot(key)
+	if !ok || spec.Kind != persona.KindVolatile {
+		return "", false
+	}
+	return key, true
+}
+
+// validRuleValue 检查取值长度，以及"是不是在试图改写指令本身"。
+//
+// 越权粗筛与人格的指令抽取共用同一个判断：同一类内容从两条路进来
+// （用户明说 / 模型自动抽），闸门没有理由不一样。
+func validRuleValue(v string) bool {
+	if utf8.RuneCountInString(v) > persona.MaxRuleValueRunes {
+		return false
+	}
+	return !persona.LooksLikeInjection(v)
 }
 
 // matchQuote 检查原话是否真的出现在原文里，返回可以直接存下来的版本。

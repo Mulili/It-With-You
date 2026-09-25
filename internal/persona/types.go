@@ -145,3 +145,22 @@ type PersonaChange struct {
 	// CreatedAt 是变更发生的时刻，Unix 毫秒
 	CreatedAt int64 `json:"createdAt"`
 }
+
+// Candidate 是"值得留存的行为规则"的候选：从对话里自动抽出来，等用户采纳才成为真规则。
+//
+// 为什么不直接写进 persona_rules：规则改的是**行为方式**，一条错的会持续污染每一轮；
+// 而记忆抽错了只影响"她记错一件事"。风险等级不同，所以一个要过审、一个直接生效
+// （见 operation.md 的取舍：显式为主、隐式落候选区、变更可见可回滚）。
+//
+// 字段是 PersonaRule 的子集：真正落库时，tier / kind / priority 这些**由保存路径决定**
+// （人写规则时也一样），不该由"抽出来的一条候选"指定——否则模型可以绕过权限矩阵。
+type Candidate struct {
+	ID        string `json:"id"`
+	PersonaID string `json:"personaId"`
+	// Slot 是规范槽位 key；抽取时就已收敛，且**只可能是允许自动演化的（volatile）槽位**
+	Slot     string `json:"slot"`
+	Value    string `json:"value"`
+	Evidence string `json:"evidence"`
+	// CreatedAt 是这条候选被抽出来的时刻，Unix 毫秒
+	CreatedAt int64 `json:"createdAt"`
+}

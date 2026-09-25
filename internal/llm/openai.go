@@ -9,16 +9,22 @@
 package llm
 
 import (
-	errorcode "agent-for-you-love/internal/pkg/errorCode"
 	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 )
+
+// ErrMissingAPIKey 表示"根本没配 Key"。
+//
+// 做成导出变量而不是每次现拼字符串：调用方（前端）拿到的就是这句话，
+// 而它是最常见的首次运行故障，值得一个明确的文案。
+var ErrMissingAPIKey = errors.New("尚未配置 API Key，请先在设置里填写")
 
 // OpenAIProvider 是 Provider 接口的 OpenAI 兼容实现，DeepSeek / OpenAI / 本地 vLLM 都能直接复用。
 //
@@ -31,7 +37,8 @@ type OpenAIProvider struct {
 }
 
 // NewOpenAIProvider 只做组装，不做网络校验。
-// 缺 Key 之类的错误留到 ChatStream 里以业务错误码返回，这样构造函数保持无副作用、便于测试。
+// 缺 Key 之类的错误留到 ChatStream 里以 ErrMissingAPIKey 返回，
+// 这样构造函数保持无副作用、便于测试。
 func NewOpenAIProvider(cfg Config) *OpenAIProvider {
 	return &OpenAIProvider{cfg: cfg, client: &http.Client{}}
 }
@@ -164,9 +171,9 @@ func (p *OpenAIProvider) send(c context.Context, messages []Message, stream bool
 //
 // 本层不假设返回内容一定是 JSON——只负责把正文取出来，解析与校验由调用方做。
 func (p *OpenAIProvider) Chat(c context.Context, messages []Message, opts ChatOptions) (string, error) {
-	// 没有 Key 就不用发请求了，直接返回业务错误码
+	// 没有 Key 就不用发请求了
 	if p.cfg.APIKey == "" {
-		return "", errorcode.ErrCodeUnKownAPIKey
+		return "", ErrMissingAPIKey
 	}
 	resp, err := p.send(c, messages, false, opts)
 	if err != nil {
@@ -195,9 +202,9 @@ func (p *OpenAIProvider) Chat(c context.Context, messages []Message, opts ChatOp
 // 取消时底层 HTTP 往返会被中断，pump 收到 ctx.Err() 后以 Chunk{Err} 收尾，
 // 而不是让前端自己丢弃后面的包。
 func (p *OpenAIProvider) ChatStream(c context.Context, messages []Message, opts ChatOptions) (<-chan Chunk, error) {
-	// 没有 Key 就不用发请求了，直接返回业务错误码，前端会把它显示在气泡里
+	// 没有 Key 就不用发请求了，前端会把它显示在气泡里
 	if p.cfg.APIKey == "" {
-		return nil, errorcode.ErrCodeUnKownAPIKey
+		return nil, ErrMissingAPIKey
 	}
 	// 流式路径只认 DisableThinking：JSON 模式要求一次性给出完整对象，与逐帧流出天然矛盾，
 	// 这里显式丢掉，免得"流式 + json_object"这种无意义组合被静默发出去。

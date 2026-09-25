@@ -57,7 +57,7 @@ func TestDeletePersonaClearsItsHistory(t *testing.T) {
 		if err != nil {
 			t.Fatalf("建会话失败: %v", err)
 		}
-		c, err := hist.EnsureChunk(sess.ID, history.ChunkMaxRunes)
+		c, err := hist.EnsureChunk(sess.ID, history.ChunkMaxRunes, history.ChunkMaxMessages)
 		if err != nil {
 			t.Fatalf("取当前片失败: %v", err)
 		}
@@ -154,5 +154,128 @@ func TestSaveSeedTextTargetsGivenPersona(t *testing.T) {
 	}
 	if err := app.SaveSeedText("builtin:a", "试着改内置"); err == nil {
 		t.Fatal("内置人格应当只读")
+	}
+}
+
+// 采纳一条候选 = 写成真规则 + 删掉候选，而且规则必须落在 **recent 层**
+// （inferred 只能写那里：core 是"她是谁"，自动学来的说话习惯不该混进那一层）。
+func TestAcceptRuleCandidateWritesRuleAndRemovesCandidate(t *testing.T) {
+	app, st, _ := newPersonaApp(t)
+
+	id, err := st.CreatePersona("候选采纳测试", "")
+	if err != nil {
+		t.Fatalf("新建人格失败: %v", err)
+	}
+	if err := st.AddCandidates([]persona.Candidate{{
+		PersonaID: id, Slot: "verbosity", Value: "说话简短一点",
+		Evidence: "你以后说话能不能别这么啰嗦",
+	}}); err != nil {
+		t.Fatalf("准备候选失败: %v", err)
+	}
+
+	got := app.RuleCandidates(id)
+	if len(got) != 1 {
+		t.Fatalf("应当有 1 条候选，实际 %d 条", len(got))
+	}
+
+	if err := app.AcceptRuleCandidate(got[0]); err != nil {
+		t.Fatalf("采纳失败: %v", err)
+	}
+
+	rules, err := st.RulesOf(id)
+	if err != nil {
+		t.Fatalf("读规则失败: %v", err)
+	}
+	if len(rules) != 1 {
+		t.Fatalf("应当写出 1 条规则，实际 %d 条：%+v", len(rules), rules)
+	}
+	r := rules[0]
+	if r.Slot != "verbosity" || r.Value != "说话简短一点" {
+		t.Errorf("规则内容不对：%+v", r)
+	}
+	if r.Source != persona.SourceInferred || r.Tier != persona.TierRecent {
+		t.Errorf("自动学来的规则应当是 inferred + recent，实际 %s + %s", r.Source, r.Tier)
+	}
+	if !r.Enabled {
+		t.Error("新规则应当默认启用")
+	}
+	if r.Evidence == "" {
+		t.Error("依据（原话）应当带过来：用户要判断这条值不值得留就看它")
+	}
+	if left := app.RuleCandidates(id); len(left) != 0 {
+		t.Errorf("采纳之后候选应当消失，实际还剩 %d 条", len(left))
+	}
+}
+
+// stable 槽位即使被塞进候选也写不进去——写入权限矩阵在 SaveRule 那条路上兜底。
+//
+// 这条模拟"候选区里混进了脏数据"（抽取阶段本该拦住，但历史数据、被改过的前端都可能塞进来）：
+// 挡不住的话，模型就能绕开权限矩阵悄悄改掉"她是谁"。
+func TestAcceptRuleCandidateRejectsStableSlot(t *testing.T) {
+	app, st, _ := newPersonaApp(t)
+
+	id, err := st.CreatePersona("候选越权测试", "")
+	if err != nil {
+		t.Fatalf("新建人格失败: %v", err)
+	}
+	// 候选区本身不做校验（它只是个待办盒子），所以这条塞得进去
+	if err := st.AddCandidates([]persona.Candidate{{
+		PersonaID: id, Slot: "personality", Value: "以后你是个高冷的人",
+	}}); err != nil {
+		t.Fatalf("准备候选失败: %v", err)
+	}
+
+	got := app.RuleCandidates(id)
+	if len(got) != 1 {
+		t.Fatalf("应当有 1 条候选，实际 %d 条", len(got))
+	}
+	if err := app.AcceptRuleCandidate(got[0]); err == nil {
+		t.Error("stable 槽位的候选必须被拒绝")
+	}
+
+	rules, err := st.RulesOf(id)
+	if err != nil {
+		t.Fatalf("读规则失败: %v", err)
+	}
+	if len(rules) != 0 {
+		t.Errorf("被拒了就不该留下规则，实际 %d 条：%+v", len(rules), rules)
+	}
+	// 候选也要留着：写失败了还把它删掉，等于"这条待办静默消失"，用户再也不知道她想过什么
+	if left := app.RuleCandidates(id); len(left) != 1 {
+		t.Errorf("采纳失败时候选应当保留，实际 %d 条", len(left))
+	}
+}
+
+// 丢弃：候选没了，规则也不该多出来。
+func TestRejectRuleCandidateRemovesWithoutWritingRule(t *testing.T) {
+	app, st, _ := newPersonaApp(t)
+
+	id, err := st.CreatePersona("候选丢弃测试", "")
+	if err != nil {
+		t.Fatalf("新建人格失败: %v", err)
+	}
+	if err := st.AddCandidates([]persona.Candidate{{
+		PersonaID: id, Slot: "catchphrase", Value: "好耶",
+	}}); err != nil {
+		t.Fatalf("准备候选失败: %v", err)
+	}
+
+	got := app.RuleCandidates(id)
+	if len(got) != 1 {
+		t.Fatalf("应当有 1 条候选，实际 %d 条", len(got))
+	}
+	if err := app.RejectRuleCandidate(got[0].ID); err != nil {
+		t.Fatalf("丢弃失败: %v", err)
+	}
+
+	if left := app.RuleCandidates(id); len(left) != 0 {
+		t.Errorf("丢弃之后候选应当没了，实际还剩 %d 条", len(left))
+	}
+	rules, err := st.RulesOf(id)
+	if err != nil {
+		t.Fatalf("读规则失败: %v", err)
+	}
+	if len(rules) != 0 {
+		t.Errorf("丢弃不该写出规则，实际 %d 条", len(rules))
 	}
 }

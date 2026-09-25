@@ -92,10 +92,27 @@ type SaveResult struct {
 	Updated bool
 }
 
+// MemoryHit 是一条检索命中的记忆：条目本身 + 它与查询的相似度。
+//
+// 为什么要把相似度带出来、而不是在存储层就按阈值筛掉：
+// "多像才算相关"是**策略**（要能随手调、要看真实数据校），
+// 而"什么最像"才是存储层的事。把策略写死进 SQL 的话，调一次阈值就得改两个实现。
+type MemoryHit struct {
+	Memory Memory
+	// Score 是余弦相似度，-1..1；越大越像
+	Score float64
+}
+
+// ChunkHit 是一条检索命中的片索引，语义同 MemoryHit。
+type ChunkHit struct {
+	Chunk ChunkIndex
+	Score float64
+}
+
 // Store 是长期记忆的存储契约。
 //
-// 目前只放 3b（收尾结算）需要的方法。检索（Search）、回访（PendingFollowUps）等
-// 留到第 4 步再加——接口随需要长，一次定义全会变成"猜着写"。
+// 检索相关的方法在第 4 步补上（原先只有 3b 收尾结算需要的），回访（PendingFollowUps）等
+// 仍然留到需要时再加——接口随需要长，一次定义全会变成"猜着写"。
 type Store interface {
 	// Save 写入一条记忆，返回它的 ID。
 	//
@@ -107,17 +124,47 @@ type Store interface {
 	// 不属于"一条记忆"本身。
 	Save(m Memory, vec []float32, threshold float64) (SaveResult, error)
 
+	// Search 语义检索该人格**可见**的记忆（公共 + 本人格私有），按相似度倒序，最多 limit 条。
+	//
+	// 注意：相似度**相同**的几条之间，相对顺序不保证（PG 对排序键相同的行不保证顺序，
+	// 内存实现则按插入顺序）。真实数据几乎不会撞上完全相同的相似度，
+	// 但测试里构造数据时要留意——与 history 的 created_at 是同一个坑。
+	Search(personaID string, vec []float32, limit int) ([]MemoryHit, error)
+
+	// SearchChunks 语义检索该人格的**片索引**，按相似度倒序，最多 limit 条。
+	//
+	// 命中片索引只是拿到"聊过这件事"的指针与摘要；要更多细节得顺着 ChunkID 回 messages 取原文
+	// （那是宿主自己的事，见 operation.md「命中片之后注入什么」）。
+	SearchChunks(personaID string, vec []float32, limit int) ([]ChunkHit, error)
+
 	// List 列出该人格**可见**的记忆（公共 + 本人格私有），按创建时间倒序。
 	//
 	// 给"它记得什么"那个界面用。它与检索的区别是：这里不按相关性排序，只按时间倒序——
 	// 用户想看的是"你都记了些什么"，而不是"什么最相关"。
 	List(personaID string, limit int) ([]Memory, error)
 
+	// Delete 删掉一条记忆。
+	//
+	// 与 DeletePersona 的区别只在粒度：那个是"人格没了，把它私有的都带走"，
+	// 这个是用户指着某一条说"忘掉它"。
+	//
+	// 找不到不报错（删两次是同一次的结果）：这个入口只有界面在用，
+	// 而"删一个已经不存在的东西"不该变成一个错误弹窗打扰用户。
+	Delete(id string) error
+
 	// IndexChunk 写入一条片索引；同一片重复写是**覆盖**（chunk_id 是主键）。
 	//
 	// 幂等是有意的：结算的最后一步才写"已结算"的标记（见 app 层 settleChunk 的写库顺序），
 	// 在那之前的任何失败都会让下一轮整体重放，而重放必须能覆盖而不是撞主键。
 	IndexChunk(ci ChunkIndex, vec []float32) error
+
+	// MarkRecalled 把这些记忆标成"刚被注入过"（写 last_recalled_at）。
+	//
+	// 这是"别反复提同一件事"的**唯一依据**——它记录的是**注入**时间，不是"被用到"的时间：
+	// 后者要靠模型自述，得再加一次调用，而注入本身就足以说明"她刚被提醒过这件事"。
+	//
+	// 找不到的 ID 不该报错：记忆可能刚被用户删掉，而这件事不值得打断一轮对话。
+	MarkRecalled(ids []string) error
 
 	// DeletePersona 删除该人格的**私有**记忆。
 	//

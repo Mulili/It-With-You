@@ -51,7 +51,7 @@ func (s *MemoryStore) EnsureSession(personaID string) (history.Session, error) {
 }
 
 // EnsureChunk 实现 history.Store。
-func (s *MemoryStore) EnsureChunk(sessionID string, maxRunes int) (history.Chunk, error) {
+func (s *MemoryStore) EnsureChunk(sessionID string, maxRunes, maxMessages int) (history.Chunk, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -60,8 +60,10 @@ func (s *MemoryStore) EnsureChunk(sessionID string, maxRunes int) (history.Chunk
 		if c.SessionID != sessionID || c.EndedAt != 0 {
 			continue
 		}
-		// 没到阈值就接着用它
-		if maxRunes <= 0 || s.chunkRunesLocked(c.ID) < maxRunes {
+		runes, count := s.chunkSizeLocked(c.ID)
+		// 没到上限就接着用它。字符数与条数**任一到达**就切（<=0 表示该项不设限），
+		// 为什么要两个上限：见 Store 接口的 EnsureChunk 注释（只按字符切会让短消息落在缝里）
+		if (maxRunes <= 0 || runes < maxRunes) && (maxMessages <= 0 || count < maxMessages) {
 			return c, nil
 		}
 		// 到了就把它收尾，再往下走开新片。这一步发生在**写入下一条用户消息之前**，
@@ -86,15 +88,17 @@ func (s *MemoryStore) EnsureChunk(sessionID string, maxRunes int) (history.Chunk
 	return c, nil
 }
 
-// chunkRunesLocked 返回该片的字符数。调用方需持锁。
-func (s *MemoryStore) chunkRunesLocked(chunkID string) int {
-	total := 0
+// chunkSizeLocked 返回该片的字符数与消息条数。调用方需持锁。
+//
+// 一次遍历算两个数：它们每次发消息都要一起判（见 EnsureChunk）。
+func (s *MemoryStore) chunkSizeLocked(chunkID string) (runes, count int) {
 	for _, m := range s.messages {
 		if m.ChunkID == chunkID {
-			total += len([]rune(m.Content))
+			runes += len([]rune(m.Content))
+			count++
 		}
 	}
-	return total
+	return runes, count
 }
 
 // nextSeqLocked 返回该会话下一个片序号（从 1 开始）。调用方需持锁。
@@ -148,6 +152,25 @@ func (s *MemoryStore) ChunkMessages(chunkID string, limit int) ([]history.Messag
 		}
 	}
 	// 条数兜底与 PG 侧口径一致：取尾部（最近的）；limit <= 0 表示全部
+	if limit > 0 && len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out, nil
+}
+
+// SessionMessages 实现 history.Store。
+//
+// 与 ChunkMessages 同一套口径（取尾部、limit <= 0 表示全部），只换了筛选列。
+func (s *MemoryStore) SessionMessages(sessionID string, limit int) ([]history.Message, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]history.Message, 0, 16)
+	for _, m := range s.messages {
+		if m.SessionID == sessionID {
+			out = append(out, m)
+		}
+	}
 	if limit > 0 && len(out) > limit {
 		out = out[len(out)-limit:]
 	}

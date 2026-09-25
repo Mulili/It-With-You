@@ -366,6 +366,85 @@ func (s *PgStore) DeletePersona(id string) error {
 	return nil
 }
 
+// AddCandidates 实现 Store。
+//
+// 整批一个事务：这批候选来自同一次抽取，写一半比全不写更难查
+// （候选区少几条不会报错，只会让人觉得"它怎么没学到"）。
+func (s *PgStore) AddCandidates(cs []persona.Candidate) error {
+	if len(cs) == 0 {
+		return nil
+	}
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	now := time.Now().UnixMilli()
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		for _, c := range cs {
+			id := c.ID
+			if id == "" {
+				id = uuid.NewString()
+			}
+			created := c.CreatedAt
+			if created == 0 {
+				created = now
+			}
+			// DO NOTHING 而不是 DO UPDATE：同一件事被反复抽到时，先出现的那条（带它当时的原话）
+			// 更值得留；而且这样它对重放是幂等的（结算失败重放会把这批再写一遍）。
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO persona_rule_candidates (id, persona_id, slot, value, evidence, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6)
+				ON CONFLICT (persona_id, slot, value) DO NOTHING`,
+				id, c.PersonaID, c.Slot, c.Value, c.Evidence, created); err != nil {
+				return fmt.Errorf("写入规则候选失败: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+// ListCandidates 实现 Store。
+func (s *PgStore) ListCandidates(personaID string, limit int) ([]persona.Candidate, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, persona_id, slot, value, evidence, created_at
+		FROM persona_rule_candidates
+		WHERE persona_id = $1::uuid
+		ORDER BY created_at DESC
+		LIMIT $2`, personaID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("读取规则候选失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]persona.Candidate, 0, 8)
+	for rows.Next() {
+		var c persona.Candidate
+		if err := rows.Scan(&c.ID, &c.PersonaID, &c.Slot, &c.Value, &c.Evidence, &c.CreatedAt); err != nil {
+			return nil, fmt.Errorf("解析规则候选失败: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历规则候选失败: %w", err)
+	}
+	return out, nil
+}
+
+// DeleteCandidate 实现 Store。
+func (s *PgStore) DeleteCandidate(id string) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	// 影响 0 行不报错：采纳与丢弃都会删它，界面重复点一下不该变成错误弹窗
+	if _, err := s.pool.Exec(ctx,
+		`DELETE FROM persona_rule_candidates WHERE id = $1::uuid`, id); err != nil {
+		return fmt.Errorf("删除规则候选失败: %w", err)
+	}
+	return nil
+}
+
 // SaveRule 新增或更新一条规则（ID 为空即新增），返回规则 ID。
 func (s *PgStore) SaveRule(r persona.PersonaRule) (string, error) {
 	ctx, cancel := s.ctx()

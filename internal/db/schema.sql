@@ -59,6 +59,30 @@ CREATE TABLE IF NOT EXISTS persona_changes (
 
 CREATE INDEX IF NOT EXISTS persona_changes_persona_idx ON persona_changes (persona_id, created_at DESC);
 
+-- 候选区（阶段4）：自动抽出来的「值得留存的行为规则」，等用户采纳才成为真规则。
+--
+-- 为什么不直接写进 persona_rules：规则改的是**行为方式**，一条错的会持续污染每一轮；
+-- 而记忆抽错了只影响"她记错一件事"。风险等级不同，所以一个要过审、一个直接生效
+-- （见 operation.md：显式为主、隐式落候选区、变更可见可回滚）。
+--
+-- 去重按 (persona_id, slot, value)：结算是每段会话都跑一次，同一件事会被反复抽到，
+-- 不去重的话候选区很快被同一条刷屏。也正因为它幂等，结算重放时可以直接重写。
+CREATE TABLE IF NOT EXISTS persona_rule_candidates (
+    id         uuid PRIMARY KEY,
+    persona_id uuid   NOT NULL REFERENCES personas (id) ON DELETE CASCADE,
+    slot       text   NOT NULL,
+    value      text   NOT NULL,
+    -- 触发它的原话：与规则的 evidence 一样属敏感内容，导出时不含
+    evidence   text   NOT NULL DEFAULT '',
+    created_at bigint NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS persona_rule_candidates_uniq_idx
+    ON persona_rule_candidates (persona_id, slot, value);
+
+CREATE INDEX IF NOT EXISTS persona_rule_candidates_persona_idx
+    ON persona_rule_candidates (persona_id, created_at DESC);
+
 -- ---------- 阶段4：会话 ----------
 --
 -- 会话是历史的组织单位：历史落库后按会话分组，而"只发当前会话的消息"天然给出了

@@ -23,6 +23,9 @@ const (
 	testPersonaA = "00000000-0000-0000-0000-00000000a001"
 	testPersonaB = "00000000-0000-0000-0000-00000000b001"
 	testPersonaC = "00000000-0000-0000-0000-00000000c001"
+	// D 只服务于"条数到阈值也换片"那条：它要断言"新片序号是 2"，
+	// 所以必须用一个**前面没用过**的人格——复用的话会接上别人已经建好的会话与片，序号就不从 1 开始了
+	testPersonaD = "00000000-0000-0000-0000-00000000d001"
 )
 
 // 同一套断言跑两种实现：内存与 PG 的行为必须一致。
@@ -39,7 +42,7 @@ func runStoreContract(t *testing.T, s history.Store) {
 		if err != nil {
 			t.Fatalf("建会话失败: %v", err)
 		}
-		c, err := s.EnsureChunk(sess.ID, history.ChunkMaxRunes)
+		c, err := s.EnsureChunk(sess.ID, history.ChunkMaxRunes, history.ChunkMaxMessages)
 		if err != nil {
 			t.Fatalf("取当前片失败: %v", err)
 		}
@@ -160,7 +163,7 @@ func runStoreContract(t *testing.T, s history.Store) {
 		sess, first := newChunk(t, testPersonaA)
 		appendTo(t, first, "随便说点什么")
 
-		again, err := s.EnsureChunk(sess.ID, history.ChunkMaxRunes)
+		again, err := s.EnsureChunk(sess.ID, history.ChunkMaxRunes, history.ChunkMaxMessages)
 		if err != nil {
 			t.Fatalf("取当前片失败: %v", err)
 		}
@@ -169,12 +172,34 @@ func runStoreContract(t *testing.T, s history.Store) {
 		}
 	})
 
+	t.Run("EnsureChunk 条数到阈值也换片", func(t *testing.T) {
+		// 这一条盯的是"落在缝里的短消息"：短消息字符数几乎不涨，
+		// 若只按字符切，一屏"嗯""哈哈"能把片撑到上千条——而拼上下文有 500 条的兜底上限，
+		// 被裁掉的那部分既不在上下文里、又因为片没收尾而进不了结算，等于静默丢失
+		sess, first := newChunk(t, testPersonaD)
+		for i := 0; i < 3; i++ {
+			appendTo(t, first, "嗯")
+		}
+
+		// 字符上限给足（不设限），只让条数上限生效：3 条 ≥ 2 就该切
+		second, err := s.EnsureChunk(sess.ID, 0, 2)
+		if err != nil {
+			t.Fatalf("取当前片失败: %v", err)
+		}
+		if second.ID == first.ID {
+			t.Fatal("条数到上限后应当另起一片")
+		}
+		if second.Seq != 2 {
+			t.Errorf("新片序号应当是 2，实际 %d", second.Seq)
+		}
+	})
+
 	t.Run("EnsureChunk 到阈值时换新片、并把旧片收尾", func(t *testing.T) {
 		sess, first := newChunk(t, testPersonaC)
 		appendTo(t, first, "这句话的存在就是为了让片超过阈值")
 
-		// 阈值传 1：任何内容都超标，于是必然触发换片
-		second, err := s.EnsureChunk(sess.ID, 1)
+		// 字符阈值传 1：任何内容都超标，于是必然触发换片
+		second, err := s.EnsureChunk(sess.ID, 1, 0)
 		if err != nil {
 			t.Fatalf("取当前片失败: %v", err)
 		}
@@ -218,6 +243,40 @@ func runStoreContract(t *testing.T, s history.Store) {
 		}
 		if got[0].Content != "四" || got[1].Content != "五" {
 			t.Errorf("应当取最近的 2 条并按正序（四、五），实际（%s、%s）", got[0].Content, got[1].Content)
+		}
+	})
+
+	t.Run("SessionMessages 只取该会话的消息、超出取尾部", func(t *testing.T) {
+		// 复用 B 现有的会话：不断言总条数（前面几个子测试可能也往它里面写过），
+		// 只断言"不串会话"与"尾部两条的顺序"这两个真正要守的不变式
+		sess, c := newChunk(t, testPersonaB)
+		appendTo(t, c, "会话消息甲")
+		appendTo(t, c, "会话消息乙")
+
+		all, err := s.SessionMessages(sess.ID, 0)
+		if err != nil {
+			t.Fatalf("读会话消息失败: %v", err)
+		}
+		for _, m := range all {
+			if m.SessionID != sess.ID {
+				t.Fatalf("混进了别的会话的消息：%s", m.SessionID)
+			}
+		}
+		if len(all) < 2 {
+			t.Fatalf("至少该有刚写的两条，实际 %d 条", len(all))
+		}
+		last := all[len(all)-2:]
+		if last[0].Content != "会话消息甲" || last[1].Content != "会话消息乙" {
+			t.Errorf("应当按正序收尾（甲、乙），实际（%s、%s）", last[0].Content, last[1].Content)
+		}
+
+		// limit 是"最多几条"且取尾部：给 1 应当只剩最后那条
+		one, err := s.SessionMessages(sess.ID, 1)
+		if err != nil {
+			t.Fatalf("读会话消息失败: %v", err)
+		}
+		if len(one) != 1 || one[0].Content != "会话消息乙" {
+			t.Errorf("limit=1 应当只给最后那条（乙），实际 %+v", one)
 		}
 	})
 
@@ -393,7 +452,7 @@ func TestMemoryStoreContract(t *testing.T) {
 
 func TestPgStoreContract(t *testing.T) {
 	st, pool := openTestPgStore(t)
-	for _, id := range []string{testPersonaA, testPersonaB, testPersonaC} {
+	for _, id := range []string{testPersonaA, testPersonaB, testPersonaC, testPersonaD} {
 		ensureTestPersona(t, pool, id)
 	}
 	runStoreContract(t, st)
@@ -413,7 +472,7 @@ func TestPgIndexChunkUpsert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建会话失败: %v", err)
 	}
-	chunk, err := st.EnsureChunk(sess.ID, history.ChunkMaxRunes)
+	chunk, err := st.EnsureChunk(sess.ID, history.ChunkMaxRunes, history.ChunkMaxMessages)
 	if err != nil {
 		t.Fatalf("取当前片失败: %v", err)
 	}

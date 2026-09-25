@@ -129,6 +129,95 @@ func (s *PgStore) IndexChunk(ci memory.ChunkIndex, vec []float32) error {
 	return nil
 }
 
+// Search 实现 memory.Store。
+func (s *PgStore) Search(personaID string, vec []float32, limit int) ([]memory.MemoryHit, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	// <=> 是余弦距离（1 - 相似度），HNSW 索引直接服务这个排序。
+	// persona_id 传 NULL 时 "= NULL" 恒为 NULL、不会匹配任何行，于是只剩 IS NULL 那一支
+	// ——正是"只看公共记忆"的语义（与 List 同一套路）
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+memoryColumns+`, 1 - (embedding <=> $1::vector) AS score
+		FROM memories
+		WHERE persona_id IS NULL OR persona_id = $2::uuid
+		ORDER BY embedding <=> $1::vector
+		LIMIT $3`, vectorLiteral(vec), nullIfEmpty(personaID), limit)
+	if err != nil {
+		return nil, fmt.Errorf("检索记忆失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]memory.MemoryHit, 0, 8)
+	for rows.Next() {
+		var h memory.MemoryHit
+		if err := rows.Scan(&h.Memory.ID, &h.Memory.PersonaID, &h.Memory.Content, &h.Memory.Kind,
+			&h.Memory.Importance, &h.Memory.Evidence, &h.Memory.FollowUpAt,
+			&h.Memory.LastRecalledAt, &h.Memory.CreatedAt, &h.Memory.UpdatedAt, &h.Score); err != nil {
+			return nil, fmt.Errorf("解析检索结果失败: %w", err)
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历检索结果失败: %w", err)
+	}
+	return out, nil
+}
+
+// SearchChunks 实现 memory.Store。
+func (s *PgStore) SearchChunks(personaID string, vec []float32, limit int) ([]memory.ChunkHit, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	// chunk_index.persona_id 不可空（片必然属于某个人格），所以这里是严格相等，
+	// 与"记忆可公共"的语义不同
+	rows, err := s.pool.Query(ctx, `
+		SELECT chunk_id, session_id, persona_id, summary, created_at,
+		       1 - (embedding <=> $1::vector) AS score
+		FROM chunk_index
+		WHERE persona_id = $2::uuid
+		ORDER BY embedding <=> $1::vector
+		LIMIT $3`, vectorLiteral(vec), personaID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("检索片索引失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]memory.ChunkHit, 0, 4)
+	for rows.Next() {
+		var h memory.ChunkHit
+		if err := rows.Scan(&h.Chunk.ChunkID, &h.Chunk.SessionID, &h.Chunk.PersonaID,
+			&h.Chunk.Summary, &h.Chunk.CreatedAt, &h.Score); err != nil {
+			return nil, fmt.Errorf("解析片索引失败: %w", err)
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历片索引失败: %w", err)
+	}
+	return out, nil
+}
+
+// MarkRecalled 实现 memory.Store。
+func (s *PgStore) MarkRecalled(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	// 逐条 UPDATE，而不是 ANY($1::uuid[])：把 []string 编码成 uuid[] 要靠 pgx 的类型推断，
+	// 传错只会在运行时炸；而这里最多三条，多几次往返不值得为它冒这个险
+	now := memory.NowMillis()
+	for _, id := range ids {
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE memories SET last_recalled_at = $2 WHERE id = $1::uuid`, id, now); err != nil {
+			return fmt.Errorf("记录记忆回想的时刻失败: %w", err)
+		}
+	}
+	return nil
+}
+
 // List 实现 memory.Store。
 func (s *PgStore) List(personaID string, limit int) ([]memory.Memory, error) {
 	ctx, cancel := s.ctx()
@@ -160,6 +249,19 @@ func (s *PgStore) List(personaID string, limit int) ([]memory.Memory, error) {
 		return nil, fmt.Errorf("遍历记忆失败: %w", err)
 	}
 	return out, nil
+}
+
+// Delete 实现 memory.Store。
+func (s *PgStore) Delete(id string) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	// 影响 0 行不报错（与内存实现一致）。注意**格式非法**的 id 会真报错（22P02）——
+	// 那属于调用方传错了东西，与"这条已经不存在"不是一回事，让它露出来更好
+	if _, err := s.pool.Exec(ctx, `DELETE FROM memories WHERE id = $1::uuid`, id); err != nil {
+		return fmt.Errorf("删除记忆失败: %w", err)
+	}
+	return nil
 }
 
 // DeletePersona 实现 memory.Store。

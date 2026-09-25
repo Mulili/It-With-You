@@ -60,6 +60,23 @@ type Store interface {
 	DeleteRule(id string) error
 	SetRuleEnabled(id string, enabled bool) error
 
+	// AddCandidates 批量写入「隐式演化」的候选（幂等：同 persona + slot + value 已存在就跳过）。
+	//
+	// 幂等是必须的：结算是每段会话都跑一次，同一件事会被反复抽到；
+	// 而且结算失败重放时也会把这批候选再写一遍（与片索引的 ON CONFLICT 同一个道理）。
+	//
+	// 注意这里**不做权限校验**：候选只是一份"待办"，采纳才写真规则（走 SaveRule 那条路）。
+	// 但"给谁抽候选"是有讲究的——内置人格只读，给它抽了也没人能采纳，那是调用方的事。
+	AddCandidates(cs []Candidate) error
+
+	// ListCandidates 返回该人格的候选（时间倒序，最多 limit 条）。
+	ListCandidates(personaID string, limit int) ([]Candidate, error)
+
+	// DeleteCandidate 删掉一条候选——**采纳与丢弃都走它**（采纳只是先写规则、再删候选）。
+	//
+	// 找不到不报错：界面上的重复点击不该变成一个错误弹窗（与 memory.Store.Delete 同一口径）。
+	DeleteCandidate(id string) error
+
 	ExportFile(id string) (PersonaFile, error)
 	ImportFile(f PersonaFile) (Persona, error)
 }

@@ -3,10 +3,11 @@ import petImg from './assets/pet.png'
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import Bubble from './components/Bubble.vue'
 import {
-  Ask, Cancel, Say, HideWindow, Quit, History, SetMenuOpen,
+  Ask, Cancel, Say, HideWindow, Quit, History, SessionMessages, Memories, DeleteMemory, SetMenuOpen,
   GetPersonaSnapshot, SetActivePersona, GetPersonaRules, GetPersonaChanges, GetPersonaMeta,
   CreatePersona, RenamePersona, DeletePersona, SaveSeedText,
   SaveRule, DeleteRule, SetRuleEnabled,
+  RuleCandidates, AcceptRuleCandidate, RejectRuleCandidate,
   GetSettings, SetThinkingDisabled, ExportPersonaToFile, ImportPersonaFromFile,
 } from '../wailsjs/go/main/App'
 import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime'
@@ -25,9 +26,18 @@ const streamId = ref('')  // 当前这一轮的 ID，用来过滤掉上一轮的
 const inputEl = ref(null) // 输入框，用来在发送后把焦点还回去
 
 const menuOpen = ref(false)
-const historyItems = ref([])
+// 历史是**两级**的：先列会话，点进去再看那一段的消息（见 internal/ui/history.go 的说明）。
+// openSession 为 null 表示正停在会话列表那一级。
+const historySessions = ref([])
+const openSession = ref(null)
+const sessionMsgs = ref([])
+// 「它记得什么」列表
+const memories = ref([])
+// 正在等二次确认的那条记忆 ID（空串 = 没有）。
+// 删除不可恢复，而窗口很小、误触代价高，所以要点两下。
+const memoryPendingDelete = ref('')
 
-// 菜单内的分区：历史 / 人格
+// 菜单内的分区：历史 / 记忆 / 人格 / 设置
 const menuTab = ref('history')
 const personaList = ref([])
 const activePersonaId = ref('')
@@ -54,12 +64,56 @@ async function loadPersona() {
 
 async function loadHistory() {
   try {
-    // 历史是只读快照，打开时拉一次即可，不做轮询、不做增量推送
-    historyItems.value = (await History()) ?? []
+    // 历史是只读快照，打开菜单时拉一次即可，不做轮询、不做增量推送
+    historySessions.value = (await History()) ?? []
   } catch (e) {
-    historyItems.value = []
-    console.error('读取历史失败', e)
+    historySessions.value = []
+    console.error('读取会话列表失败', e)
   }
+}
+
+// 点开一条会话：只拉这一条的消息。为什么要分两级而不是一次全带上，见 internal/ui/history.go
+async function openSessionMessages(s) {
+  openSession.value = s
+  sessionMsgs.value = []
+  try {
+    sessionMsgs.value = (await SessionMessages(s.id)) ?? []
+  } catch (e) {
+    console.error('读取会话消息失败', e)
+  }
+}
+
+// 返回会话列表。顺手清掉已展开的消息：下次点进去该重新拉——
+// 期间后台可能刚把这一段结算完（标题都是新生成的），留着旧快照会让人以为标题没生效
+function closeSession() {
+  openSession.value = null
+  sessionMsgs.value = []
+}
+
+async function loadMemories() {
+  try {
+    memories.value = (await Memories()) ?? []
+  } catch (e) {
+    memories.value = []
+    console.error('读取记忆失败', e)
+  }
+}
+
+async function removeMemory(m) {
+  try {
+    await DeleteMemory(m.id)
+  } catch (e) {
+    formError.value = errText(e)
+  }
+  memoryPendingDelete.value = ''
+  await loadMemories()
+}
+
+// fact / preference / event / promise → 中文。
+// 认不出来的按原值显示，而不是留空：将来后端加了新类型，界面上也该看得见
+const MEMORY_KINDS = { fact: '事实', preference: '偏好', event: '经历', promise: '约定' }
+function kindLabel(kind) {
+  return MEMORY_KINDS[kind] ?? kind
 }
 
 // ---------- 设置（⑨）----------
@@ -172,6 +226,8 @@ const limits = ref({ seedTextRunes: 1200, ruleValueRunes: 200, injectBudgetRunes
 const detailId = ref('')       // 空 = 列表视图；否则为正在查看的人格 ID
 const detailRules = ref([])    // 详情页里那个人格的规则
 const detailChanges = ref([])  // 详情页里那个人格的最近变更（时间倒序）
+// 详情页里那个人格的「她学到的」候选（隐式演化的待办，采纳/丢弃后才消失）
+const candidates = ref([])
 const seedForm = ref(null)     // null = 未在编辑；否则为 { text }
 const ruleForm = ref(null)     // null = 未在编辑；否则为表单内容（id 为空即新增）
 const nameForm = ref(null)     // { mode: 'create' | 'rename', name, copyFrom }
@@ -241,6 +297,41 @@ async function loadChanges(id) {
   }
 }
 
+// 「她学到的」候选：从对话里自动抽出来的行为倾向，采纳之后才成为真规则。
+// 它挂在人格这一侧（不进「记忆」分区）：候选改的是行为方式，与记忆的风险等级不是一回事。
+async function loadCandidates(id) {
+  if (!id) {
+    candidates.value = []
+    return
+  }
+  try {
+    candidates.value = (await RuleCandidates(id)) ?? []
+  } catch (e) {
+    candidates.value = []
+    console.error('读取规则候选失败', e)
+  }
+}
+
+// 采纳 = 后端写真规则 + 删掉候选。规则列表会由 persona:changed 事件刷回来，
+// 这里只需要把候选重新拉一遍。
+async function acceptCandidate(c) {
+  try {
+    await AcceptRuleCandidate(c)
+  } catch (e) {
+    formError.value = errText(e)
+  }
+  await loadCandidates(detailId.value)
+}
+
+async function rejectCandidate(c) {
+  try {
+    await RejectRuleCandidate(c.id)
+  } catch (e) {
+    formError.value = errText(e)
+  }
+  await loadCandidates(detailId.value)
+}
+
 function resetForms() {
   seedForm.value = null
   ruleForm.value = null
@@ -252,12 +343,13 @@ function resetForms() {
 async function openDetail(p) {
   resetForms()
   detailId.value = p.id
-  await Promise.all([loadRules(p.id), loadChanges(p.id)])
+  await Promise.all([loadRules(p.id), loadChanges(p.id), loadCandidates(p.id)])
 }
 
 function closeDetail() {
   resetForms()
   detailId.value = ''
+  candidates.value = []
 }
 
 function startCreate() {
@@ -440,6 +532,8 @@ function onPersonaChanged(p) {
   loadPersona()
   // 删除人格、切换人格都会影响"当前人格的历史"，历史页可能正开着
   loadHistory()
+  // 记忆同样按人格隔离：删人格会带走它的私有记忆，切人格会换成另一份可见范围
+  loadMemories()
   // 详情页开着就同步它那份规则与变更记录：改这两样的入口不止编辑器一处
   // （"记住我的要求"也会写），变更记录更是每写必增
   if (detailId.value && detailId.value === p.personaId) {
@@ -451,7 +545,10 @@ function onPersonaChanged(p) {
 async function openMenu() {
   menuOpen.value = true
   SetMenuOpen(true)
-  await Promise.all([loadHistory(), loadPersona(), loadMeta(), loadSettings()])
+  // 每次打开都回到"会话列表"那一级：上次展开的那条可能已经被收尾结算过了（标题、摘要都变了）
+  closeSession()
+  memoryPendingDelete.value = ''
+  await Promise.all([loadHistory(), loadMemories(), loadPersona(), loadMeta(), loadSettings()])
 }
 
 function closeMenu() {
@@ -462,6 +559,14 @@ function closeMenu() {
 function toggleMenu() {
   menuOpen.value ? closeMenu() : openMenu()
 }
+
+// 换分区时把手上的临时状态收掉：展开的那段会话、等二次确认的删除。
+// 不收的话会"跨分区带过去"——从记忆切回历史，人还停在上次展开的那一段里，
+// 会以为列表没了；反过来也一样。
+watch(menuTab, () => {
+  closeSession()
+  memoryPendingDelete.value = ''
+})
 
 // 隐藏前先收起菜单：否则窗口会带着「加高后的尺寸 + 打开的面板」一起被隐藏，
 // 下次从托盘唤出时尺寸与预期不符
@@ -631,6 +736,13 @@ onUnmounted(() => {
           </button>
           <button
             class="menu__tab"
+            :class="{ 'menu__tab--on': menuTab === 'memory' }"
+            @click="menuTab = 'memory'"
+          >
+            记忆
+          </button>
+          <button
+            class="menu__tab"
             :class="{ 'menu__tab--on': menuTab === 'persona' }"
             @click="menuTab = 'persona'"
           >
@@ -645,22 +757,85 @@ onUnmounted(() => {
           </button>
         </nav>
 
+        <!-- 历史是两级的：会话列表 → 点进去看那一段的消息。 -->
         <template v-if="menuTab === 'history'">
-          <p v-if="!historyItems.length" class="menu__empty">还没有对话记录</p>
+          <!-- 第二级：某一条会话的消息 -->
+          <template v-if="openSession">
+            <div class="bar">
+              <button class="btn btn--ghost" @click="closeSession">← 返回</button>
+              <span class="bar__name">{{ openSession.title || '未命名对话' }}</span>
+            </div>
+            <p v-if="!sessionMsgs.length" class="menu__empty">这一段还没有消息</p>
+            <ul v-else class="menu__list">
+              <li
+                v-for="item in sessionMsgs"
+                :key="item.id"
+                class="menu__item"
+                :class="item.role === 'user' ? 'menu__item--user' : 'menu__item--bot'"
+              >
+                <div class="menu__meta">
+                  <span>{{ item.role === 'user' ? '我' : '伴侣' }}</span>
+                  <span>{{ fmtTime(item.at) }}</span>
+                  <span v-if="item.status === 'canceled'" class="menu__tag">已打断</span>
+                </div>
+                <p class="menu__text">{{ item.text }}</p>
+              </li>
+            </ul>
+          </template>
+
+          <!-- 第一级：会话列表。标题由结算在会话收尾时生成，
+               所以正聊着的这一段（以及还没轮到结算的）标题是空的，给个兜底文案 -->
+          <template v-else>
+            <p v-if="!historySessions.length" class="menu__empty">还没有对话记录</p>
+            <ul v-else class="menu__list">
+              <li
+                v-for="s in historySessions"
+                :key="s.id"
+                class="menu__item menu__item--pick"
+                title="点一下看这一段聊了什么"
+                @click="openSessionMessages(s)"
+              >
+                <div class="menu__meta">
+                  <span>{{ fmtTime(s.startedAt) }}</span>
+                  <span v-if="!s.endedAt" class="menu__tag menu__tag--on">进行中</span>
+                </div>
+                <p class="menu__text">{{ s.title || '未命名对话' }}</p>
+              </li>
+            </ul>
+          </template>
+        </template>
+
+        <!-- 「它记得什么」：自动抽出来的记忆必须看得见、删得掉，
+             否则抽错一条就只能忍着，或者把整个库清掉 -->
+        <template v-else-if="menuTab === 'memory'">
+          <p v-if="!storageReady" class="menu__warn">
+            数据库未连接：记忆功能不可用（对话与人格不受影响）
+          </p>
+          <p v-else-if="!memories.length" class="menu__empty">
+            它还没记住什么。聊完一段、等后台整理过之后，这里就会出现。
+          </p>
           <ul v-else class="menu__list">
-            <!-- 列表只增不改、每条 id 唯一，用 id 做 key 是安全的 -->
-            <li
-              v-for="item in historyItems"
-              :key="item.id"
-              class="menu__item"
-              :class="item.role === 'user' ? 'menu__item--user' : 'menu__item--bot'"
-            >
+            <li v-for="m in memories" :key="m.id" class="menu__item">
               <div class="menu__meta">
-                <span>{{ item.role === 'user' ? '我' : '伴侣' }}</span>
-                <span>{{ fmtTime(item.at) }}</span>
-                <span v-if="item.status === 'canceled'" class="menu__tag">已打断</span>
+                <span class="menu__tag">{{ kindLabel(m.kind) }}</span>
+                <span class="menu__tag">{{ m.private ? '你们之间' : '关于你' }}</span>
+                <span>{{ fmtTime(m.createdAt) }}</span>
               </div>
-              <p class="menu__text">{{ item.text }}</p>
+              <p class="menu__text">{{ m.content }}</p>
+
+              <!-- 二次确认：删除不可恢复，而窗口这么小、误触代价高 -->
+              <div v-if="memoryPendingDelete === m.id" class="form form--danger">
+                <p class="form__warn">删掉之后她就不会再记得这件事了，不可恢复。</p>
+                <div class="form__btns">
+                  <button class="btn btn--ghost" @click="memoryPendingDelete = ''">取消</button>
+                  <button class="btn btn--danger" @click="removeMemory(m)">确认删掉</button>
+                </div>
+              </div>
+              <div v-else class="mem__acts">
+                <button class="iconbtn" title="让她忘掉这一条" @click="memoryPendingDelete = m.id">
+                  删
+                </button>
+              </div>
             </li>
           </ul>
         </template>
@@ -753,6 +928,37 @@ onUnmounted(() => {
             <p v-else class="seed__text">
               {{ detailPersona?.seedText || '（还没有写主体文本）' }}
             </p>
+
+            <!-- 「她学到的」：隐式演化攒下来的候选。只有非空时才出现——
+                 没有待办的时候摆一个空标题，只会让这一页看着更挤 -->
+            <template v-if="candidates.length">
+              <div class="rules__head">
+                <span>她学到的（{{ candidates.length }}）</span>
+              </div>
+              <p class="pane__note">
+                这些是她从你们的对话里自己总结出来的说话方式。采纳之后才会生效——规则会一直影响她怎么说话，
+                所以不自动写进去。
+              </p>
+              <ul class="rules">
+                <li v-for="c in candidates" :key="c.id" class="rule">
+                  <div class="rule__main">
+                    <div class="rule__meta">
+                      <span class="rule__slot">{{ slotLabel(c.slot) }}</span>
+                      <span class="menu__tag menu__tag--on">待采纳</span>
+                    </div>
+                    <p class="rule__value">{{ c.value }}</p>
+                    <!-- 原话是她"从哪句听出来的"：用户判断该不该采纳，看的就是这个 -->
+                    <p v-if="c.evidence" class="cand__quote">「{{ c.evidence }}」</p>
+                  </div>
+                  <div class="rule__acts">
+                    <button class="iconbtn" title="采纳：写进她的规则" @click="acceptCandidate(c)">收</button>
+                    <button class="iconbtn" title="丢弃：不写规则，只清掉这条" @click="rejectCandidate(c)">
+                      弃
+                    </button>
+                  </div>
+                </li>
+              </ul>
+            </template>
 
             <div class="rules__head">
               <span>规则（{{ detailRules.length }}）</span>
@@ -1175,7 +1381,8 @@ onUnmounted(() => {
   overflow: hidden;
 }
 
-/* 菜单内的分区切换：历史 / 人格 */
+/* 菜单内的分区切换：历史 / 记忆 / 人格 / 设置。四个用 flex:1 均分，
+   340px 宽下每个约 76px，放两个中文字够用 */
 .menu__tabs {
   display: flex;
   gap: 4px;
@@ -1286,6 +1493,15 @@ onUnmounted(() => {
   color: #2b2b33;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* 记忆条目自己的动作行（"删"）。整行右对齐放在内容下方，
+   与规则列表那种"内容左、动作右"的并排不同：记忆的正文是一句话，
+   在 340px 宽度里再挤一个按钮会把它压成窄条 */
+.mem__acts {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
 }
 
 .menu__empty {
@@ -1508,6 +1724,15 @@ onUnmounted(() => {
   font-size: 11px;
   line-height: 1.5;
   color: #9a9aa8;
+}
+
+/* 候选的依据（原话）：比取值更小更淡——它是"她为什么这么想"，不是内容本身 */
+.cand__quote {
+  margin: 2px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #7b7b8b;
+  word-break: break-word;
 }
 
 .rules__head {

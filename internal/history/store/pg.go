@@ -123,7 +123,7 @@ func (s *PgStore) EnsureSession(personaID string) (history.Session, error) {
 }
 
 // EnsureChunk 实现 history.Store。
-func (s *PgStore) EnsureChunk(sessionID string, maxRunes int) (history.Chunk, error) {
+func (s *PgStore) EnsureChunk(sessionID string, maxRunes, maxMessages int) (history.Chunk, error) {
 	ctx, cancel := s.ctx()
 	defer cancel()
 
@@ -138,11 +138,13 @@ func (s *PgStore) EnsureChunk(sessionID string, maxRunes int) (history.Chunk, er
 	cur, err := scanChunk(row)
 	switch {
 	case err == nil:
-		size, err := s.chunkRunes(ctx, cur.ID)
+		runes, count, err := s.chunkSize(ctx, cur.ID)
 		if err != nil {
 			return history.Chunk{}, err
 		}
-		if maxRunes <= 0 || size < maxRunes {
+		// 字符数与条数**任一到达上限**就切（传 <=0 表示该项不设限）。
+		// 为什么要两个上限：见 Store 接口的 EnsureChunk 注释（只按字符切会让短消息落在缝里）
+		if (maxRunes <= 0 || runes < maxRunes) && (maxMessages <= 0 || count < maxMessages) {
 			return cur, nil
 		}
 		// 到阈值了：先把当前片收尾再开新片。
@@ -193,18 +195,19 @@ func (s *PgStore) EnsureChunk(sessionID string, maxRunes int) (history.Chunk, er
 	return c, nil
 }
 
-// chunkRunes 返回该片的字符数。
+// chunkSize 返回该片的字符数与消息条数。
 //
-// 在 SQL 里算而不是把消息全取回 Go 再数：片可能有几百条消息，而每次发消息都要判一次大小，
-// 来回传这些数据不值得。PG 的 length() 按**字符**计数（不是字节），与 Go 侧的 rune 口径一致。
-func (s *PgStore) chunkRunes(ctx context.Context, chunkID string) (int, error) {
-	var total int
+// 两个数一次查出来：它们每次发消息都要一起判（见 EnsureChunk），分两条 SQL 就是白跑一趟。
+//
+// 在 SQL 里算而不是把消息全取回 Go 再数：片可能有几百条消息，来回传这些数据不值得。
+// PG 的 length() 按**字符**计数（不是字节），与 Go 侧的 rune 口径一致。
+func (s *PgStore) chunkSize(ctx context.Context, chunkID string) (runes, count int, err error) {
 	if err := s.pool.QueryRow(ctx,
-		`SELECT COALESCE(SUM(length(content)), 0) FROM messages WHERE chunk_id = $1`,
-		chunkID).Scan(&total); err != nil {
-		return 0, fmt.Errorf("统计片大小失败: %w", err)
+		`SELECT COALESCE(SUM(length(content)), 0), COUNT(*) FROM messages WHERE chunk_id = $1`,
+		chunkID).Scan(&runes, &count); err != nil {
+		return 0, 0, fmt.Errorf("统计片大小失败: %w", err)
 	}
-	return total, nil
+	return runes, count, nil
 }
 
 // AppendMessage 实现 history.Store。
@@ -264,6 +267,29 @@ func (s *PgStore) ChunkMessages(chunkID string, limit int) ([]history.Message, e
 		ORDER BY created_at ASC`, chunkID, nullIfLimit(limit))
 	if err != nil {
 		return nil, fmt.Errorf("读取片消息失败: %w", err)
+	}
+	defer rows.Close()
+	return scanMessages(rows)
+}
+
+// SessionMessages 实现 history.Store。
+//
+// 与 ChunkMessages 同一套写法（取尾部再翻回正序、limit <= 0 传 NULL），只换了筛选列。
+func (s *PgStore) SessionMessages(sessionID string, limit int) ([]history.Message, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, session_id, COALESCE(chunk_id::text, ''), persona_id, role, content, status, created_at FROM (
+			SELECT id, session_id, chunk_id, persona_id, role, content, status, created_at
+			FROM messages
+			WHERE session_id = $1
+			ORDER BY created_at DESC
+			LIMIT $2
+		) t
+		ORDER BY created_at ASC`, sessionID, nullIfLimit(limit))
+	if err != nil {
+		return nil, fmt.Errorf("读取会话消息失败: %w", err)
 	}
 	defer rows.Close()
 	return scanMessages(rows)

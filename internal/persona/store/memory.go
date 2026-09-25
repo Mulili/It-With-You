@@ -32,7 +32,12 @@ type MemoryStore struct {
 	personas map[string]persona.Persona
 	rules    map[string][]persona.PersonaRule // personaID → 规则
 	changes  []persona.PersonaChange
-	activeID string
+	// candidates 是隐式演化的候选区。
+	//
+	// 用切片而不是 map[personaID]：候选总量很小（每段会话最多抽几条，用户迟早会处理），
+	// 而按 id 删除是它的高频操作——切片反而更直接。
+	candidates []persona.Candidate
+	activeID   string
 
 	// thinkingDisabled 是应用级设置（不属于任何人格），对应 PG 里的 app_settings。
 	// 内存实现下它随进程消失，与自建人格同命运。
@@ -279,6 +284,15 @@ func (s *MemoryStore) DeletePersona(id string) error {
 	}
 	s.changes = kept
 
+	// 候选同理：人格都没了，没有人能采纳它们（PG 那边靠外键级联做同一件事）
+	keptCand := s.candidates[:0]
+	for _, c := range s.candidates {
+		if c.PersonaID != id {
+			keptCand = append(keptCand, c)
+		}
+	}
+	s.candidates = keptCand
+
 	if s.activeID == id {
 		// 删掉的是当前人格：回退到第一个内置人格，避免"当前人格指向不存在的东西"
 		if len(s.builtinOrder) > 0 {
@@ -288,6 +302,75 @@ func (s *MemoryStore) DeletePersona(id string) error {
 		}
 	}
 	return nil
+}
+
+// AddCandidates 实现 Store。
+func (s *MemoryStore) AddCandidates(cs []persona.Candidate) error {
+	if len(cs) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, c := range cs {
+		if s.hasCandidateLocked(c.PersonaID, c.Slot, c.Value) {
+			continue
+		}
+		if c.ID == "" {
+			c.ID = uuid.NewString()
+		}
+		if c.CreatedAt == 0 {
+			c.CreatedAt = s.now()
+		}
+		s.candidates = append(s.candidates, c)
+	}
+	return nil
+}
+
+// hasCandidateLocked 判断同一条候选是否已经在了。调用方需持锁。
+//
+// 判重键与 PG 的唯一索引一致（persona + slot + value）：两边必须同口径，
+// 否则契约测试会看到"内存里 1 条、PG 里 2 条"这种分叉。
+func (s *MemoryStore) hasCandidateLocked(personaID, slot, value string) bool {
+	for _, c := range s.candidates {
+		if c.PersonaID == personaID && c.Slot == slot && c.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
+// ListCandidates 实现 Store。
+func (s *MemoryStore) ListCandidates(personaID string, limit int) ([]persona.Candidate, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]persona.Candidate, 0, 8)
+	for _, c := range s.candidates {
+		if c.PersonaID == personaID {
+			out = append(out, c)
+		}
+	}
+	// 新的在前，与 PG 的 ORDER BY created_at DESC 对齐
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// DeleteCandidate 实现 Store。
+func (s *MemoryStore) DeleteCandidate(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.candidates {
+		if s.candidates[i].ID == id {
+			s.candidates = append(s.candidates[:i], s.candidates[i+1:]...)
+			return nil
+		}
+	}
+	return nil // 找不到就是已经处理过了（采纳与丢弃都会删它）
 }
 
 // SaveRule 新增或更新一条规则（ID 为空即新增），返回规则 ID。
