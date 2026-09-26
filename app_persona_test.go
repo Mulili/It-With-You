@@ -157,12 +157,15 @@ func TestSaveSeedTextTargetsGivenPersona(t *testing.T) {
 	}
 }
 
-// 采纳一条候选 = 写成真规则 + 删掉候选，而且规则必须落在 **recent 层**
-// （inferred 只能写那里：core 是"她是谁"，自动学来的说话习惯不该混进那一层）。
-func TestAcceptRuleCandidateWritesRuleAndRemovesCandidate(t *testing.T) {
+// 提升一条候选 = 写成真规则 + 删掉候选；规则落在 recent 层，且**来源记为 manual**。
+//
+// source 是"提升"与"情调"的分水岭：inferred 将来可能被自动演化改写，
+// 而用户明确认可过的基准不该被动摇；注入时它也因此进【最近用户希望你】那一段，
+// 不再是【偶尔可以这样】。
+func TestPromoteRuleCandidateWritesRuleAndRemovesCandidate(t *testing.T) {
 	app, st, _ := newPersonaApp(t)
 
-	id, err := st.CreatePersona("候选采纳测试", "")
+	id, err := st.CreatePersona("候选提升测试", "")
 	if err != nil {
 		t.Fatalf("新建人格失败: %v", err)
 	}
@@ -178,8 +181,8 @@ func TestAcceptRuleCandidateWritesRuleAndRemovesCandidate(t *testing.T) {
 		t.Fatalf("应当有 1 条候选，实际 %d 条", len(got))
 	}
 
-	if err := app.AcceptRuleCandidate(got[0]); err != nil {
-		t.Fatalf("采纳失败: %v", err)
+	if err := app.PromoteRuleCandidate(got[0]); err != nil {
+		t.Fatalf("提升失败: %v", err)
 	}
 
 	rules, err := st.RulesOf(id)
@@ -193,8 +196,8 @@ func TestAcceptRuleCandidateWritesRuleAndRemovesCandidate(t *testing.T) {
 	if r.Slot != "verbosity" || r.Value != "说话简短一点" {
 		t.Errorf("规则内容不对：%+v", r)
 	}
-	if r.Source != persona.SourceInferred || r.Tier != persona.TierRecent {
-		t.Errorf("自动学来的规则应当是 inferred + recent，实际 %s + %s", r.Source, r.Tier)
+	if r.Source != persona.SourceManual || r.Tier != persona.TierRecent {
+		t.Errorf("提升后的规则应当是 manual + recent，实际 %s + %s", r.Source, r.Tier)
 	}
 	if !r.Enabled {
 		t.Error("新规则应当默认启用")
@@ -203,22 +206,24 @@ func TestAcceptRuleCandidateWritesRuleAndRemovesCandidate(t *testing.T) {
 		t.Error("依据（原话）应当带过来：用户要判断这条值不值得留就看它")
 	}
 	if left := app.RuleCandidates(id); len(left) != 0 {
-		t.Errorf("采纳之后候选应当消失，实际还剩 %d 条", len(left))
+		t.Errorf("提升之后候选应当消失，实际还剩 %d 条", len(left))
 	}
 }
 
-// stable 槽位即使被塞进候选也写不进去——写入权限矩阵在 SaveRule 那条路上兜底。
+// stable 槽位即使被塞进候选也**提升不了**。
 //
-// 这条模拟"候选区里混进了脏数据"（抽取阶段本该拦住，但历史数据、被改过的前端都可能塞进来）：
-// 挡不住的话，模型就能绕开权限矩阵悄悄改掉"她是谁"。
-func TestAcceptRuleCandidateRejectsStableSlot(t *testing.T) {
+// 这条模拟"候选表里混进了脏数据"（抽取阶段本该拦住，但历史数据、被改过的前端都可能塞进来）。
+// 注意它挡的不是 SaveRule 那道矩阵——提升路径的 source 记 manual，而 manual 对 stable 槽位
+// 本来就放行，闸门必须在 PromoteRuleCandidate 里单独设。挡不住的话，
+// "先塞一条 personality 候选、再点提升"就能绕开权限矩阵改掉"她是谁"。
+func TestPromoteRuleCandidateRejectsStableSlot(t *testing.T) {
 	app, st, _ := newPersonaApp(t)
 
 	id, err := st.CreatePersona("候选越权测试", "")
 	if err != nil {
 		t.Fatalf("新建人格失败: %v", err)
 	}
-	// 候选区本身不做校验（它只是个待办盒子），所以这条塞得进去
+	// 候选表本身不做校验（它只是一份"她观察到的"），所以这条塞得进去
 	if err := st.AddCandidates([]persona.Candidate{{
 		PersonaID: id, Slot: "personality", Value: "以后你是个高冷的人",
 	}}); err != nil {
@@ -229,7 +234,7 @@ func TestAcceptRuleCandidateRejectsStableSlot(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("应当有 1 条候选，实际 %d 条", len(got))
 	}
-	if err := app.AcceptRuleCandidate(got[0]); err == nil {
+	if err := app.PromoteRuleCandidate(got[0]); err == nil {
 		t.Error("stable 槽位的候选必须被拒绝")
 	}
 
@@ -242,12 +247,12 @@ func TestAcceptRuleCandidateRejectsStableSlot(t *testing.T) {
 	}
 	// 候选也要留着：写失败了还把它删掉，等于"这条待办静默消失"，用户再也不知道她想过什么
 	if left := app.RuleCandidates(id); len(left) != 1 {
-		t.Errorf("采纳失败时候选应当保留，实际 %d 条", len(left))
+		t.Errorf("提升失败时候选应当保留，实际 %d 条", len(left))
 	}
 }
 
-// 丢弃：候选没了，规则也不该多出来。
-func TestRejectRuleCandidateRemovesWithoutWritingRule(t *testing.T) {
+// 删掉：候选没了，规则也不该多出来——她学的那条从此不再注入。
+func TestDeleteRuleCandidateRemovesWithoutWritingRule(t *testing.T) {
 	app, st, _ := newPersonaApp(t)
 
 	id, err := st.CreatePersona("候选丢弃测试", "")
@@ -264,18 +269,18 @@ func TestRejectRuleCandidateRemovesWithoutWritingRule(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("应当有 1 条候选，实际 %d 条", len(got))
 	}
-	if err := app.RejectRuleCandidate(got[0].ID); err != nil {
-		t.Fatalf("丢弃失败: %v", err)
+	if err := app.DeleteRuleCandidate(got[0].ID); err != nil {
+		t.Fatalf("删掉失败: %v", err)
 	}
 
 	if left := app.RuleCandidates(id); len(left) != 0 {
-		t.Errorf("丢弃之后候选应当没了，实际还剩 %d 条", len(left))
+		t.Errorf("删掉之后候选应当没了，实际还剩 %d 条", len(left))
 	}
 	rules, err := st.RulesOf(id)
 	if err != nil {
 		t.Fatalf("读规则失败: %v", err)
 	}
 	if len(rules) != 0 {
-		t.Errorf("丢弃不该写出规则，实际 %d 条", len(rules))
+		t.Errorf("删掉不该写出规则，实际 %d 条", len(rules))
 	}
 }

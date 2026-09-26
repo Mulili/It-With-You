@@ -25,7 +25,7 @@ func TestRealBuiltinInjectionPreview(t *testing.T) {
 	}
 
 	for _, bp := range builtins {
-		system, dropped := persona.BuildSystemPrompt(bp.Persona, bp.Rules)
+		system, dropped := persona.BuildSystemPrompt(bp.Persona, bp.Rules, nil)
 		if dropped != 0 {
 			t.Errorf("%s：有 %d 条 recent 规则被预算截断", bp.Persona.Name, dropped)
 		}

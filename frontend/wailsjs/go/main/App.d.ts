@@ -4,8 +4,6 @@ import {persona} from '../models';
 import {main} from '../models';
 import {ui} from '../models';
 
-export function AcceptRuleCandidate(arg1:persona.Candidate):Promise<void>;
-
 export function Ask(arg1:string):Promise<string>;
 
 export function Cancel():Promise<void>;
@@ -17,6 +15,8 @@ export function DeleteMemory(arg1:string):Promise<void>;
 export function DeletePersona(arg1:string):Promise<void>;
 
 export function DeleteRule(arg1:string):Promise<void>;
+
+export function DeleteRuleCandidate(arg1:string):Promise<void>;
 
 export function ExportPersonaToFile(arg1:string):Promise<string>;
 
@@ -38,9 +38,9 @@ export function ImportPersonaFromFile():Promise<persona.Persona>;
 
 export function Memories():Promise<Array<ui.MemoryItem>>;
 
-export function Quit():Promise<void>;
+export function PromoteRuleCandidate(arg1:persona.Candidate):Promise<void>;
 
-export function RejectRuleCandidate(arg1:string):Promise<void>;
+export function Quit():Promise<void>;
 
 export function RenamePersona(arg1:string,arg2:string):Promise<void>;
 

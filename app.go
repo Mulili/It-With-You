@@ -79,11 +79,18 @@ const (
 	recallChunkLimit = 1
 )
 
-// candidateDisplayLimit 是一次最多返回几条规则候选。
+// candidateDisplayLimit 是一次最多返回几条「她学到的」。
 //
-// 它管的是**展示**：候选是待办，攒到几十条还没处理的用户需要的是"看一眼、批量清掉"，
+// 它管的是**展示**：攒到几十条还没处理的用户需要的是"看一眼、批量清掉"，
 // 而不是一屏几百行。数据本身不设上限（丢弃是显式操作，不该被动丢）。
 const candidateDisplayLimit = 30
+
+// moodInjectLimit 是注入时一回读几条候选。
+//
+// 比展示上限大，是为了防"某一个槽位攒了很多条、把别的槽位的候选挤出读取窗口"——
+// 真正进提示词的还要过一道"每槽位只留最新一条"（见 persona.moodCandidates），
+// 而 volatile 槽位统共几个，所以拉宽一点就够，不必精确。
+const moodInjectLimit = 200
 
 type App struct {
 	ctx      context.Context
@@ -520,19 +527,22 @@ func (a *App) settleChunk(c history.Chunk) error {
 		return fmt.Errorf("写片摘要失败: %w", err)
 	}
 
-	log.Printf("[settle] 已结算片 %s（要点 %d / 事实 %d / 规则候选 %d / 未了 %d / 丢弃 %d）",
+	log.Printf("[settle] 已结算片 %s（要点 %d / 事实 %d / 行为倾向 %d / 未了 %d / 丢弃 %d）",
 		c.ID, len(res.KeyPoints), len(res.Facts), len(res.Rules), len(res.Unresolved), res.Dropped)
 	return nil
 }
 
-// addRuleCandidates 把这次抽出来的行为规则候选写进候选区。
+// addRuleCandidates 把这次抽出来的行为倾向写进候选表。
 //
-// 为什么只给**可写人格**抽：内置人格的规则是只读的，给它抽候选等于攒一堆谁也采纳不了的待办。
+// 写进去就**已经在生效了**（注入时以【偶尔可以这样】的措辞带进上下文），所以这里不是
+// 在攒一张待办清单。用户随后在界面上看到的是"她已经会了"，可以提升成基准，也可以删掉。
+//
+// 为什么只给**可写人格**抽：内置人格的规则是作者定稿的，不该被她自己悄悄改歪；
 // 而"想在它身上改点什么"走的是另一条路——对内置人格提要求时，handleDirective 会先把它复制成
 // 一份「我的」（那是用户主动发起的显式意图）。隐式演化没有这个授权，所以这里只跳过、不复制：
 // 一次结算就悄悄多出一个新人格，用户会以为出了 bug。
 //
-// 写不进去就整体作废（与事实同一条理由）：候选是待办，静默少几条只会让人觉得"它怎么没学到"；
+// 写不进去就整体作废（与事实同一条理由）：静默少几条只会让人觉得"它怎么没学到"；
 // 而重放是幂等的（同 persona+slot+value 只留一条），代价只是一次多余的写入。
 func (a *App) addRuleCandidates(personaID string, rules []settle.RuleCandidate) error {
 	if a.personas == nil {
@@ -540,7 +550,7 @@ func (a *App) addRuleCandidates(personaID string, rules []settle.RuleCandidate) 
 	}
 	p, ok := findPersona(a.personas.Snapshot().Personas, personaID)
 	if !ok || p.IsBuiltin {
-		log.Printf("[settle] 「%s」是内置人格，本次抽出的 %d 条行为规则候选已跳过",
+		log.Printf("[settle] 「%s」是内置人格，本次抽出的 %d 条行为倾向已跳过",
 			a.personaName(personaID), len(rules))
 		return nil
 	}
@@ -551,12 +561,12 @@ func (a *App) addRuleCandidates(personaID string, rules []settle.RuleCandidate) 
 			PersonaID: personaID,
 			Slot:      r.Slot,
 			Value:     r.Value,
-			// 依据存**原话**：用户要判断"这条该不该采纳"时，只有原话能说明她是从哪句听出来的
+			// 依据存**原话**：用户判断"要不要让她一直这样"时，只有原话能说明她是从哪句听出来的
 			Evidence: r.Quote,
 		})
 	}
 	if err := a.personas.AddCandidates(cs); err != nil {
-		return fmt.Errorf("写规则候选失败: %w", err)
+		return fmt.Errorf("写行为倾向候选失败: %w", err)
 	}
 	return nil
 }
@@ -919,9 +929,16 @@ func (a *App) buildMessages(personaID string, msgs []llm.Message, recall string)
 	if !ok {
 		return msgs
 	}
-	system, dropped := persona.BuildSystemPrompt(active, snap.Rules)
+	// 她自己在对话里琢磨出来的倾向。拿不到就当这一轮没有情调——
+	// 少一段"偶尔可以这样"不该让整轮对话失败，而它本来也不是每轮非有不可的东西。
+	mood, err := a.personas.ListCandidates(personaID, moodInjectLimit)
+	if err != nil {
+		log.Printf("[persona] 读取「她学到的」失败，本轮不注入: %v", err)
+		mood = nil
+	}
+	system, dropped := persona.BuildSystemPrompt(active, snap.Rules, mood)
 	if dropped > 0 {
-		log.Printf("[persona] 「%s」的 recent 层有 %d 条规则超出注入预算，本轮未注入", active.Name, dropped)
+		log.Printf("[persona] 「%s」有 %d 条规则或倾向超出注入预算，本轮未注入", active.Name, dropped)
 	}
 
 	out := make([]llm.Message, 0, len(msgs)+2)
@@ -1248,70 +1265,86 @@ func (a *App) SaveRule(rule persona.PersonaRule) (string, error) {
 	return id, nil
 }
 
-// RuleCandidates 返回**指定人格**的规则候选（隐式演化攒下来的待办）。
+// RuleCandidates 返回**指定人格**「她学到的」——她自己从对话里琢磨出来的说话倾向。
 //
 // 带 personaID 而不是只给当前人格，理由与 RulesOf 一样：编辑器要能改任意人格。
-// 它挂在人格这一侧、不在"记忆"那一侧：候选改的是**行为方式**，采纳后进的是人格规则表——
-// 与记忆的风险等级不是一回事（记忆错一条只是记错一件事，规则错一条会一直影响她怎么说话）。
+//
+// 注意这些东西**已经在生效了**（以【偶尔可以这样】的措辞注入，见 persona.BuildSystemPrompt），
+// 不是一张待办清单。界面上的两个动作是"让她一直这样"（提升成真规则）与"删掉"，
+// 而不是"准不准她用"——用户的体验应当是"她已经会了，不喜欢可以撤"。
 func (a *App) RuleCandidates(personaID string) []persona.Candidate {
 	if a.personas == nil || personaID == "" {
 		return nil
 	}
 	rows, err := a.personas.ListCandidates(personaID, candidateDisplayLimit)
 	if err != nil {
-		log.Printf("[persona] 读取规则候选失败: %v", err)
+		log.Printf("[persona] 读取「她学到的」失败: %v", err)
 		return nil
 	}
 	return rows
 }
 
-// AcceptRuleCandidate 采纳一条候选：**先写成真规则，再删掉候选**。
+// PromoteRuleCandidate 把她琢磨出来的一条倾向**提升成真规则**：「让她一直这样」。
 //
-// 顺序不能反：反过来的话，写规则失败时候选已经没了——用户会以为"采纳成功但它没生效"，
-// 而且再也找不回那条东西。反过来（规则成了、删候选失败）只是候选多留一条，
-// 再点一次就是幂等的覆盖。两害相权，留下看得见的痕迹。
+// 顺序不能反（先写规则、再删候选）：反过来的话，写规则失败时候选已经没了——
+// 用户会以为"提升成功但它没生效"，而且再也找不回那条东西。反过来（规则成了、删候选失败）
+// 只是候选多留一条，再点一次就是幂等的覆盖。两害相权，留下看得见的痕迹。
 //
-// 校验一律交给 SaveRule 那条路（NormalizeRule + CheckWrite）：槽位是否规范、能不能被自动抽取写
-// （stable 会被挡）、取值长度、覆盖还是追加，都在那里统一把关——在这里再抄一遍只会多一处会走样的地方。
-func (a *App) AcceptRuleCandidate(c persona.Candidate) error {
+// 两个关键决定：
+//   - Source 记 **manual 而不是 inferred**。内容是模型抽的没错，但"以后就这么说"这个决定
+//     是用户下的，这条规则从此是基准，进【最近用户希望你】那一段，不再是"偶尔可以这样"。
+//     记成 inferred 会让它永远停在情调强度上，用户点了半天没反应。
+//   - Tier 仍是 recent。提升的是**强度**，不是身份——她说话的语气不该混进 core
+//     （那一层是"她是谁"）。唯一的例外是覆盖到已有的 core 单值槽位（如称呼），
+//     那时 SaveRule 的"单值覆盖"会沿用旧的 tier，那是**用户主动**要替换基准，符合预期。
+//
+// 校验里有一处**不能**交给 SaveRule：槽位必须是 volatile。
+// 因为矩阵是按 source 判权限的，而这里 source 记 manual，它必然会放行 stable 槽位——
+// 于是"先往候选表塞一条 personality、再点提升"就能绕开权限矩阵。这条约束只属于提升路径。
+func (a *App) PromoteRuleCandidate(c persona.Candidate) error {
 	if err := a.requireStore(); err != nil {
 		return err
 	}
 	slot := persona.CanonicalizeSlot(c.Slot)
+	spec, ok := persona.LookupSlot(slot)
+	if !ok || spec.Kind != persona.KindVolatile {
+		// 候选的语义就是"自动演化允许的那些维度的观察"，stable 出现在这里说明数据已经坏了
+		//（抽取层保证不会）。用户想改"她是谁"应当去规则编辑器，不是靠提升一条观察。
+		return fmt.Errorf("槽位 %s 不能从候选提升（候选只涵盖可自动演化的维度）", persona.SlotLabel(slot))
+	}
 	if _, err := a.personas.SaveRule(persona.PersonaRule{
 		PersonaID: c.PersonaID,
 		Slot:      slot,
 		Value:     c.Value,
-		// 内容是模型抽的，所以记 inferred；而 inferred **只能进 recent 层**（CheckWrite 会挡），
-		// 这也正是它该待的地方：core 是"她是谁"，自动学来的说话习惯不该混进那一层。
-		// "用户按下了采纳"这件事不需要额外记一列——规则存在本身就是凭据，变更日志里也留了痕。
-		Source:   persona.SourceInferred,
-		Tier:     persona.TierRecent,
-		Evidence: c.Evidence,
+		Source:    persona.SourceManual,
+		Tier:      persona.TierRecent,
+		Evidence:  c.Evidence,
 	}); err != nil {
-		return fmt.Errorf("采纳规则候选失败: %w", err)
+		return fmt.Errorf("提升规则候选失败: %w", err)
 	}
 
 	if err := a.personas.DeleteCandidate(c.ID); err != nil {
 		// 规则已经生效了，这一步失败只是候选多留一条：不往外抛，
-		// 报错会让用户以为没采纳成功，再点一次反而重复
-		log.Printf("[persona] 采纳成功，但清理候选失败（候选可以再点一次丢弃）: %v", err)
+		// 报错会让用户以为没提升成功，再点一次反而重复
+		log.Printf("[persona] 提升成功，但清理候选失败（候选可以再点一次删掉）: %v", err)
 	}
 	a.notifyPersonaChanged(c.PersonaID, persona.ActionUpdate,
-		fmt.Sprintf("已采纳：%s → %s", persona.SlotLabel(slot), c.Value))
+		fmt.Sprintf("她以后会一直这样：%s → %s", persona.SlotLabel(slot), c.Value))
 	return nil
 }
 
-// RejectRuleCandidate 丢弃一条候选（删掉即可，不写规则）。
-func (a *App) RejectRuleCandidate(id string) error {
+// DeleteRuleCandidate 删掉一条「她学到的」（不写规则）。
+//
+// 它可能正在以情调方式生效，删掉即不再注入。
+func (a *App) DeleteRuleCandidate(id string) error {
 	if err := a.requireStore(); err != nil {
 		return err
 	}
 	if id == "" {
-		return fmt.Errorf("没有指定要丢弃的候选")
+		return fmt.Errorf("没有指定要删掉的候选")
 	}
 	if err := a.personas.DeleteCandidate(id); err != nil {
-		return fmt.Errorf("丢弃候选失败: %w", err)
+		return fmt.Errorf("删掉候选失败: %w", err)
 	}
 	return nil
 }

@@ -1,5 +1,5 @@
 // Package settle 是「收尾结算」：把一段已经聊完的对话整理成几样能长期使用的东西——
-// 片摘要（抽取式、带原话）、会话标题、待存事实、**待采纳的行为规则候选**。
+// 片摘要（抽取式、带原话）、会话标题、待存事实、**她自己琢磨出来的行为倾向**。
 //
 // 为什么单独成包：它只做"从原文里挑"，不碰数据库、也不调网络——输入是消息、输出是结构化结果。
 // 于是它的规则（原话必须回得到原文、抽取而非生成）可以用纯单元测试钉住；
@@ -81,11 +81,14 @@ type Fact struct {
 	Private bool
 }
 
-// RuleCandidate 是一条"关于你该怎么做"的长期倾向，抽出来放进候选区等用户定夺。
+// RuleCandidate 是一条"关于你该怎么说话"的长期倾向：抽出来存进候选表，
+// 由注入链路以【偶尔可以这样】的措辞带进上下文——**它不需要用户批准就已经在起作用了**。
 //
-// 为什么不直接生效：规则改的是**行为方式**，一条错的会持续污染每一轮；
-// 而事实抽错了只影响"她记错一件事"。风险等级不同，所以它要过一道人的眼睛
-// （operation.md：显式为主、隐式落候选区、变更可见可回滚）。
+// 为什么不像事实那样直接写进 persona_rules：规则改的是**行为基准**，一条错的会持续污染每一轮；
+// 而这条只是"偶尔可以这样"，错了只说错一句话。所以两者走不同的表：
+// 事实进 memories，倾向进候选表（不参与单值槽位覆盖，也就顶不掉用户明确的基准）。
+// 用户若认可，可以在界面上把它提升成真规则——那时才走 SaveRule 的权限矩阵。
+// 完整取舍见 operation.md（显式为主、隐式落候选区、变更可见可回滚）。
 type RuleCandidate struct {
 	// Slot 是收敛后的规范槽位 key，且**必然是 volatile**（stable 层自动抽取无权写入）
 	Slot  string
@@ -150,7 +153,7 @@ func Prompt(msgs []llm.Message) (system, user string) {
 	b.WriteString("- topic：这一段主要在聊什么（一句话）\n")
 	b.WriteString("- key_points：最重要的 3~8 条，每条 = 概括 + 支持它的原话\n")
 	b.WriteString("- facts：值得长期记住的事。每条包含：\n")
-	b.WriteString("    content：写成一句可以直接记住的话（例如「用户喜欢你傲娇的样子」）\n")
+	b.WriteString("    content：写成一句可以直接记住的话（例如「用户爱你傲娇的样子」「用户爱喝美式」）\n")
 	b.WriteString("    about：user = 关于用户本人的（喜好、经历、家人、工作），任何人格都该知道；\n")
 	b.WriteString("           persona = 关于你和他之间的（约定、一起做过的事、你对他的承诺），只属于你\n")
 	b.WriteString("    kind：fact 客观事实 / preference 喜好 / event 发生过的事 / promise 约定或承诺\n")
@@ -158,8 +161,11 @@ func Prompt(msgs []llm.Message) (system, user string) {
 	b.WriteString("                3 = 一般经历；2 = 日常小事； 1 = 无关紧要的内容 \n")
 	b.WriteString("    quote：支持这条事实的原话\n")
 	b.WriteString("- unresolved：这段里还没说完、或答应过还没做的事，没有就给空数组\n")
-	b.WriteString("- rules：用户在这段里透出的、**希望你以后怎么说话做事**的长期倾向。每条包含：\n")
-	b.WriteString("    slot：只能从下面选（不是关于用户的喜好，而是关于你自己的行为）\n")
+	b.WriteString("- rules：只收**你自己说话时的方式**——怎么称呼他、用什么语气、说多长、爱说什么口头禅。\n")
+	b.WriteString("    先分清方向再动手：「你该怎么说话」写进 rules；「用户自己喜欢什么」只写进 facts。\n")
+	b.WriteString("    「用户爱你傲娇的样子」是后一种，别写进 rules——那是他喜欢什么，不是给你的指示。\n")
+	b.WriteString("    每条包含：\n")
+	b.WriteString("    slot：只能从下面选\n")
 	for _, s := range volatileSlots() {
 		fmt.Fprintf(&b, "        %s = %s\n", s.Key, s.Label)
 	}

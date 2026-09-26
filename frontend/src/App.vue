@@ -7,7 +7,7 @@ import {
   GetPersonaSnapshot, SetActivePersona, GetPersonaRules, GetPersonaChanges, GetPersonaMeta,
   CreatePersona, RenamePersona, DeletePersona, SaveSeedText,
   SaveRule, DeleteRule, SetRuleEnabled,
-  RuleCandidates, AcceptRuleCandidate, RejectRuleCandidate,
+  RuleCandidates, PromoteRuleCandidate, DeleteRuleCandidate,
   GetSettings, SetThinkingDisabled, ExportPersonaToFile, ImportPersonaFromFile,
 } from '../wailsjs/go/main/App'
 import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime'
@@ -226,7 +226,7 @@ const limits = ref({ seedTextRunes: 1200, ruleValueRunes: 200, injectBudgetRunes
 const detailId = ref('')       // 空 = 列表视图；否则为正在查看的人格 ID
 const detailRules = ref([])    // 详情页里那个人格的规则
 const detailChanges = ref([])  // 详情页里那个人格的最近变更（时间倒序）
-// 详情页里那个人格的「她学到的」候选（隐式演化的待办，采纳/丢弃后才消失）
+// 详情页里那个人格的「她学到的」：她自己琢磨出来的说话倾向，**已经在偶尔用了**
 const candidates = ref([])
 const seedForm = ref(null)     // null = 未在编辑；否则为 { text }
 const ruleForm = ref(null)     // null = 未在编辑；否则为表单内容（id 为空即新增）
@@ -297,8 +297,12 @@ async function loadChanges(id) {
   }
 }
 
-// 「她学到的」候选：从对话里自动抽出来的行为倾向，采纳之后才成为真规则。
-// 它挂在人格这一侧（不进「记忆」分区）：候选改的是行为方式，与记忆的风险等级不是一回事。
+// 「她学到的」：她自己从对话里琢磨出来的说话倾向。
+//
+// 注意这些**不是待办**——后端已经把它们以【偶尔可以这样】的措辞注入了上下文，她已经在用了。
+// 所以界面上没有"准不准她用"这一步：默认就是生效的，用户看到的是"她已经会了"，
+// 能做的只有两件事——觉得好就让她一直这样（提升成真规则），不喜欢就删掉。
+// 它挂在人格这一侧（不进「记忆」分区）：改的是行为方式，与记忆的风险等级不是一回事。
 async function loadCandidates(id) {
   if (!id) {
     candidates.value = []
@@ -308,24 +312,24 @@ async function loadCandidates(id) {
     candidates.value = (await RuleCandidates(id)) ?? []
   } catch (e) {
     candidates.value = []
-    console.error('读取规则候选失败', e)
+    console.error('读取「她学到的」失败', e)
   }
 }
 
-// 采纳 = 后端写真规则 + 删掉候选。规则列表会由 persona:changed 事件刷回来，
-// 这里只需要把候选重新拉一遍。
-async function acceptCandidate(c) {
+// 提升 = 后端写真规则 + 删掉这条；规则列表会由 persona:changed 事件刷回来，
+// 这里只需要把它重新拉一遍。
+async function promoteCandidate(c) {
   try {
-    await AcceptRuleCandidate(c)
+    await PromoteRuleCandidate(c)
   } catch (e) {
     formError.value = errText(e)
   }
   await loadCandidates(detailId.value)
 }
 
-async function rejectCandidate(c) {
+async function deleteCandidate(c) {
   try {
-    await RejectRuleCandidate(c.id)
+    await DeleteRuleCandidate(c.id)
   } catch (e) {
     formError.value = errText(e)
   }
@@ -929,31 +933,33 @@ onUnmounted(() => {
               {{ detailPersona?.seedText || '（还没有写主体文本）' }}
             </p>
 
-            <!-- 「她学到的」：隐式演化攒下来的候选。只有非空时才出现——
-                 没有待办的时候摆一个空标题，只会让这一页看着更挤 -->
+            <!-- 「她学到的」：她自己琢磨出来的说话倾向，后端已经以「偶尔可以这样」注入上下文。
+                 只有非空时才出现——没有的时候摆一个空标题，只会让这一页看着更挤 -->
             <template v-if="candidates.length">
               <div class="rules__head">
                 <span>她学到的（{{ candidates.length }}）</span>
               </div>
               <p class="pane__note">
-                这些是她从你们的对话里自己总结出来的说话方式。采纳之后才会生效——规则会一直影响她怎么说话，
-                所以不自动写进去。
+                这些是她自己从你们的对话里琢磨出来的说话方式，现在只是偶尔用用。
+                想让她每次都这样，就点「一直这样」。
               </p>
               <ul class="rules">
                 <li v-for="c in candidates" :key="c.id" class="rule">
                   <div class="rule__main">
                     <div class="rule__meta">
                       <span class="rule__slot">{{ slotLabel(c.slot) }}</span>
-                      <span class="menu__tag menu__tag--on">待采纳</span>
+                      <span class="menu__tag menu__tag--on">偶尔用</span>
                     </div>
                     <p class="rule__value">{{ c.value }}</p>
-                    <!-- 原话是她"从哪句听出来的"：用户判断该不该采纳，看的就是这个 -->
+                    <!-- 原话是她"从哪句听出来的"：用户要不要让她一直这样，看的就是这个 -->
                     <p v-if="c.evidence" class="cand__quote">「{{ c.evidence }}」</p>
                   </div>
                   <div class="rule__acts">
-                    <button class="iconbtn" title="采纳：写进她的规则" @click="acceptCandidate(c)">收</button>
-                    <button class="iconbtn" title="丢弃：不写规则，只清掉这条" @click="rejectCandidate(c)">
-                      弃
+                    <button class="iconbtn" title="让她以后一直这样" @click="promoteCandidate(c)">
+                      一直这样
+                    </button>
+                    <button class="iconbtn" title="删掉：她以后不再这样" @click="deleteCandidate(c)">
+                      删掉
                     </button>
                   </div>
                 </li>

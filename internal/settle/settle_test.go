@@ -328,7 +328,7 @@ func TestParseRejectsStableSlotRules(t *testing.T) {
 }
 
 // 认不出来的槽位落 other —— 这是有意的（与人格的指令抽取同一套收敛规则）：
-// 与其丢掉用户真实表达过的倾向，不如先放进候选区让人来归类。
+// 与其丢掉用户真实表达过的倾向，不如落进 other 留着；other 也是 volatile，所以它照样能生效。
 func TestParseFallsBackToOtherSlot(t *testing.T) {
 	res, err := Parse(rulesJSON(
 		`{"slot":"完全没听过的说法","value":"多用感叹号","quote":"`+ruleQuote+`"}`), ruleSource())
@@ -372,7 +372,7 @@ func TestParseRejectsBadRuleValues(t *testing.T) {
 
 // 只有规则候选、摘要却是空的 → 整条作废。
 //
-// 因为 Summary() 里不含规则（它要单独进候选区），这种结果进了向量库就是一条
+// 因为 Summary() 里不含规则（它要单独进候选表、以情调方式注入），这种结果进了向量库就是一条
 // "什么都没记住"的空回忆，只会挤占检索名额。
 func TestRulesAloneAreNotEnough(t *testing.T) {
 	raw := `{"rules":[{"slot":"tone","value":"别啰嗦","quote":"` + ruleQuote + `"}]}`
@@ -393,6 +393,25 @@ func TestPromptListsOnlyVolatileSlotsForRules(t *testing.T) {
 	for _, key := range []string{"address_self", "personality", "taboo"} {
 		if strings.Contains(user, key) {
 			t.Errorf("提示词里不该出现 stable 槽位 %q——列出来等于邀请模型去写它", key)
+		}
+	}
+}
+
+// facts 与 rules 的边界必须写在提示词里：「用户自己喜欢什么」只进 facts，
+// 「你该怎么说话」才进 rules。
+//
+// 不说清的话同一句话会被抽两遍——「我喜欢你多笑」既进了记忆（直接生效），
+// 又变成一条她学到的倾向。用户会觉得莫名其妙：我明明说了，怎么还给我记一笔账。
+// 这条约束只活在提示词文本里，没有断言就会被将来某次改写悄悄抹掉。
+func TestPromptSeparatesFactsFromRules(t *testing.T) {
+	_, user := Prompt(source())
+
+	for _, want := range []string{
+		"只收**你自己说话时的方式**",
+		"「用户自己喜欢什么」只写进 facts",
+	} {
+		if !strings.Contains(user, want) {
+			t.Errorf("提示词里应当有 facts / rules 的边界说明 %q", want)
 		}
 	}
 }
