@@ -8,6 +8,8 @@ import (
 
 	"agent-for-you-love/internal/db"
 	"agent-for-you-love/internal/history"
+	"agent-for-you-love/internal/pkg/pgutil"
+	"agent-for-you-love/internal/pkg/timeutil"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -60,25 +62,6 @@ func scanChunk(row pgx.Row) (history.Chunk, error) {
 	return c, err
 }
 
-// nullIfEmpty 把空字符串转成 SQL NULL。
-//
-// 用途只有一个：chunk_id 在老行（v3 之前写入的）里是空的，而给 uuid 列传 ""
-// 会让 pgx 直接报错——传 nil 才是"没有值"。
-func nullIfEmpty(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
-}
-
-// nullIfLimit 把"不限"（limit <= 0）转成 SQL NULL——PG 的 LIMIT NULL 就是不限。
-func nullIfLimit(limit int) any {
-	if limit <= 0 {
-		return nil
-	}
-	return limit
-}
-
 // EnsureSession 实现 history.Store。
 func (s *PgStore) EnsureSession(personaID string) (history.Session, error) {
 	ctx, cancel := s.ctx()
@@ -105,7 +88,7 @@ func (s *PgStore) EnsureSession(personaID string) (history.Session, error) {
 	// 没有未收尾的会话，开一段新的。
 	// 并发下理论上可能开出两段（两个 Ask 同时走到这里），但桌面单用户场景下 Ask 是串行的；
 	// 真出现了也无害——EnsureSession 只取最近的那条，多出来的会在收尾时被一起处理。
-	now := history.NowMillis()
+	now := timeutil.NowMillis()
 	sess = history.Session{
 		ID:        uuid.NewString(),
 		PersonaID: personaID,
@@ -150,7 +133,7 @@ func (s *PgStore) EnsureChunk(sessionID string, maxRunes, maxMessages int) (hist
 		// 到阈值了：先把当前片收尾再开新片。
 		// **这一步发生在写入下一条用户消息之前**，所以片边界落在用户发言处，
 		// 一个问答对不会被从中间切开。
-		now := history.NowMillis()
+		now := timeutil.NowMillis()
 		if _, err := s.pool.Exec(ctx,
 			`UPDATE session_chunks SET ended_at = $2, updated_at = $2 WHERE id = $1`,
 			cur.ID, now); err != nil {
@@ -176,7 +159,7 @@ func (s *PgStore) EnsureChunk(sessionID string, maxRunes, maxMessages int) (hist
 		return history.Chunk{}, fmt.Errorf("读取会话所属人格失败: %w", err)
 	}
 
-	now := history.NowMillis()
+	now := timeutil.NowMillis()
 	c := history.Chunk{
 		ID:        uuid.NewString(),
 		SessionID: sessionID,
@@ -215,21 +198,13 @@ func (s *PgStore) AppendMessage(m history.Message) (string, error) {
 	ctx, cancel := s.ctx()
 	defer cancel()
 
-	if m.ID == "" {
-		m.ID = uuid.NewString()
-	}
-	if m.CreatedAt == 0 {
-		m.CreatedAt = history.NowMillis()
-	}
-	if m.Status == "" {
-		m.Status = history.StatusOK
-	}
+	m = history.NormalizeMessage(m)
 
 	// chunk_id 可能是空串（v3 之前写入的老行没有分片）；给 uuid 列传 "" 会报错，转成 NULL
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO messages (id, session_id, chunk_id, persona_id, role, content, status, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		m.ID, m.SessionID, nullIfEmpty(m.ChunkID), m.PersonaID,
+		m.ID, m.SessionID, pgutil.NullIfEmpty(m.ChunkID), m.PersonaID,
 		m.Role, m.Content, m.Status, m.CreatedAt); err != nil {
 		return "", fmt.Errorf("写入消息失败: %w", err)
 	}
@@ -264,7 +239,7 @@ func (s *PgStore) ChunkMessages(chunkID string, limit int) ([]history.Message, e
 			ORDER BY created_at DESC
 			LIMIT $2
 		) t
-		ORDER BY created_at ASC`, chunkID, nullIfLimit(limit))
+		ORDER BY created_at ASC`, chunkID, pgutil.NullIfLimit(limit))
 	if err != nil {
 		return nil, fmt.Errorf("读取片消息失败: %w", err)
 	}
@@ -287,7 +262,7 @@ func (s *PgStore) SessionMessages(sessionID string, limit int) ([]history.Messag
 			ORDER BY created_at DESC
 			LIMIT $2
 		) t
-		ORDER BY created_at ASC`, sessionID, nullIfLimit(limit))
+		ORDER BY created_at ASC`, sessionID, pgutil.NullIfLimit(limit))
 	if err != nil {
 		return nil, fmt.Errorf("读取会话消息失败: %w", err)
 	}
@@ -402,7 +377,7 @@ func (s *PgStore) EndSession(sessionID string) error {
 	ctx, cancel := s.ctx()
 	defer cancel()
 
-	now := history.NowMillis()
+	now := timeutil.NowMillis()
 	if _, err := s.pool.Exec(ctx,
 		`UPDATE sessions SET ended_at = $2, updated_at = $2 WHERE id = $1 AND ended_at IS NULL`,
 		sessionID, now); err != nil {
@@ -462,7 +437,7 @@ func (s *PgStore) SetChunkSummary(chunkID, summary string) error {
 
 	if _, err := s.pool.Exec(ctx,
 		`UPDATE session_chunks SET summary = $2, updated_at = $3 WHERE id = $1`,
-		chunkID, summary, history.NowMillis()); err != nil {
+		chunkID, summary, timeutil.NowMillis()); err != nil {
 		return fmt.Errorf("写片摘要失败: %w", err)
 	}
 	return nil
@@ -477,7 +452,7 @@ func (s *PgStore) SetSessionTitleIfEmpty(sessionID, title string) error {
 	//（先读再判会有"两个片同时结算"的竞争窗口）
 	if _, err := s.pool.Exec(ctx,
 		`UPDATE sessions SET title = $2, updated_at = $3 WHERE id = $1 AND title = ''`,
-		sessionID, title, history.NowMillis()); err != nil {
+		sessionID, title, timeutil.NowMillis()); err != nil {
 		return fmt.Errorf("写会话标题失败: %w", err)
 	}
 	return nil

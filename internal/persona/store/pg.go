@@ -437,12 +437,28 @@ func (s *PgStore) DeleteCandidate(id string) error {
 	ctx, cancel := s.ctx()
 	defer cancel()
 
-	// 影响 0 行不报错：采纳与丢弃都会删它，界面重复点一下不该变成错误弹窗
+	// 影响 0 行不报错：提升与删掉都会删它，界面重复点一下不该变成错误弹窗
 	if _, err := s.pool.Exec(ctx,
 		`DELETE FROM persona_rule_candidates WHERE id = $1::uuid`, id); err != nil {
 		return fmt.Errorf("删除规则候选失败: %w", err)
 	}
 	return nil
+}
+
+// PruneStaleCandidates 实现 Store。
+//
+// 一条 DELETE 就够，不需要事务：这里没有配套的日志要写——候选表本来就没有变更记录
+// （它不是"用户的东西"，删掉无痕可留）。
+func (s *PgStore) PruneStaleCandidates(before int64) (int, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM persona_rule_candidates WHERE created_at < $1`, before)
+	if err != nil {
+		return 0, fmt.Errorf("清理过期候选失败: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // SaveRule 新增或更新一条规则（ID 为空即新增），返回规则 ID。

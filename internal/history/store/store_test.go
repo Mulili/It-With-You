@@ -11,6 +11,7 @@ import (
 	"agent-for-you-love/internal/llm"
 	"agent-for-you-love/internal/memory"
 	memorystore "agent-for-you-love/internal/memory/store"
+	"agent-for-you-love/internal/pkg/timeutil"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -61,7 +62,7 @@ func runStoreContract(t *testing.T, s history.Store) {
 		if _, err := s.AppendMessage(history.Message{
 			SessionID: c.SessionID, ChunkID: c.ID, PersonaID: c.PersonaID,
 			Role: llm.RoleUser, Content: text, Status: history.StatusOK,
-			CreatedAt: history.NowMillis() + timeShift,
+			CreatedAt: timeutil.NowMillis() + timeShift,
 		}); err != nil {
 			t.Fatalf("写消息失败: %v", err)
 		}

@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"agent-for-you-love/internal/memory"
+	"agent-for-you-love/internal/pkg/timeutil"
 
 	"github.com/google/uuid"
 )
@@ -42,14 +43,8 @@ func (s *MemoryStore) Save(m memory.Memory, vec []float32, threshold float64) (m
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := memory.NowMillis()
-	if m.CreatedAt == 0 {
-		m.CreatedAt = now
-	}
-	m.UpdatedAt = now
-	if m.Importance == 0 {
-		m.Importance = memory.DefaultImportance
-	}
+	now := timeutil.NowMillis()
+	m = memory.NormalizeMemory(m, now)
 
 	// 去重：在"该人格可见的范围"里找最相似的一条。
 	// Kind 必须相同——"喜欢猫"和"养过猫"相似度很高，但它们是两件事。
@@ -120,7 +115,7 @@ func (s *MemoryStore) IndexChunk(ci memory.ChunkIndex, vec []float32) error {
 		ci.CreatedAt = old.ci.CreatedAt
 	}
 	if ci.CreatedAt == 0 {
-		ci.CreatedAt = memory.NowMillis()
+		ci.CreatedAt = timeutil.NowMillis()
 	}
 	s.chunkIndex[ci.ChunkID] = indexEntry{ci: ci, vec: vec}
 	return nil
@@ -136,6 +131,8 @@ func (s *MemoryStore) Search(personaID string, vec []float32, limit int) ([]memo
 		if !visibleTo(e.m, personaID) {
 			continue
 		}
+		// ⚠️ 这里**故意不过滤**"本段对话里提过的"（与 PG 侧同一口径）：
+		// 丢掉会让"她不知道"，然后开始编。提过的由上层降级为弱化措辞。
 		// 相似度用与 PG 的 <=> 同一个口径（余弦），否则同一条断言在两种实现下会得出不同结论
 		hits = append(hits, memory.MemoryHit{Memory: e.m, Score: cosine(vec, e.vec)})
 	}
@@ -155,6 +152,8 @@ func (s *MemoryStore) SearchChunks(personaID string, vec []float32, limit int) (
 		if e.ci.PersonaID != personaID {
 			continue
 		}
+		// ⚠️ 同样**故意不过滤**（包括"排除当前会话自己的片"）：片的摘要不在上下文里，
+		// 丢掉她就会在"你上次说的那件事"面前哑口无言。重复提改用弱化措辞解决。
 		hits = append(hits, memory.ChunkHit{Chunk: e.ci, Score: cosine(vec, e.vec)})
 	}
 	sortHits(hits, func(h memory.ChunkHit) float64 { return h.Score })
@@ -162,22 +161,60 @@ func (s *MemoryStore) SearchChunks(personaID string, vec []float32, limit int) (
 }
 
 // MarkRecalled 实现 memory.Store。
-func (s *MemoryStore) MarkRecalled(ids []string) error {
+func (s *MemoryStore) MarkRecalled(ids []string, sessionID string) error {
 	if len(ids) == 0 {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := memory.NowMillis()
+	now := timeutil.NowMillis()
 	want := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		want[id] = true
 	}
 	for i := range s.entries {
-		if want[s.entries[i].m.ID] {
-			s.entries[i].m.LastRecalledAt = now
+		if !want[s.entries[i].m.ID] {
+			continue
 		}
+		m := &s.entries[i].m
+		// 本段对话里第几次提：同会话 +1，换会话重置为 1（与 PG 侧的 CASE WHEN 同口径）
+		if sessionID != "" && m.LastRecalledSession == sessionID {
+			m.RecallCount++
+		} else {
+			m.RecallCount = 1
+		}
+		m.LastRecalledAt = now
+		m.LastRecalledSession = sessionID
+	}
+	return nil
+}
+
+// MarkChunksRecalled 实现 memory.Store。
+func (s *MemoryStore) MarkChunksRecalled(chunkIDs []string, sessionID string) error {
+	if len(chunkIDs) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	want := make(map[string]bool, len(chunkIDs))
+	for _, id := range chunkIDs {
+		want[id] = true
+	}
+	for id, e := range s.chunkIndex {
+		if !want[id] {
+			continue
+		}
+		// 本段对话里第几次提（与 PG 侧的 CASE WHEN 同口径）
+		if sessionID != "" && e.ci.LastRecalledSession == sessionID {
+			e.ci.RecallCount++
+		} else {
+			e.ci.RecallCount = 1
+		}
+		e.ci.LastRecalledSession = sessionID
+		// indexEntry 里存的是 ChunkIndex 的值，改完要写回 map
+		s.chunkIndex[id] = e
 	}
 	return nil
 }

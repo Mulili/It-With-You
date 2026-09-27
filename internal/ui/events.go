@@ -14,6 +14,12 @@ const (
 	// EventPersonaChanged 是人格被改动的通知（阶段3）。
 	// 用途有二：显式指令写入后的回执（让用户知道"它记住了"）、设置浮层开着时刷新。
 	EventPersonaChanged = "persona:changed"
+
+	// EventWindowHidden 在窗口被隐藏时发出。
+	//
+	// 为什么需要它：隐藏可能由**托盘**发起（Go 侧直接调 Hide），而"菜单开没开"的状态在前端。
+	// 不通知的话前端会以为菜单还开着——下次显示窗口时，「加高后的尺寸 + 打开的面板」一起回来。
+	EventWindowHidden = "window:hidden"
 )
 
 // SayPayload 是 EventSay 事件的负载。

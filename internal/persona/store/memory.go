@@ -370,7 +370,27 @@ func (s *MemoryStore) DeleteCandidate(id string) error {
 			return nil
 		}
 	}
-	return nil // 找不到就是已经处理过了（采纳与丢弃都会删它）
+	return nil // 找不到就是已经处理过了（提升与删掉都会删它）
+}
+
+// PruneStaleCandidates 实现 Store。
+//
+// 重新分配一个切片而不是原地 `[:0]` 压缩：后者会覆写底层数组，
+// 而 ListCandidates 是把它交给调用方的（虽然目前返回的是副本，但这层耦合不值得留着）。
+func (s *MemoryStore) PruneStaleCandidates(before int64) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	kept := make([]persona.Candidate, 0, len(s.candidates))
+	for _, c := range s.candidates {
+		if c.CreatedAt < before {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	n := len(s.candidates) - len(kept)
+	s.candidates = kept
+	return n, nil
 }
 
 // SaveRule 新增或更新一条规则（ID 为空即新增），返回规则 ID。

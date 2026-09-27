@@ -10,6 +10,8 @@ import (
 
 	"agent-for-you-love/internal/db"
 	"agent-for-you-love/internal/memory"
+	"agent-for-you-love/internal/pkg/pgutil"
+	"agent-for-you-love/internal/pkg/timeutil"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -47,14 +49,8 @@ func (s *PgStore) Save(m memory.Memory, vec []float32, threshold float64) (memor
 	ctx, cancel := s.ctx()
 	defer cancel()
 
-	now := memory.NowMillis()
-	if m.CreatedAt == 0 {
-		m.CreatedAt = now
-	}
-	m.UpdatedAt = now
-	if m.Importance == 0 {
-		m.Importance = memory.DefaultImportance
-	}
+	now := timeutil.NowMillis()
+	m = memory.NormalizeMemory(m, now)
 	vecLit := vectorLiteral(vec)
 
 	// 去重：在该人格可见的范围里取最相似的一条，<=> 是余弦距离，HNSW 索引直接服务这个查询。
@@ -68,7 +64,7 @@ func (s *PgStore) Save(m memory.Memory, vec []float32, threshold float64) (memor
 		FROM memories
 		WHERE kind = $2 AND (persona_id IS NULL OR persona_id = $3::uuid)
 		ORDER BY embedding <=> $1::vector
-		LIMIT 1`, vecLit, m.Kind, nullIfEmpty(m.PersonaID)).Scan(&dupID, &dupSim)
+		LIMIT 1`, vecLit, m.Kind, pgutil.NullIfEmpty(m.PersonaID)).Scan(&dupID, &dupSim)
 	switch {
 	case err == nil && dupSim >= threshold:
 		if _, err := s.pool.Exec(ctx, `
@@ -79,7 +75,7 @@ func (s *PgStore) Save(m memory.Memory, vec []float32, threshold float64) (memor
 			       embedding = $6::vector, updated_at = $7
 			 WHERE id = $1`,
 			dupID, m.Content, m.Evidence, m.Importance,
-			nullIfZero(m.FollowUpAt), vecLit, now); err != nil {
+			pgutil.NullIfZero(m.FollowUpAt), vecLit, now); err != nil {
 			return memory.SaveResult{}, fmt.Errorf("更新记忆失败: %w", err)
 		}
 		return memory.SaveResult{ID: dupID, Updated: true}, nil
@@ -94,8 +90,8 @@ func (s *PgStore) Save(m memory.Memory, vec []float32, threshold float64) (memor
 		INSERT INTO memories (id, persona_id, content, kind, importance, embedding, evidence,
 		                      follow_up_at, last_recalled_at, created_at, updated_at)
 		VALUES ($1, $2::uuid, $3, $4, $5, $6::vector, $7, $8, NULL, $9, $9)`,
-		m.ID, nullIfEmpty(m.PersonaID), m.Content, m.Kind, m.Importance, vecLit,
-		m.Evidence, nullIfZero(m.FollowUpAt), m.CreatedAt); err != nil {
+		m.ID, pgutil.NullIfEmpty(m.PersonaID), m.Content, m.Kind, m.Importance, vecLit,
+		m.Evidence, pgutil.NullIfZero(m.FollowUpAt), m.CreatedAt); err != nil {
 		return memory.SaveResult{}, fmt.Errorf("写入记忆失败: %w", err)
 	}
 	return memory.SaveResult{ID: m.ID}, nil
@@ -105,7 +101,7 @@ func (s *PgStore) Save(m memory.Memory, vec []float32, threshold float64) (memor
 //
 // 可空列用 COALESCE 兜成零值：让 NULL 透到 Go 会逼每个调用点都处理一遍可空性，
 // 不如在 SQL 边界上收敛掉（与 history 那边同一套路）。
-const memoryColumns = `id, COALESCE(persona_id::text, ''), content, kind, importance, evidence, COALESCE(follow_up_at, 0), COALESCE(last_recalled_at, 0), created_at, updated_at`
+const memoryColumns = `id, COALESCE(persona_id::text, ''), content, kind, importance, evidence, COALESCE(follow_up_at, 0), COALESCE(last_recalled_at, 0), COALESCE(last_recalled_session::text, ''), recall_count, created_at, updated_at`
 
 // IndexChunk 实现 memory.Store。
 func (s *PgStore) IndexChunk(ci memory.ChunkIndex, vec []float32) error {
@@ -113,7 +109,7 @@ func (s *PgStore) IndexChunk(ci memory.ChunkIndex, vec []float32) error {
 	defer cancel()
 
 	if ci.CreatedAt == 0 {
-		ci.CreatedAt = memory.NowMillis()
+		ci.CreatedAt = timeutil.NowMillis()
 	}
 	// 冲突时只覆盖摘要与向量，**保留原有的 created_at**：它表示"这片是什么时候被索引的"，
 	// 而重放不该把它刷新成现在（否则排查"索引是什么时候建的"就永远看到的是最近一次重放）
@@ -137,12 +133,17 @@ func (s *PgStore) Search(personaID string, vec []float32, limit int) ([]memory.M
 	// <=> 是余弦距离（1 - 相似度），HNSW 索引直接服务这个排序。
 	// persona_id 传 NULL 时 "= NULL" 恒为 NULL、不会匹配任何行，于是只剩 IS NULL 那一支
 	// ——正是"只看公共记忆"的语义（与 List 同一套路）
+	//
+	// ⚠️ 这里**故意不加**"这段对话里提过的就过滤掉"：那种过滤被一个反例推翻了——
+	// 连着问"草莓喜不喜欢 / 芒果喜不喜欢 / 菠萝喜不喜欢"，第三次起若不再返回，
+	// 她会**不知道**，然后就开始编。提过的那些照常返回，由上层降级为弱化措辞
+	// （见 memory.Memory.RecallCount）。
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+memoryColumns+`, 1 - (embedding <=> $1::vector) AS score
 		FROM memories
 		WHERE persona_id IS NULL OR persona_id = $2::uuid
 		ORDER BY embedding <=> $1::vector
-		LIMIT $3`, vectorLiteral(vec), nullIfEmpty(personaID), limit)
+		LIMIT $3`, vectorLiteral(vec), pgutil.NullIfEmpty(personaID), limit)
 	if err != nil {
 		return nil, fmt.Errorf("检索记忆失败: %w", err)
 	}
@@ -153,7 +154,8 @@ func (s *PgStore) Search(personaID string, vec []float32, limit int) ([]memory.M
 		var h memory.MemoryHit
 		if err := rows.Scan(&h.Memory.ID, &h.Memory.PersonaID, &h.Memory.Content, &h.Memory.Kind,
 			&h.Memory.Importance, &h.Memory.Evidence, &h.Memory.FollowUpAt,
-			&h.Memory.LastRecalledAt, &h.Memory.CreatedAt, &h.Memory.UpdatedAt, &h.Score); err != nil {
+			&h.Memory.LastRecalledAt, &h.Memory.LastRecalledSession, &h.Memory.RecallCount,
+			&h.Memory.CreatedAt, &h.Memory.UpdatedAt, &h.Score); err != nil {
 			return nil, fmt.Errorf("解析检索结果失败: %w", err)
 		}
 		out = append(out, h)
@@ -171,8 +173,14 @@ func (s *PgStore) SearchChunks(personaID string, vec []float32, limit int) ([]me
 
 	// chunk_index.persona_id 不可空（片必然属于某个人格），所以这里是严格相等，
 	// 与"记忆可公共"的语义不同
+	//
+	// ⚠️ 这里**故意不加**任何"提过就过滤"的条件——包括"排除当前会话自己的片"。
+	// 片的摘要并不在上下文里（只发当前片），所以她同样得靠注入才想得起来；
+	// 把它们丢掉，她就会在"你上次说的那件事"面前哑口无言、甚至开始编。
+	// 重复提的问题改用**弱化措辞**解决（见 memory.ChunkIndex.RecallCount）。
 	rows, err := s.pool.Query(ctx, `
 		SELECT chunk_id, session_id, persona_id, summary, created_at,
+		       COALESCE(last_recalled_session::text, ''), recall_count,
 		       1 - (embedding <=> $1::vector) AS score
 		FROM chunk_index
 		WHERE persona_id = $2::uuid
@@ -187,7 +195,8 @@ func (s *PgStore) SearchChunks(personaID string, vec []float32, limit int) ([]me
 	for rows.Next() {
 		var h memory.ChunkHit
 		if err := rows.Scan(&h.Chunk.ChunkID, &h.Chunk.SessionID, &h.Chunk.PersonaID,
-			&h.Chunk.Summary, &h.Chunk.CreatedAt, &h.Score); err != nil {
+			&h.Chunk.Summary, &h.Chunk.CreatedAt, &h.Chunk.LastRecalledSession,
+			&h.Chunk.RecallCount, &h.Score); err != nil {
 			return nil, fmt.Errorf("解析片索引失败: %w", err)
 		}
 		out = append(out, h)
@@ -199,7 +208,7 @@ func (s *PgStore) SearchChunks(personaID string, vec []float32, limit int) ([]me
 }
 
 // MarkRecalled 实现 memory.Store。
-func (s *PgStore) MarkRecalled(ids []string) error {
+func (s *PgStore) MarkRecalled(ids []string, sessionID string) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -208,11 +217,41 @@ func (s *PgStore) MarkRecalled(ids []string) error {
 
 	// 逐条 UPDATE，而不是 ANY($1::uuid[])：把 []string 编码成 uuid[] 要靠 pgx 的类型推断，
 	// 传错只会在运行时炸；而这里最多三条，多几次往返不值得为它冒这个险
-	now := memory.NowMillis()
+	//
+	// recall_count 的口径：**本段对话里第几次提**。同一会话里再提就 +1，换了会话重置为 1。
+	// SET 子句右侧用的都是**行更新前**的值，所以两列谁先谁后无所谓。
+	now := timeutil.NowMillis()
 	for _, id := range ids {
-		if _, err := s.pool.Exec(ctx,
-			`UPDATE memories SET last_recalled_at = $2 WHERE id = $1::uuid`, id, now); err != nil {
+		if _, err := s.pool.Exec(ctx, `
+			UPDATE memories
+			   SET last_recalled_at = $2,
+			       recall_count = CASE WHEN last_recalled_session = $3::uuid THEN recall_count + 1 ELSE 1 END,
+			       last_recalled_session = $3::uuid
+			 WHERE id = $1::uuid`, id, now, pgutil.NullIfEmpty(sessionID)); err != nil {
 			return fmt.Errorf("记录记忆回想的时刻失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// MarkChunksRecalled 实现 memory.Store。
+//
+// 与 MarkRecalled 同一套路（逐条 UPDATE），但**没有时间戳那一半**：
+// 片索引上只需要"在哪段对话里提过"，不需要"什么时候提过"。
+func (s *PgStore) MarkChunksRecalled(chunkIDs []string, sessionID string) error {
+	if len(chunkIDs) == 0 {
+		return nil
+	}
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	for _, id := range chunkIDs {
+		if _, err := s.pool.Exec(ctx, `
+			UPDATE chunk_index
+			   SET recall_count = CASE WHEN last_recalled_session = $2::uuid THEN recall_count + 1 ELSE 1 END,
+			       last_recalled_session = $2::uuid
+			 WHERE chunk_id = $1::uuid`, id, pgutil.NullIfEmpty(sessionID)); err != nil {
+			return fmt.Errorf("记录往事回想失败: %w", err)
 		}
 	}
 	return nil
@@ -230,7 +269,7 @@ func (s *PgStore) List(personaID string, limit int) ([]memory.Memory, error) {
 		FROM memories
 		WHERE persona_id IS NULL OR persona_id = $1::uuid
 		ORDER BY created_at DESC
-		LIMIT $2`, nullIfEmpty(personaID), limit)
+		LIMIT $2`, pgutil.NullIfEmpty(personaID), limit)
 	if err != nil {
 		return nil, fmt.Errorf("读取记忆列表失败: %w", err)
 	}
@@ -240,7 +279,8 @@ func (s *PgStore) List(personaID string, limit int) ([]memory.Memory, error) {
 	for rows.Next() {
 		var m memory.Memory
 		if err := rows.Scan(&m.ID, &m.PersonaID, &m.Content, &m.Kind, &m.Importance, &m.Evidence,
-			&m.FollowUpAt, &m.LastRecalledAt, &m.CreatedAt, &m.UpdatedAt); err != nil {
+			&m.FollowUpAt, &m.LastRecalledAt, &m.LastRecalledSession, &m.RecallCount,
+			&m.CreatedAt, &m.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("解析记忆失败: %w", err)
 		}
 		out = append(out, m)
@@ -296,20 +336,4 @@ func vectorLiteral(vec []float32) string {
 	}
 	b.WriteByte(']')
 	return b.String()
-}
-
-// nullIfEmpty 把空字符串转成 SQL NULL（uuid 列传 "" 会直接报错）。
-func nullIfEmpty(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
-}
-
-// nullIfZero 把 0 转成 SQL NULL（用于可空的 bigint 列）。
-func nullIfZero(v int64) any {
-	if v == 0 {
-		return nil
-	}
-	return v
 }

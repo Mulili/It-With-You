@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"testing"
@@ -37,7 +37,7 @@ func newPersonaApp(t *testing.T) (*App, persona.Store, history.Store) {
 	t.Helper()
 	st := store.NewMemoryStore(testBuiltins(), true)
 	hist := historystore.NewMemoryStore()
-	return NewApp(nil, st, hist, memorystore.NewMemoryStore(), nil), st, hist
+	return NewApp(nil, st, hist, memorystore.NewMemoryStore(), nil, nil), st, hist
 }
 
 // 删除人格必须同时清掉它的对话历史：那些消息的 personaID 已失效，

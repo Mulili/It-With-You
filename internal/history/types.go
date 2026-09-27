@@ -9,8 +9,10 @@
 package history
 
 import (
+	"agent-for-you-love/internal/pkg/timeutil"
 	"errors"
-	"time"
+
+	"github.com/google/uuid"
 )
 
 // 消息状态。
@@ -207,5 +209,20 @@ type Store interface {
 	DeletePersona(personaID string) error
 }
 
-// NowMillis 是取当前时间的统一入口，便于测试替换（保持与项目其他部分同一口径：Unix 毫秒）。
-func NowMillis() int64 { return time.Now().UnixMilli() }
+// NormalizeMessage 补全一条消息的缺省值：ID、创建时间、状态。
+//
+// 放在领域包而不是各自的 store 里，因为它是**业务规则**（"没给状态就是成功的"），
+// 两种存储实现必须一致。原来两个 store 各抄一份，哪天加一个待补字段就会出现
+// "内存实现有、PG 实现没有"——而症状是某些字段时有时无，极难定位。
+func NormalizeMessage(m Message) Message {
+	if m.ID == "" {
+		m.ID = uuid.NewString()
+	}
+	if m.CreatedAt == 0 {
+		m.CreatedAt = timeutil.NowMillis()
+	}
+	if m.Status == "" {
+		m.Status = StatusOK
+	}
+	return m
+}

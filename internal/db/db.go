@@ -28,7 +28,8 @@ import (
 //	v2 → v3：加 session_chunks（会话内分片）、messages 加 chunk_id；
 //	        会话级的 session_index 改为片级的 chunk_index
 //	v3 → v4：加 persona_rule_candidates（隐式演化的候选区）
-const SchemaVersion = 4
+//	v4 → v5：memories 加 last_recalled_session（抑制"同一段对话里反复提同一件事"）
+const SchemaVersion = 5
 
 // envDSN 是连接串所在的环境变量名。
 const envDSN = "COMPANION_PG_DSN"

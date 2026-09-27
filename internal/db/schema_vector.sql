@@ -27,6 +27,19 @@ CREATE TABLE IF NOT EXISTS chunk_index (
     persona_id uuid   NOT NULL REFERENCES personas (id) ON DELETE CASCADE,
     summary    text   NOT NULL,
     embedding  vector(1024) NOT NULL,
+    -- 最近一次被注入时所在的会话，语义与 memories.last_recalled_session 完全一样：
+    -- 同一段对话里提过一次就不再提。
+    --
+    -- 这一列在往事侧尤其要紧：**它和"排除当前会话"是两件事**。
+    -- 后者只挡住"本会话自己的片"，而一条几天前的往事属于**别的**会话，
+    -- 于是每轮检索都会命中它、每轮都注入一遍——用户的感觉就是"她每一句都回扣同一件事"。
+    last_recalled_session uuid,
+    -- 在 last_recalled_session 那段对话里，它已经被注入过几次。
+    --
+    -- 为什么是计数而不是一个布尔"提过没有"：提过之后还有**梯度**——
+    -- 第一次她可以自然提起；第二次该提醒她"这件事你提过了，除非他主动问起"；
+    -- 再之后就不再返回（避免反复刷屏）。零值表示"这段对话里没提过"。
+    recall_count smallint NOT NULL DEFAULT 0,
     created_at bigint NOT NULL
 );
 
@@ -56,11 +69,30 @@ CREATE TABLE IF NOT EXISTS memories (
     -- 非空 = 未完结话题，到点可主动问一句（4.6 主动发言用）；
     -- **问过一次后置空**，于是"只回访一次"由数据本身保证，不需要额外的状态字段
     follow_up_at bigint,
-    -- 最近一次被检索注入的时间：抑制"反复提同一件事"
+    -- 最近一次被检索注入的时间。
+    -- ⚠️ 抑制"反复提同一件事"靠的不是它，而是下面那列 session——"隔了多久算久"是个要拍的数，
+    -- 而"同一段对话里提过没有"是确定的事实。它留着是因为"什么时候提过"本身有价值
+    -- （将来做遗忘曲线 / 相关性衰减要用）
     last_recalled_at bigint,
+    -- 最近一次被注入时所在的**会话**。
+    --
+    -- 真正要防的不是"隔了多久"，而是**同一段对话里反复提**：用户会明确感觉到"她怎么老提这个"。
+    -- 用会话做判据就不必拍一个冷却时长——同一段对话里提过就不再提；
+    -- 换个新会话仍会提一次，那本来就是期望行为（"上次我们聊过…"）。
+    last_recalled_session uuid,
+    -- 语义与 memories.recall_count 完全一样，见那里的说明
+    recall_count smallint NOT NULL DEFAULT 0,
     created_at bigint NOT NULL,
     updated_at bigint NOT NULL
 );
+
+-- 幂等建表管不到"给**已有**的表加列"，所以这里补两条 ALTER。
+-- 新库上它们没有副作用；老库靠它们把列补上——在本项目里，"迁移"的全部形态就是这个
+-- （见 internal/db 的 checkVersion：升级 = 重跑一遍建表脚本 + 补版本号）。
+ALTER TABLE memories    ADD COLUMN IF NOT EXISTS last_recalled_session uuid;
+ALTER TABLE chunk_index ADD COLUMN IF NOT EXISTS last_recalled_session uuid;
+ALTER TABLE memories    ADD COLUMN IF NOT EXISTS recall_count smallint NOT NULL DEFAULT 0;
+ALTER TABLE chunk_index ADD COLUMN IF NOT EXISTS recall_count smallint NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS memories_embedding_idx ON memories USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS memories_persona_idx   ON memories (persona_id, created_at DESC);

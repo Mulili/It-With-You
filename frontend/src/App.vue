@@ -9,7 +9,7 @@ import {
   SaveRule, DeleteRule, SetRuleEnabled,
   RuleCandidates, PromoteRuleCandidate, DeleteRuleCandidate,
   GetSettings, SetThinkingDisabled, ExportPersonaToFile, ImportPersonaFromFile,
-} from '../wailsjs/go/main/App'
+} from '../wailsjs/go/app/App'
 import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime'
 
 // 与 Go 侧 internal/ui/events.go 里的常量保持一致
@@ -18,6 +18,7 @@ const EVENT_CHUNK = 'chat:chunk'
 const EVENT_DONE = 'chat:done'
 const EVENT_ERROR = 'chat:error'
 const EVENT_PERSONA_CHANGED = 'persona:changed'
+const EVENT_WINDOW_HIDDEN = 'window:hidden'
 
 const bubbleText = ref('')
 const draft = ref('')
@@ -579,6 +580,15 @@ function onHide() {
   HideWindow()
 }
 
+// 窗口被隐藏了——由**后端**发起的那条路径（例如从托盘"显示 / 隐藏"）。
+//
+// onHide 只有 × 按钮会走；托盘那条是 Go 直接调 Window.Hide()，前端原本无从知晓，
+// 于是菜单状态一直留在"开着"，下次唤出时加高的尺寸与面板一起回来。
+// 后端在 Window.Hide 里发了这个事件，这里补上同样的收尾。
+function onWindowHidden() {
+  if (menuOpen.value) closeMenu()
+}
+
 // 菜单里只显示 时:分，够用了；跨天的记录补上月-日，否则长会话里分不清先后
 function fmtTime(at) {
   const d = new Date(at)
@@ -682,6 +692,7 @@ onMounted(async () => {
   EventsOn(EVENT_DONE, onDone)
   EventsOn(EVENT_ERROR, onError)
   EventsOn(EVENT_PERSONA_CHANGED, onPersonaChanged)
+  EventsOn(EVENT_WINDOW_HIDDEN, onWindowHidden)
 
   // 先把存储状态问出来，再决定说什么。
   // 顺序不能反：数据库没就绪时该立刻进阻断态，而不是等用户点开菜单才知道
@@ -700,6 +711,7 @@ onUnmounted(() => {
   EventsOff(EVENT_DONE)
   EventsOff(EVENT_ERROR)
   EventsOff(EVENT_PERSONA_CHANGED)
+  EventsOff(EVENT_WINDOW_HIDDEN)
   clearTimeout(toastTimer)
 })
 </script>

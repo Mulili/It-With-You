@@ -137,6 +137,61 @@ func runCandidateContract(t *testing.T, s persona.Store) {
 			t.Errorf("人格都没了，候选不该还在：%+v", got)
 		}
 	})
+
+	t.Run("PruneStaleCandidates 只清过期的，且不碰规则", func(t *testing.T) {
+		pid := newPersona(t)
+		// 用"1970 年"这种极端时间戳，before 也取极小值：契约测试连的是**真实库**，
+		// 只要两头的量级都远离当下，就不可能误伤库里任何真实数据
+		if err := s.AddCandidates([]persona.Candidate{
+			{PersonaID: pid, Slot: "address_user", Value: "老板", CreatedAt: 1},
+			{PersonaID: pid, Slot: "tone", Value: "别太正经", CreatedAt: time.Now().UnixMilli()},
+		}); err != nil {
+			t.Fatalf("写候选失败: %v", err)
+		}
+		if _, err := s.SaveRule(persona.PersonaRule{
+			PersonaID: pid, Slot: "catchphrase", Value: "好耶",
+			Source: persona.SourceManual, Tier: persona.TierRecent,
+			Kind: persona.KindVolatile, Enabled: true,
+		}); err != nil {
+			t.Fatalf("写规则失败: %v", err)
+		}
+
+		n, err := s.PruneStaleCandidates(1000)
+		if err != nil {
+			t.Fatalf("清理失败: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("应当只清掉那条 1970 年的候选，实际 %d 条", n)
+		}
+
+		left, err := s.ListCandidates(pid, 10)
+		if err != nil {
+			t.Fatalf("列候选失败: %v", err)
+		}
+		if len(left) != 1 || left[0].Value != "别太正经" {
+			t.Errorf("留下的应当是那条没超窗的，实际 %+v", left)
+		}
+
+		// 规则一条都不能少：懒归档**只清候选**。规则那侧没有无界增长的来源
+		// （单值槽位写入即覆盖、多值槽位靠用户明说或亲手提升），而按时间淘汰它们
+		// 会造成"用户明说了'叫我主人'，30 天后她忘了"这种伤害。见 persona.Store 的注释
+		rules, err := s.RulesOf(pid)
+		if err != nil {
+			t.Fatalf("读规则失败: %v", err)
+		}
+		if len(rules) != 1 {
+			t.Errorf("清理候选不该动到规则，实际规则数 %d", len(rules))
+		}
+
+		// 再跑一次：已经没有可清的了（不该反复"清掉"同一条）
+		n, err = s.PruneStaleCandidates(1000)
+		if err != nil {
+			t.Fatalf("清理失败: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("第二次清理应当清 0 条，实际 %d 条", n)
+		}
+	})
 }
 
 func TestMemoryStoreCandidates(t *testing.T) {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"agent-for-you-love/internal/app"
 	"agent-for-you-love/internal/config"
 	"agent-for-you-love/internal/db"
 	historystore "agent-for-you-love/internal/history/store"
@@ -58,7 +59,10 @@ func main() {
 	// 探测失败返回 nil：记忆功能整体停用，对话照常，且启动不被打断。
 	embedder := probeEmbedder()
 
-	app := NewApp(llm.NewOpenAIProvider(llmCfg), personaStore, historyStore, memoryStore, embedder)
+	// 变量名刻意避开包名：下面还要用 app.NewApp 这个包限定符，
+	// 叫 app 的话变量会把包名遮蔽掉（编译得过，但之后再也用不了那个包）。
+	application := app.NewApp(llm.NewOpenAIProvider(llmCfg), personaStore, historyStore,
+		memoryStore, embedder, trayIcon)
 
 	err := wails.Run(&options.App{
 		Title:         "常驻助手",
@@ -86,10 +90,10 @@ func main() {
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
-		OnStartup:  app.startup,
-		OnShutdown: app.shutdown,
+		OnStartup:  application.Startup,
+		OnShutdown: application.Shutdown,
 		Bind: []interface{}{
-			app,
+			application,
 		},
 		Windows: &windows.Options{
 			// 让 WebView2 的默认背景透明：网页自己画的透明区域不会被涂白。
@@ -166,6 +170,14 @@ func probeEmbedder() llm.Embedder {
 		return nil
 	}
 	log.Printf("[embed] 嵌入服务就绪：%s @ %s（%d 维）", cfg.Model, cfg.BaseURL, cfg.Dim)
+	if e.NativeOllama() {
+		// 这句话值得打：保活是否生效只取决于"探测到的端点"，而它带来的差别
+		// （隔夜后第一句话快 2.2 秒、还是慢 2.2 秒）从其它日志里完全看不出来。
+		log.Printf("[embed] 已启用模型保活：走 Ollama 原生端点，空闲不会被卸载")
+	} else {
+		log.Printf("[embed] 未探测到 Ollama 原生端点，走兼容端点：模型可能在空闲 5 分钟后被卸载" +
+			"（下一次嵌入要多花约 2 秒）")
+	}
 	return e
 }
 

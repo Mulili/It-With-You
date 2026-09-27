@@ -2,7 +2,10 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -125,5 +128,127 @@ func TestEmbedSemanticSeparation(t *testing.T) {
 
 	if similar <= unrelated+0.2 {
 		t.Errorf("语义区分度不成立：相似对 %.4f 应当比无关对 %.4f 高出至少 0.2", similar, unrelated)
+	}
+}
+
+// ---------- 端点选择（不依赖外部服务）----------
+//
+// 下面这组用 httptest 假装服务端，专门钉住"什么时候走 Ollama 原生端点"。
+// 它值得单独测，因为原生端点是我们**唯一**能传 keep_alive 的地方：
+// 走错了端点不会报任何错，只会让模型在空闲 5 分钟后被卸载——
+// 而症状是"隔夜后第一句话慢 2.2 秒"，没人会想到是这里。
+
+// fakeEmbedService 是一个可配置的假服务端：isOllama 决定它是否暴露 /api/version。
+type fakeEmbedService struct {
+	*httptest.Server
+	dim int
+	// lastEmbedPath / lastEmbedBody 记录最后一次嵌入请求（不含探测那次），供断言
+	lastEmbedPath string
+	lastEmbedBody map[string]any
+}
+
+func newFakeEmbedService(t *testing.T, isOllama bool, dim int) *fakeEmbedService {
+	t.Helper()
+	f := &fakeEmbedService{dim: dim}
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/version" && isOllama:
+			_, _ = w.Write([]byte(`{"version":"0.1.32"}`))
+
+		case r.URL.Path == "/api/embed":
+			f.lastEmbedPath = r.URL.Path
+			_ = json.NewDecoder(r.Body).Decode(&f.lastEmbedBody)
+			// 原生端点把向量直接放在 embeddings 里（二维数组）
+			vec := make([]float32, dim)
+			vec[0] = 1 // 非零，免得被别的断言当成退化结果
+			_ = json.NewEncoder(w).Encode(map[string]any{"embeddings": [][]float32{vec}})
+
+		case r.URL.Path == "/v1/embeddings":
+			f.lastEmbedPath = r.URL.Path
+			_ = json.NewDecoder(r.Body).Decode(&f.lastEmbedBody)
+			vec := make([]float32, dim)
+			vec[0] = 1
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]any{{"embedding": vec}},
+			})
+
+		default:
+			// /api/version 在不模拟 Ollama 时也必须这里返回 404，
+			// 否则探测会拿到 200、误判成 Ollama
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(f.Close)
+	return f
+}
+
+// 探测到 Ollama → 走原生端点，且请求体里带着 keep_alive = -1。
+//
+// 最后半句是本测试存在的理由：漏了它，模型照样能用，只是空闲 5 分钟后被卸载。
+func TestEmbedUsesNativeEndpointForOllama(t *testing.T) {
+	const dim = 3
+	f := newFakeEmbedService(t, true, dim)
+
+	e := NewOpenAIEmbedder(EmbedConfig{BaseURL: f.URL + "/v1", Model: "bge-m3", Dim: dim})
+	if err := e.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify 失败: %v", err)
+	}
+	if _, err := e.Embed(context.Background(), []string{"x"}); err != nil {
+		t.Fatalf("Embed 失败: %v", err)
+	}
+
+	if f.lastEmbedPath != "/api/embed" {
+		t.Fatalf("探测到 Ollama 后应当走原生端点，实际请求了 %q", f.lastEmbedPath)
+	}
+	// JSON 里的数字都是 float64
+	if ka, ok := f.lastEmbedBody["keep_alive"].(float64); !ok || ka != embedKeepAlive {
+		t.Errorf("请求体必须带 keep_alive = %d（否则模型会被卸载），实际 %v",
+			embedKeepAlive, f.lastEmbedBody["keep_alive"])
+	}
+	if f.lastEmbedBody["model"] != "bge-m3" || f.lastEmbedBody["input"] == nil {
+		t.Errorf("请求体不完整：%+v", f.lastEmbedBody)
+	}
+}
+
+// 探不到 /api/version（不是 Ollama）→ 退回兼容端点，且**不带** keep_alive。
+//
+// 不带是对的：那是 OpenAI 的扩展字段吗？不是——它是 Ollama 特有的，
+// 发给别的服务端要么被忽略、要么直接报未知参数。
+func TestEmbedFallsBackToCompatEndpoint(t *testing.T) {
+	const dim = 2
+	f := newFakeEmbedService(t, false, dim)
+
+	e := NewOpenAIEmbedder(EmbedConfig{BaseURL: f.URL + "/v1", Model: "m", Dim: dim})
+	if err := e.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify 失败: %v", err)
+	}
+	if _, err := e.Embed(context.Background(), []string{"x"}); err != nil {
+		t.Fatalf("Embed 失败: %v", err)
+	}
+
+	if f.lastEmbedPath != "/v1/embeddings" {
+		t.Fatalf("不是 Ollama 时应当走兼容端点，实际请求了 %q", f.lastEmbedPath)
+	}
+	if _, exists := f.lastEmbedBody["keep_alive"]; exists {
+		t.Errorf("兼容端点不该收到 keep_alive（那是 Ollama 特有的）：%+v", f.lastEmbedBody)
+	}
+}
+
+// nativeBase 从兼容 base_url 推出原生前缀。
+//
+// 用户的 base_url 写法五花八门，这里把几种常见形态都钉住：
+// 推错了会请求到一个不存在的路径，而探测失败只会静默退回兼容端点——
+// 于是"保活失效"这件事完全没有报错可查。
+func TestNativeBase(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"http://localhost:11434/v1", "http://localhost:11434"},
+		{"http://localhost:11434/v1/", "http://localhost:11434"}, // 结尾斜杠
+		{"http://localhost:11434", "http://localhost:11434"},     // 没写 /v1
+		{"http://host:8080/api/v1", "http://host:8080/api"},      // 带前缀路径
+	}
+	for _, c := range cases {
+		if got := nativeBase(c.in); got != c.want {
+			t.Errorf("nativeBase(%q) = %q，期望 %q", c.in, got, c.want)
+		}
 	}
 }

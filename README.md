@@ -173,17 +173,22 @@ Wails 窗口配置：透明、无边框、置顶、可拖动
 
 Go 后端：暴露一个 Say(text string) 方法，前端调用后显示气泡
 
-目录结构建议
+目录结构建议（阶段1 的规划，现已落地——实际结构如下）
 
 ```text
-desktop-companion/
-├── main.go              # Wails 入口
-├── app.go               # 应用逻辑
+It-With-You/
+├── main.go              # Wails 入口：装配依赖 + wails.Run 的窗口/托盘配置
 ├── internal/
-│   ├── ui/              # 窗口、托盘
-│   ├── llm/             # 预留：LLM 接口
-│   ├── memory/          # 预留：RAG 接口
-│   └── voice/           # 预留：语音接口
+│   ├── app/             # 应用层：App 结构体、生命周期、暴露给前端的绑定方法
+│   ├── ui/              # 窗口、托盘、前端事件
+│   ├── llm/             # LLM 接口与 OpenAI 兼容实现（对话 + 嵌入）
+│   ├── memory/          # RAG 记忆（事实 + 片索引）
+│   ├── history/         # 对话历史（会话 / 分片 / 消息）
+│   ├── persona/         # 人格与规则（槽位、权限矩阵、内置人格）
+│   ├── settle/          # 收尾结算：从聊天原文里抽摘要 / 事实 / 行为倾向
+│   ├── db/              # PG 连接与表结构脚本
+│   ├── config/          # .env 加载
+│   └── pkg/             # 跨包共用的小工具（按用途分子包）
 ├── frontend/
 │   ├── src/
 │   │   ├── components/
@@ -192,6 +197,9 @@ desktop-companion/
 │   └── index.html
 └── go.mod
 ```
+
+> 阶段1 的规划里 `app.go` 在根目录；后来按域拆成 5 个文件并整体移入 `internal/app/`
+> （原因与代价见 operation.md「结构整理」）。
 
 验收标准
 双击运行，桌面出现一个透明小窗口
@@ -270,7 +278,6 @@ window.wails.flags.enableResize = true；前端运行时检测鼠标是否落在
 还会占掉本就紧张的垂直空间。
 
 注意：无边框窗口没有可见边框，可缩放的 6px 是透明的，用户只能靠光标变化发现，建议右下角再画一个视觉抓手。
-
 风险：缩放与透明合成叠加时的实际表现尚未真机验证（边缘重绘、残影）。若出现异常，先临时关掉
 WindowIsTranslucent 做对比，隔离变量后再决定是否降级为「前端抓手 + runtime.WindowSetSize」自绘缩放。
 

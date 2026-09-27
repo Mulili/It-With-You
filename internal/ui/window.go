@@ -45,11 +45,20 @@ func (w *Window) Show() {
 }
 
 // Hide 隐藏窗口（幂等），窗口从任务栏消失但进程与托盘仍在。
+//
+// 隐藏之后要通知前端把菜单收起来。**任何隐藏路径都必须带上这件事**：
+// × 按钮那条前端自己会先收（见 App.vue 的 onHide），但托盘的 ToggleWindow 是
+// Go 单方面发起的，前端无从知晓——于是下次唤出时窗口带着「加高的尺寸 + 打开的面板」。
+//
+// 收起动作交给前端的 closeMenu，而不在这里直接改尺寸：**"菜单开没开"的真相在前端**，
+// 尺寸只是它的结果（见 SetMenuOpen）。若这里也改一次，两边就要靠幂等逻辑互相兜底，
+// 反而可能撞出"尺寸已经还原、面板还开着"这种更难看的状态。
 func (w *Window) Hide() {
 	w.mu.Lock()
 	w.visible = false
 	w.mu.Unlock()
 	runtime.WindowHide(w.ctx)
+	runtime.EventsEmit(w.ctx, EventWindowHidden)
 }
 
 // Toggle 切换显示 / 隐藏，返回切换后的状态。

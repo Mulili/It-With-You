@@ -303,8 +303,120 @@ func runStoreContract(t *testing.T, s memory.Store, chunk testChunk) {
 		}
 	})
 
+	t.Run("提过的记忆照样返回，只是带着会话与计数", func(t *testing.T) {
+		const (
+			sessionA = "00000000-0000-0000-0000-0000000000a1"
+			sessionB = "00000000-0000-0000-0000-0000000000b1"
+		)
+		query := makeVec(41, 1)
+		m := save(t, memory.Memory{
+			PersonaID: testPersonaA, Kind: memory.KindFact,
+			Content: testContentPrefix + "会话计数用的那条",
+		}, makeVec(41, 1))
+
+		// ⚠️ 断言"含我那条"而不是"恰好 1 条"：契约测试共用同一个人格，
+		// 库里还有别的子测试写下的数据，而 Search **不做阈值过滤**（阈值是上层的策略）。
+		mine := func(t *testing.T) (memory.MemoryHit, bool) {
+			t.Helper()
+			hits, err := s.Search(testPersonaA, query, 5)
+			if err != nil {
+				t.Fatalf("检索失败: %v", err)
+			}
+			for _, h := range hits {
+				if h.Memory.ID == m.ID {
+					return h, true
+				}
+			}
+			return memory.MemoryHit{}, false
+		}
+
+		if h, ok := mine(t); !ok || h.Memory.RecallCount != 0 {
+			t.Fatalf("未标记前应当搜得到且计数为 0，实际 %+v", h.Memory)
+		}
+
+		// ⚠️ 这个测试的核心：**无论提过几次，它都必须返回**。
+		// 曾经做过"提过太多次就不再返回"，被一个反例推翻了——连着问"草莓 / 芒果 / 菠萝
+		// 喜不喜欢"，第三次起若不再注入，她会"不知道"，然后开始编。
+		// 所以抑制**只改措辞，不决定给不给**（见 memory.Memory.RecallCount）。
+		for i := 1; i <= 3; i++ {
+			if err := s.MarkRecalled([]string{m.ID}, sessionA); err != nil {
+				t.Fatalf("第 %d 次标记失败: %v", i, err)
+			}
+			h, ok := mine(t)
+			if !ok {
+				t.Fatalf("提过 %d 次之后**也必须返回**（丢了她就只能编）", i)
+			}
+			if h.Memory.LastRecalledSession != sessionA || h.Memory.RecallCount != i {
+				t.Errorf("第 %d 次标记后应当是 %s/%d，实际 %s/%d",
+					i, sessionA, i, h.Memory.LastRecalledSession, h.Memory.RecallCount)
+			}
+		}
+
+		// 换一段对话：计数从 1 重新开始（"上次我们聊过…"是期望行为）
+		if err := s.MarkRecalled([]string{m.ID}, sessionB); err != nil {
+			t.Fatalf("换会话标记失败: %v", err)
+		}
+		if h, _ := mine(t); h.Memory.LastRecalledSession != sessionB || h.Memory.RecallCount != 1 {
+			t.Errorf("换会话后计数应当重置为 1，实际 %s/%d",
+				h.Memory.LastRecalledSession, h.Memory.RecallCount)
+		}
+	})
+
+	t.Run("见过的往事照样返回，只是带着会话与计数", func(t *testing.T) {
+		const (
+			sessionA = "00000000-0000-0000-0000-0000000000c3"
+			sessionB = "00000000-0000-0000-0000-0000000000d3"
+		)
+		query := makeVec(22, 1)
+		if err := s.IndexChunk(memory.ChunkIndex{
+			ChunkID: chunk.ChunkID, SessionID: chunk.SessionID, PersonaID: testPersonaA,
+			Summary: testContentPrefix + "主题：会话计数用的往事",
+		}, makeVec(22, 1)); err != nil {
+			t.Fatalf("写片索引失败: %v", err)
+		}
+
+		mine := func(t *testing.T) (memory.ChunkHit, bool) {
+			t.Helper()
+			hits, err := s.SearchChunks(testPersonaA, query, 5)
+			if err != nil {
+				t.Fatalf("检索片索引失败: %v", err)
+			}
+			for _, h := range hits {
+				if h.Chunk.ChunkID == chunk.ChunkID {
+					return h, true
+				}
+			}
+			return memory.ChunkHit{}, false
+		}
+
+		// ⚠️ **本段对话自己的片也照样返回**：它的摘要并不在上下文里（上下文只发当前片），
+		// 丢掉她就会在"你上次说的那件事"面前哑口无言。同理，无论提过几次都不能丢。
+		for i := 1; i <= 3; i++ {
+			if err := s.MarkChunksRecalled([]string{chunk.ChunkID}, sessionA); err != nil {
+				t.Fatalf("第 %d 次标记失败: %v", i, err)
+			}
+			h, ok := mine(t)
+			if !ok {
+				t.Fatalf("提过 %d 次之后**也必须返回**（丢了她就只能编）", i)
+			}
+			if h.Chunk.LastRecalledSession != sessionA || h.Chunk.RecallCount != i {
+				t.Errorf("第 %d 次标记后应当是 %s/%d，实际 %s/%d",
+					i, sessionA, i, h.Chunk.LastRecalledSession, h.Chunk.RecallCount)
+			}
+		}
+
+		// 换一段对话：计数从 1 重新开始
+		if err := s.MarkChunksRecalled([]string{chunk.ChunkID}, sessionB); err != nil {
+			t.Fatalf("换会话标记失败: %v", err)
+		}
+		if h, _ := mine(t); h.Chunk.LastRecalledSession != sessionB || h.Chunk.RecallCount != 1 {
+			t.Errorf("换会话后计数应当重置为 1，实际 %s/%d",
+				h.Chunk.LastRecalledSession, h.Chunk.RecallCount)
+		}
+	})
+
 	t.Run("MarkRecalled 只写下被想起来的那些", func(t *testing.T) {
-		if err := s.MarkRecalled(nil); err != nil {
+		if err := s.MarkRecalled(nil, ""); err != nil {
 			t.Fatalf("空列表不该报错: %v", err)
 		}
 
@@ -317,7 +429,7 @@ func runStoreContract(t *testing.T, s memory.Store, chunk testChunk) {
 			Content: testContentPrefix + "没被想起来的事",
 		}, makeVec(31, 1))
 
-		if err := s.MarkRecalled([]string{recalled.ID}); err != nil {
+		if err := s.MarkRecalled([]string{recalled.ID}, ""); err != nil {
 			t.Fatalf("标记失败: %v", err)
 		}
 

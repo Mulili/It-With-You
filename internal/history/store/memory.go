@@ -6,6 +6,8 @@ import (
 	"sync"
 
 	"agent-for-you-love/internal/history"
+	"agent-for-you-love/internal/pkg/sliceutil"
+	"agent-for-you-love/internal/pkg/timeutil"
 
 	"github.com/google/uuid"
 )
@@ -38,7 +40,7 @@ func (s *MemoryStore) EnsureSession(personaID string) (history.Session, error) {
 		}
 	}
 
-	now := history.NowMillis()
+	now := timeutil.NowMillis()
 	sess := history.Session{
 		ID:        uuid.NewString(),
 		PersonaID: personaID,
@@ -68,13 +70,13 @@ func (s *MemoryStore) EnsureChunk(sessionID string, maxRunes, maxMessages int) (
 		}
 		// 到了就把它收尾，再往下走开新片。这一步发生在**写入下一条用户消息之前**，
 		// 所以片边界落在用户发言处——一个问答对不会被从中间切开。
-		now := history.NowMillis()
+		now := timeutil.NowMillis()
 		s.chunks[i].EndedAt = now
 		s.chunks[i].UpdatedAt = now
 		break
 	}
 
-	now := history.NowMillis()
+	now := timeutil.NowMillis()
 	c := history.Chunk{
 		ID:        uuid.NewString(),
 		SessionID: sessionID,
@@ -127,74 +129,50 @@ func (s *MemoryStore) AppendMessage(m history.Message) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if m.ID == "" {
-		m.ID = uuid.NewString()
-	}
-	if m.CreatedAt == 0 {
-		m.CreatedAt = history.NowMillis()
-	}
-	if m.Status == "" {
-		m.Status = history.StatusOK
-	}
+	m = history.NormalizeMessage(m)
 	s.messages = append(s.messages, m)
 	return m.ID, nil
 }
 
 // ChunkMessages 实现 history.Store。
+//
+// 取的是**尾部** limit 条（最近的）；limit <= 0 表示全部——与 PG 侧口径一致。
 func (s *MemoryStore) ChunkMessages(chunkID string, limit int) ([]history.Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	out := make([]history.Message, 0, 8)
-	for _, m := range s.messages {
-		if m.ChunkID == chunkID {
-			out = append(out, m)
-		}
-	}
-	// 条数兜底与 PG 侧口径一致：取尾部（最近的）；limit <= 0 表示全部
-	if limit > 0 && len(out) > limit {
-		out = out[len(out)-limit:]
-	}
-	return out, nil
+	return sliceutil.FilterTail(s.messages, func(m history.Message) bool {
+		return m.ChunkID == chunkID
+	}, limit), nil
 }
 
 // SessionMessages 实现 history.Store。
 //
-// 与 ChunkMessages 同一套口径（取尾部、limit <= 0 表示全部），只换了筛选列。
+// 与 ChunkMessages 同一套口径，只换了筛选列。
 func (s *MemoryStore) SessionMessages(sessionID string, limit int) ([]history.Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	out := make([]history.Message, 0, 16)
-	for _, m := range s.messages {
-		if m.SessionID == sessionID {
-			out = append(out, m)
-		}
-	}
-	if limit > 0 && len(out) > limit {
-		out = out[len(out)-limit:]
-	}
-	return out, nil
+	return sliceutil.FilterTail(s.messages, func(m history.Message) bool {
+		return m.SessionID == sessionID
+	}, limit), nil
 }
 
 // RecentMessages 实现 history.Store。
 //
 // 返回的是**时间正序**的最近 limit 条：取尾部 limit 条但**不反转**——
 // "取最近的"是筛选条件，"正序"是给前端直接渲染的顺序，两件事别混。
+//
+// 这里靠的是 messages 的**插入顺序就是时间顺序**（只 append，不重排）。
+// 下面 ListSessions / PendingChunks 则要按业务字段排序再取头部，那是另一回事，
+// 所以它们不走 FilterTail——硬合并只会把"要不要排序"变成一个难懂参数。
 func (s *MemoryStore) RecentMessages(personaID string, limit int) ([]history.Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	mine := make([]history.Message, 0, len(s.messages))
-	for _, m := range s.messages {
-		if m.PersonaID == personaID {
-			mine = append(mine, m)
-		}
-	}
-	if limit > 0 && len(mine) > limit {
-		mine = mine[len(mine)-limit:]
-	}
-	return mine, nil
+	return sliceutil.FilterTail(s.messages, func(m history.Message) bool {
+		return m.PersonaID == personaID
+	}, limit), nil
 }
 
 // ListSessions 实现 history.Store。
@@ -239,7 +217,7 @@ func (s *MemoryStore) EndSession(sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := history.NowMillis()
+	now := timeutil.NowMillis()
 	for i := range s.sessions {
 		if s.sessions[i].ID == sessionID && s.sessions[i].EndedAt == 0 {
 			s.sessions[i].EndedAt = now
@@ -303,7 +281,7 @@ func (s *MemoryStore) SetChunkSummary(chunkID, summary string) error {
 	for i := range s.chunks {
 		if s.chunks[i].ID == chunkID {
 			s.chunks[i].Summary = summary
-			s.chunks[i].UpdatedAt = history.NowMillis()
+			s.chunks[i].UpdatedAt = timeutil.NowMillis()
 			return nil
 		}
 	}
@@ -318,7 +296,7 @@ func (s *MemoryStore) SetSessionTitleIfEmpty(sessionID, title string) error {
 	for i := range s.sessions {
 		if s.sessions[i].ID == sessionID && s.sessions[i].Title == "" {
 			s.sessions[i].Title = title
-			s.sessions[i].UpdatedAt = history.NowMillis()
+			s.sessions[i].UpdatedAt = timeutil.NowMillis()
 			return nil
 		}
 	}

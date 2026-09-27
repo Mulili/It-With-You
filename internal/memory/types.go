@@ -11,8 +11,6 @@
 // 但写进哪个字段由本包的接口决定，不给调用方选。
 package memory
 
-import "time"
-
 // 记忆类型。
 //
 // promise 是双向的："用户答应我…"与"我答应过用户…"都算，后者对拟人感更关键
@@ -57,10 +55,27 @@ type Memory struct {
 	// 注意它和 CreatedAt 是两件事：CreatedAt 是"事情什么时候发生的"（事实、永久），
 	// FollowUpAt 是"我该什么时候提它"（调度、问过一次就清零）。
 	FollowUpAt int64 `json:"followUpAt"`
-	// LastRecalledAt 是最近一次被检索注入的时间，用于抑制"反复提同一件事"。
+	// LastRecalledAt 是最近一次被检索注入的时间。
+	//
+	// ⚠️ 抑制"反复提同一件事"**不靠它**，靠下面的 LastRecalledSession：
+	// "隔了多久算久"是个要拍的数，而"同一段对话里提过没有"是确定的事实。
+	// 它留着是因为"什么时候提过"本身有价值（将来做遗忘曲线 / 相关性衰减要用）。
 	LastRecalledAt int64 `json:"lastRecalledAt"`
-	CreatedAt      int64 `json:"createdAt"`
-	UpdatedAt      int64 `json:"updatedAt"`
+	// LastRecalledSession 是最近一次被注入时所在的会话 ID（空串 = 从未注入过）。
+	//
+	// 它让"别反复提同一件事"有了确定的判据：同一段对话里提过就不再提，
+	// 换个新会话仍会提一次——那本来就是期望行为（"上次我们聊过…"）。
+	LastRecalledSession string `json:"lastRecalledSession"`
+	// RecallCount 是在 LastRecalledSession 那段对话里已经被注入过几次。
+	//
+	// 用途只有**分档措辞**：本段对话里没提过的正常注入，提过的降为"只当背景资料"。
+	//
+	// ⚠️ 它**绝不用来丢弃**。曾经做过"提过太多次就不再返回"，被一个反例推翻了：
+	// 连着问"草莓喜不喜欢 / 芒果喜不喜欢 / 菠萝喜不喜欢"，第三次起若不再注入，
+	// 她会**不知道**——然后就开始编（"喜欢吧"）。**编出来的答案比重复提一句有害得多。**
+	RecallCount int   `json:"recallCount"`
+	CreatedAt   int64 `json:"createdAt"`
+	UpdatedAt   int64 `json:"updatedAt"`
 }
 
 // ChunkIndex 是「片索引」：向量库里的一条**指针**，指向 session_chunks 里的一片。
@@ -83,6 +98,14 @@ type ChunkIndex struct {
 	Summary string
 	// CreatedAt 是这条索引建立的时间
 	CreatedAt int64
+	// LastRecalledSession 是最近一次被注入时所在的会话（空串 = 从未注入过）。
+	//
+	// 与 Memory.LastRecalledSession 同一个用途：同一段对话里提过的不再提。
+	// 往事这一侧尤其要紧——一条几天前的片摘要若没有它，会在当前这段对话里被**每一轮**都注入，
+	// 而"排除当前会话的片"挡不住这种情况（那条往事属于别的会话）。
+	LastRecalledSession string
+	// RecallCount 语义同 Memory.RecallCount（在这段对话里已注入几次）。
+	RecallCount int
 }
 
 // SaveResult 说明一次保存的结果，让调用方能如实记日志。
@@ -126,12 +149,19 @@ type Store interface {
 
 	// Search 语义检索该人格**可见**的记忆（公共 + 本人格私有），按相似度倒序，最多 limit 条。
 	//
+	// **不做任何丢弃式过滤**——包括"这段对话里已经提过"的那些：它们照样返回，
+	// 由上层换成弱化措辞再注入（见 Memory.RecallCount）。
+	// 丢掉会让"她不知道"，然后开始编，那比重复提一句有害得多。
+	//
 	// 注意：相似度**相同**的几条之间，相对顺序不保证（PG 对排序键相同的行不保证顺序，
 	// 内存实现则按插入顺序）。真实数据几乎不会撞上完全相同的相似度，
 	// 但测试里构造数据时要留意——与 history 的 created_at 是同一个坑。
 	Search(personaID string, vec []float32, limit int) ([]MemoryHit, error)
 
 	// SearchChunks 语义检索该人格的**片索引**，按相似度倒序，最多 limit 条。
+	//
+	// 与 Search 一样**不做丢弃式过滤**，包括本段对话自己的片：它们的摘要并不在上下文里
+	// （只发当前片），所以她同样需要靠注入才能想起来。提过的那些由上层降级为弱化措辞。
 	//
 	// 命中片索引只是拿到"聊过这件事"的指针与摘要；要更多细节得顺着 ChunkID 回 messages 取原文
 	// （那是宿主自己的事，见 operation.md「命中片之后注入什么」）。
@@ -158,13 +188,22 @@ type Store interface {
 	// 在那之前的任何失败都会让下一轮整体重放，而重放必须能覆盖而不是撞主键。
 	IndexChunk(ci ChunkIndex, vec []float32) error
 
-	// MarkRecalled 把这些记忆标成"刚被注入过"（写 last_recalled_at）。
+	// MarkRecalled 把这些记忆标成"在这段对话里刚被注入过"（写 last_recalled_at
+	// 与 last_recalled_session）。
 	//
-	// 这是"别反复提同一件事"的**唯一依据**——它记录的是**注入**时间，不是"被用到"的时间：
-	// 后者要靠模型自述，得再加一次调用，而注入本身就足以说明"她刚被提醒过这件事"。
+	// 这是"别反复提同一件事"的**唯一依据**——它记录的是**注入**，不是"被用到"：
+	// 后者要靠模型自述、得再加一次调用，而注入本身就足以说明"她刚被提醒过这件事"。
+	//
+	// 记的是**会话**而不是时间戳，理由见 last_recalled_session 的注释（不必拍冷却时长）。
 	//
 	// 找不到的 ID 不该报错：记忆可能刚被用户删掉，而这件事不值得打断一轮对话。
-	MarkRecalled(ids []string) error
+	MarkRecalled(ids []string, sessionID string) error
+
+	// MarkChunksRecalled 把这些往事标成"在这段对话里刚被注入过"，语义同 MarkRecalled。
+	//
+	// 与它分开而不是合并成一个调用：两者操作的是两张表（memories / chunk_index），
+	// 合起来会让"哪个 id 属于哪一边"变成调用方要操心的事。
+	MarkChunksRecalled(chunkIDs []string, sessionID string) error
 
 	// DeletePersona 删除该人格的**私有**记忆。
 	//
@@ -172,5 +211,19 @@ type Store interface {
 	DeletePersona(personaID string) error
 }
 
-// NowMillis 取当前时间（Unix 毫秒，与项目其他部分同一口径）。
-func NowMillis() int64 { return time.Now().UnixMilli() }
+// NormalizeMemory 补全一条记忆的缺省值：创建时间、更新时间、重要性。
+//
+// now 由调用方传入而不是在这里现取：保存路径后面还要用它写别的列（如 follow_up_at），
+// 两处各取一次时钟会得到两个不同的毫秒值。
+//
+// 与 history.NormalizeMessage 同理：这是两种存储实现必须共用的业务规则。
+func NormalizeMemory(m Memory, now int64) Memory {
+	if m.CreatedAt == 0 {
+		m.CreatedAt = now
+	}
+	m.UpdatedAt = now
+	if m.Importance == 0 {
+		m.Importance = DefaultImportance
+	}
+	return m
+}

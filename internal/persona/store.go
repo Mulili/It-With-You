@@ -72,10 +72,19 @@ type Store interface {
 	// ListCandidates 返回该人格的候选（时间倒序，最多 limit 条）。
 	ListCandidates(personaID string, limit int) ([]Candidate, error)
 
-	// DeleteCandidate 删掉一条候选——**采纳与丢弃都走它**（采纳只是先写规则、再删候选）。
+	// DeleteCandidate 删掉一条候选——**提升与删掉都走它**（提升只是先写规则、再删候选）。
 	//
 	// 找不到不报错：界面上的重复点击不该变成一个错误弹窗（与 memory.Store.Delete 同一口径）。
 	DeleteCandidate(id string) error
+
+	// PruneStaleCandidates 删掉"放着很久没动过"的候选，返回删了几条。
+	//
+	// 为什么候选**直接删**而不是像规则那样降层：它只是情调素材——表里连 tier 都没有，
+	// 也不参与检索。她三个月前观察到的一个称呼，留着既不会再用、又会在界面上一直占一行。
+	//
+	// 为什么**只清候选、不动规则**：见 App.pruneStaleCandidates 的说明——
+	// 规则那侧现在没有任何无界增长的来源（单值槽位写入即覆盖，多值槽位靠用户明说或亲手提升）。
+	PruneStaleCandidates(before int64) (int, error)
 
 	ExportFile(id string) (PersonaFile, error)
 	ImportFile(f PersonaFile) (Persona, error)
