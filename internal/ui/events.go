@@ -15,6 +15,12 @@ const (
 	// 用途有二：显式指令写入后的回执（让用户知道"它记住了"）、设置浮层开着时刷新。
 	EventPersonaChanged = "persona:changed"
 
+	// EventContextStat 在**每轮拼完上下文之后**发出，负载是 ui.ContextStat。
+	//
+	// 为什么用事件而不是让前端主动来问：这个数字只有在"刚拼完上下文"那一刻才准
+	// （它就是那一轮真的发出去的东西）。前端每轮问一次等于多一次往返，还可能问到旧值。
+	EventContextStat = "context:stat"
+
 	// EventWindowHidden 在窗口被隐藏时发出。
 	//
 	// 为什么需要它：隐藏可能由**托盘**发起（Go 侧直接调 Hide），而"菜单开没开"的状态在前端。

@@ -34,7 +34,7 @@ const (
 //
 // 0.92 是**故意偏高**的：错并不可逆（两条不同的记忆合成一条，信息就没了），
 // 而重复只是多占一个 Top-3 名额（还能清理）。等有真实数据再校。
-const DefaultDedupThreshold = 0.92
+const DefaultDedupThreshold = 0.85
 
 // Memory 是一条长期记忆。
 type Memory struct {

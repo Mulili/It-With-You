@@ -231,6 +231,36 @@ export namespace persona {
 
 export namespace ui {
 	
+	export class ContextStat {
+	    persona: number;
+	    history: number;
+	    recall: number;
+	    prompt: number;
+	    total: number;
+	    recallFacts: number;
+	    recallChunks: number;
+	    capacity: number;
+	    messages: number;
+	    messageLimit: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new ContextStat(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.persona = source["persona"];
+	        this.history = source["history"];
+	        this.recall = source["recall"];
+	        this.prompt = source["prompt"];
+	        this.total = source["total"];
+	        this.recallFacts = source["recallFacts"];
+	        this.recallChunks = source["recallChunks"];
+	        this.capacity = source["capacity"];
+	        this.messages = source["messages"];
+	        this.messageLimit = source["messageLimit"];
+	    }
+	}
 	export class HistoryItem {
 	    id: string;
 	    role: string;

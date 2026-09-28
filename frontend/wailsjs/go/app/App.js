@@ -10,6 +10,10 @@ export function Cancel() {
   return window['go']['app']['App']['Cancel']();
 }
 
+export function ContextStat() {
+  return window['go']['app']['App']['ContextStat']();
+}
+
 export function CreatePersona(arg1, arg2) {
   return window['go']['app']['App']['CreatePersona'](arg1, arg2);
 }

@@ -5,7 +5,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	"agent-for-you-love/internal/history"
 	historystore "agent-for-you-love/internal/history/store"
 	"agent-for-you-love/internal/llm"
 	"agent-for-you-love/internal/memory"
@@ -167,12 +169,12 @@ func TestSafePrefixLen(t *testing.T) {
 		in   string
 		want int
 	}{
-		{"hello", 5},          // 没标记：全推
-		{"hi[[used:1]]", 2},   // 见到完整标记：只推它之前
-		{"hi[[use", 2},        // 尾巴可能是标记前缀：扣住
-		{"hi[", 2},            // 一个 "[" 也要扣
-		{"hi", 2},             // 与标记无关：全推
-		{"x[[used:2]]yz", 1},  // 标记之后的内容一律不推
+		{"hello", 5},         // 没标记：全推
+		{"hi[[used:1]]", 2},  // 见到完整标记：只推它之前
+		{"hi[[use", 2},       // 尾巴可能是标记前缀：扣住
+		{"hi[", 2},           // 一个 "[" 也要扣
+		{"hi", 2},            // 与标记无关：全推
+		{"x[[used:2]]yz", 1}, // 标记之后的内容一律不推
 	}
 	for _, c := range cases {
 		if got := safePrefixLen(c.in); got != c.want {
@@ -393,7 +395,7 @@ func TestBuildMessagesPutsRecallBeforeLastMessage(t *testing.T) {
 		{Role: llm.RoleAssistant, Content: "第一答"},
 		{Role: llm.RoleUser, Content: "这一轮说的"},
 	}
-	got := app.buildMessages(personaID, msgs, "（回忆块）")
+	got := app.buildMessages(personaID, msgs, recallResult{Text: "（回忆块）"})
 
 	if len(got) != 5 {
 		t.Fatalf("应当是 人格 + 2 条历史 + 回忆 + 最后一条 = 5 条，实际 %d 条：%+v", len(got), got)
@@ -409,8 +411,50 @@ func TestBuildMessagesPutsRecallBeforeLastMessage(t *testing.T) {
 	}
 
 	// 没有回忆时不该多出任何一条消息
-	if plain := app.buildMessages(personaID, msgs, ""); len(plain) != 4 {
+	if plain := app.buildMessages(personaID, msgs, recallResult{}); len(plain) != 4 {
 		t.Errorf("没有回忆时应当只有 4 条，实际 %d 条", len(plain))
+	}
+}
+
+// 顶部状态条的数字必须与**真的发出去的东西**对得上。
+//
+// 这条同时钉住"按字符数、不按字节数"：中文写成字节数会整体大三倍，各段比例就全错了。
+func TestContextStatMatchesWhatWasSent(t *testing.T) {
+	app, _, personaID := newRecallApp(t)
+
+	msgs := []llm.Message{
+		{Role: llm.RoleUser, Content: "第一句"},
+		{Role: llm.RoleAssistant, Content: "第一答"},
+		{Role: llm.RoleUser, Content: "这一轮说的"},
+	}
+	rec := recallResult{Text: "（回忆块）", Facts: 2, Chunks: 1}
+	app.buildMessages(personaID, msgs, rec)
+
+	stat := app.ContextStat()
+	if stat.Persona == 0 {
+		t.Error("人格那一段不该为 0")
+	}
+	// "第一句" + "第一答" = 6 个字符（写成字节数会是 18）
+	if stat.History != 6 {
+		t.Errorf("历史那一段应当是 6 个字符，实际 %d", stat.History)
+	}
+	if stat.Prompt != 5 {
+		t.Errorf("本轮那句话应当是 5 个字符，实际 %d", stat.Prompt)
+	}
+	if stat.Recall != utf8.RuneCountInString(rec.Text) {
+		t.Errorf("回忆那一段应当按字符数算，实际 %d", stat.Recall)
+	}
+	if stat.RecallFacts != 2 || stat.RecallChunks != 1 {
+		t.Errorf("回忆条数应当照抄 recallResult，实际 %d 条事实 / %d 段往事", stat.RecallFacts, stat.RecallChunks)
+	}
+	if stat.Total != stat.Persona+stat.History+stat.Recall+stat.Prompt {
+		t.Errorf("合计应当等于四段之和，实际 %d", stat.Total)
+	}
+	if stat.Capacity != history.ChunkMaxRunes || stat.MessageLimit != history.ContextMessagesLimit {
+		t.Errorf("「满」的参照应当是片的两个上限，实际 %d 字 / %d 条", stat.Capacity, stat.MessageLimit)
+	}
+	if stat.Messages != len(msgs) {
+		t.Errorf("条数应当是 %d，实际 %d", len(msgs), stat.Messages)
 	}
 }
 

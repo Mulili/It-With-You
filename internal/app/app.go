@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"agent-for-you-love/internal/history"
 	"agent-for-you-love/internal/llm"
@@ -97,6 +98,13 @@ type App struct {
 	// 缓存的理由：Ask 每轮都要用它决定带不带 thinking 字段，不该每次都查一遍库；
 	// 而写入口只有 SetThinkingDisabled 一处，所以缓存不会走样。
 	thinkingDisabled bool
+
+	// lastCtxStat 是**最近一轮**的上下文构成（界面顶部那条状态条用）。
+	//
+	// 缓存的理由与 thinkingDisabled 不同：这个值算出来就是给人看的，
+	// 而"算"这件事只有 buildMessages 会做（只有它知道发出去的是什么）。
+	// 存在这里，前端重开窗口时也能立刻拿到上一次的样子，不必重算。
+	lastCtxStat ui.ContextStat
 }
 
 // nextID 返回进程内自增的轮次编号。
@@ -259,7 +267,7 @@ func (a *App) Ask(text string) (string, error) {
 	}
 	// 想在拼上下文之前：它是这一轮里唯一的嵌入调用，跑完才有东西可注入（见 recall）
 	rec := a.recall(personaID, sess.ID, msgs)
-	full := a.buildMessages(personaID, msgs, rec.Text)
+	full := a.buildMessages(personaID, msgs, rec)
 
 	go a.stream(ctx, id, sess.ID, chunk.ID, personaID, full, noThinking, rec)
 	// 顺带看一眼这句话里有没有"长期要求"（粗筛命中才会真的调一次模型）。
@@ -315,14 +323,40 @@ func (a *App) chatJSON(ctx context.Context, system, user string) (string, error)
 //     不再需要"只发最近 N 轮"那种截断。更早的内容要靠记忆召回，而不是一路全带上；
 //   - 预算截断发生在 persona.BuildSystemPrompt 内（超预算先截 recent 层，主体与 core 永不截）；
 //   - recall **不写进历史**，且位置压在末尾（见下面注释）。
-func (a *App) buildMessages(personaID string, msgs []llm.Message, recall string) []llm.Message {
+//
+// 它顺便算出**这一轮的上下文由什么构成**并推给界面（见 ui.ContextStat 与 publishContextStat）：
+// 这件事只有在这里能做对——只有它同时握着人格、历史、回忆这三样。
+// 所以别把这段挪去别处"复用"，那只会算出与真正发出去的东西不一致的假数字。
+func (a *App) buildMessages(personaID string, msgs []llm.Message, rec recallResult) []llm.Message {
+	// 先算不依赖人格的那几段。**一律按字符数**（与 ChunkMaxRunes 同一量纲），
+	// 不能用 len()：那是字节数，一个中文 3 个字节，比例会整体歪掉。
+	stat := ui.ContextStat{
+		Capacity:     history.ChunkMaxRunes,
+		MessageLimit: history.ContextMessagesLimit,
+		Messages:     len(msgs),
+		Recall:       utf8.RuneCountInString(rec.Text),
+		RecallFacts:  rec.Facts,
+		RecallChunks: rec.Chunks,
+	}
+	// msgs 的最后一条就是本轮用户说的话（见 Ask 里"先写库、再读"），单独拆出来——
+	// 用户想分清的是"我这一句"与"之前的历史"，混在一起就看不出来了。
+	for i, m := range msgs {
+		if i == len(msgs)-1 {
+			stat.Prompt = utf8.RuneCountInString(m.Content)
+			continue
+		}
+		stat.History += utf8.RuneCountInString(m.Content)
+	}
+
 	if a.personas == nil {
+		a.publishContextStat(stat)
 		return msgs
 	}
 
 	snap := a.personas.Snapshot()
 	active, ok := findPersona(snap.Personas, personaID)
 	if !ok {
+		a.publishContextStat(stat)
 		return msgs
 	}
 	// 她自己在对话里琢磨出来的倾向。拿不到就当这一轮没有情调——
@@ -336,24 +370,50 @@ func (a *App) buildMessages(personaID string, msgs []llm.Message, recall string)
 	if dropped > 0 {
 		log.Printf("[persona] 「%s」有 %d 条规则或倾向超出注入预算，本轮未注入", active.Name, dropped)
 	}
+	stat.Persona = utf8.RuneCountInString(system)
 
 	out := make([]llm.Message, 0, len(msgs)+2)
 	if strings.TrimSpace(system) != "" {
 		out = append(out, llm.Message{Role: llm.RoleSystem, Content: system})
 	}
-	if recall == "" {
+	if rec.Text == "" {
+		a.publishContextStat(stat)
 		return append(out, msgs...)
 	}
 	if len(msgs) == 0 {
-		return append(out, llm.Message{Role: llm.RoleSystem, Content: recall})
+		a.publishContextStat(stat)
+		return append(out, llm.Message{Role: llm.RoleSystem, Content: rec.Text})
 	}
 
 	// 回忆插在**最后一条消息之前**（那是本轮用户说的话），而不是接在人格提示词后面：
 	// 人格与历史那一段才是"每轮都一样"的前缀，把这条每轮都在变的回忆压到末尾，
 	// 前缀缓存才不会被它打掉（4.7 记过这个坑）。
 	out = append(out, msgs[:len(msgs)-1]...)
-	out = append(out, llm.Message{Role: llm.RoleSystem, Content: recall})
-	return append(out, msgs[len(msgs)-1])
+	out = append(out, llm.Message{Role: llm.RoleSystem, Content: rec.Text})
+	out = append(out, msgs[len(msgs)-1])
+	a.publishContextStat(stat)
+	return out
+}
+
+// publishContextStat 记下这一轮的上下文构成，并推给界面（界面顶部那条状态条）。
+//
+// 两件事一起做、而不是只推事件：前端刚打开（或重开窗口）时它还没在听事件，
+// 得靠 ContextStat() 主动来问一次；两边都从这一个字段取，才不会有"两个真相"。
+func (a *App) publishContextStat(s ui.ContextStat) {
+	s.Total = s.Persona + s.History + s.Recall + s.Prompt
+
+	a.mu.Lock()
+	a.lastCtxStat = s
+	a.mu.Unlock()
+
+	// win 由 Startup 建立，所以它等价于"Wails 运行时和界面都已经起来了"。
+	// 守这一道不是顺手加的：EventsEmit 拿到**不是生命周期给的那个 ctx** 会直接结束进程，
+	// 而测试里正好就是这个样子（ctx 是 context.Background()，win 是 nil）——
+	// 少了这道判断，任何调 buildMessages 的测试都会把整个测试进程带走。
+	if a.win == nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, ui.EventContextStat, s)
 }
 
 // requireStore 统一处理"存储未就绪"。

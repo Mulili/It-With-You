@@ -9,6 +9,7 @@ import {
   SaveRule, DeleteRule, SetRuleEnabled,
   RuleCandidates, PromoteRuleCandidate, DeleteRuleCandidate,
   GetSettings, SetThinkingDisabled, ExportPersonaToFile, ImportPersonaFromFile,
+  ContextStat,
 } from '../wailsjs/go/app/App'
 import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime'
 
@@ -19,6 +20,7 @@ const EVENT_DONE = 'chat:done'
 const EVENT_ERROR = 'chat:error'
 const EVENT_PERSONA_CHANGED = 'persona:changed'
 const EVENT_WINDOW_HIDDEN = 'window:hidden'
+const EVENT_CONTEXT = 'context:stat'
 
 const bubbleText = ref('')
 const draft = ref('')
@@ -49,6 +51,77 @@ const storageReady = ref(true)
 const settings = ref({ thinkingDisabled: false })
 // 导出哪个人格；空串 = 用当前生效的那个
 const exportId = ref('')
+
+// ---------- 上下文占用（窗口顶部那条状态条）----------
+//
+// 为什么要分段：用户真正想分清的是**回忆是"被注进来的"还是"本来就在历史里"**——
+//   - 回忆每轮临时插入、**不进历史**，受检索阈值与降档管（紫色那段是唯一"注进来的"）；
+//   - 历史只要还在这一片里就一直读得到，不受任何阈值影响。
+// 两者的表现完全不同，所以条上必须是两段不同的颜色。
+//
+// 初始值只是一份保守占位（容量口径的真值来自后端，见 internal/history/types.go 的两个上限）：
+// 先把条画出来，免得"还没有数字 → 条子忽隐忽现"地跳。
+const ctxStat = ref({
+  persona: 0, history: 0, recall: 0, prompt: 0, total: 0,
+  recallFacts: 0, recallChunks: 0, capacity: 20000, messages: 0, messageLimit: 500,
+})
+
+// 回忆那一坨里各有几条：字符数一样时，"3 条事实"和"1 段往事"占的地方差很多
+const recallDetail = computed(() => {
+  const s = ctxStat.value
+  const parts = []
+  if (s.recallFacts) parts.push(`${s.recallFacts} 条事实`)
+  if (s.recallChunks) parts.push(`${s.recallChunks} 段往事`)
+  return parts.join(' + ')
+})
+
+// 各段宽度按**占容量的比例**算，而不是"占这一轮上下文的几分之几"——
+// 要看的是"离满还有多远"，所以空着的那截必须留在条上。
+//
+// 同一份数据也拿来渲染条子底下的图例（颜色、名字、字数）：**必须逐色标出**，
+// 只给一个总数的话，就看不出哪截是"注进来的记忆"、哪截是"本来就在历史里的"。
+const ctxSegments = computed(() => {
+  const s = ctxStat.value
+  if (!s.capacity) return []
+  // 片是"到下一条用户消息之前才切"，所以允许略微超出容量；超出时整体压回 100%
+  const scale = s.total > s.capacity ? s.capacity / s.total : 1
+  return [
+    { key: 'persona', label: '人格', n: s.persona, cls: 'ctxseg--persona' },
+    { key: 'history', label: '历史', n: s.history, cls: 'ctxseg--history' },
+    { key: 'recall', label: '回忆', n: s.recall, cls: 'ctxseg--recall' },
+    { key: 'prompt', label: '我这句话', n: s.prompt, cls: 'ctxseg--prompt' },
+  ]
+    .filter((seg) => seg.n > 0)
+    .map((seg) => ({
+      ...seg,
+      pct: ((seg.n * scale) / s.capacity) * 100,
+      // "回忆"要额外说清里面是几条事实、几段往事：字数相同的两坨，内容差得很远
+      title:
+        seg.key === 'recall' && recallDetail.value
+          ? `回忆 ${seg.n} 字（${recallDetail.value}）`
+          : `${seg.label} ${seg.n} 字`,
+    }))
+})
+
+// 条子宽度有限："6.2k" 比 "6200" 好读
+function fmtNum(n) {
+  if (!n) return '0'
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+}
+
+async function loadContextStat() {
+  try {
+    const s = await ContextStat()
+    if (s) ctxStat.value = s
+  } catch (e) {
+    console.error('读取上下文占用失败', e)
+  }
+}
+
+// 每轮拼完上下文时后端推一次——只有那一刻它才知道这一轮真的发出去多少
+function onContextStat(p) {
+  if (p) ctxStat.value = p
+}
 
 async function loadPersona() {
   try {
@@ -693,11 +766,13 @@ onMounted(async () => {
   EventsOn(EVENT_ERROR, onError)
   EventsOn(EVENT_PERSONA_CHANGED, onPersonaChanged)
   EventsOn(EVENT_WINDOW_HIDDEN, onWindowHidden)
+  EventsOn(EVENT_CONTEXT, onContextStat)
 
   // 先把存储状态问出来，再决定说什么。
   // 顺序不能反：数据库没就绪时该立刻进阻断态，而不是等用户点开菜单才知道
   // （那时他已经开始打字了，白写一段话）。
-  await loadPersona()
+  // 上下文占用与存储无关（它只是这一轮发了多少字），所以并行拉、不串在这条链上。
+  await Promise.all([loadPersona(), loadContextStat()])
   if (storageReady.value === false) {
     say('数据库未连接')
     return
@@ -712,6 +787,7 @@ onUnmounted(() => {
   EventsOff(EVENT_ERROR)
   EventsOff(EVENT_PERSONA_CHANGED)
   EventsOff(EVENT_WINDOW_HIDDEN)
+  EventsOff(EVENT_CONTEXT)
   clearTimeout(toastTimer)
 })
 </script>
@@ -730,6 +806,35 @@ onUnmounted(() => {
       <span class="dragbar__title">With-You</span>
       <button class="dragbar__btn" title="隐藏到托盘" @click="onHide()">×</button>
     </header>
+
+    <!-- 上下文占用：**这一轮真正发出去的那一包**（人格 + 当前片历史 + 本轮回忆 + 我这句话）。
+         看两件事：① 离满还有多远（空着的那截）；② 回忆是**注进来的**（紫色）还是本来就在历史里。
+         宽度按占容量的比例，所以它同时是个进度条 -->
+    <div v-if="dbReady" class="ctxbar" title="这一轮真正发给模型的上下文（按字符数）">
+      <div class="ctxbar__track">
+        <span
+          v-for="seg in ctxSegments"
+          :key="seg.key"
+          class="ctxseg"
+          :class="seg.cls"
+          :style="{ width: seg.pct + '%' }"
+          :title="seg.title"
+        ></span>
+      </div>
+
+      <!-- 逐色标注：条上每种颜色是什么、各占多少字。
+           只给一个总数的话，就分不清哪截是"注进来的记忆"、哪截是"本来就在历史里的" -->
+      <p class="ctxbar__key">
+        <span v-for="seg in ctxSegments" :key="seg.key" class="ctxbar__keyitem" :title="seg.title">
+          <i class="ctxbar__dot" :class="seg.cls"></i>{{ seg.label }} {{ fmtNum(seg.n) }}
+        </span>
+      </p>
+
+      <p class="ctxbar__legend">
+        <span>合计 {{ fmtNum(ctxStat.total) }} / {{ fmtNum(ctxStat.capacity) }} 字</span>
+        <span class="ctxbar__right">{{ ctxStat.messages }}/{{ ctxStat.messageLimit }} 条</span>
+      </p>
+    </div>
 
     <main class="stage">
       <!-- 流式期间 duration=0，避免气泡在长回复中途自动收起 -->
@@ -1337,6 +1442,82 @@ onUnmounted(() => {
   color: #33333d;
 }
 
+/* ---------- 上下文占用条 ---------- */
+
+/* 细条 + 一行小字：它只是"看一眼"的东西，不该跟气泡、桌宠抢地方 */
+.ctxbar {
+  padding: 0 2px;
+}
+
+/* 轨道。底色就是"还空着"的那一截——所以这条同时也是个进度条，
+   看的是"离满还有多远"，而不是"这轮内容里各占几分之几" */
+.ctxbar__track {
+  display: flex;
+  height: 10px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: rgba(30, 25, 60, 0.08);
+}
+
+/* 每段至少 2px：按占容量的比例算，只有几个字的那段会不足 1px，
+   看不见就等于没有——而"这一轮你的话占多少"正是要看的东西 */
+.ctxseg {
+  min-width: 2px;
+  height: 100%;
+}
+
+/* 四段四种颜色。**回忆必须是最扎眼的那一种**：
+   它是唯一"被注进来的"（每轮临时插入、不进历史），也是这条存在的理由 */
+.ctxseg--persona { background: #c9c7d6; }
+.ctxseg--history { background: #8ba6e8; }
+.ctxseg--recall  { background: #7c6cf5; }
+.ctxseg--prompt  { background: #63c9a4; }
+
+/* 颜色图例：条子自己不会说话，这一行就是它的说明。
+   只排一行（不换行、放不下就裁）：条子的高度必须是定的，菜单的 top 是按它算的（见 .menu） */
+.ctxbar__key {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 3px 0 0;
+  font-size: 10px;
+  line-height: 1.2;
+  color: #7b7b8b;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.ctxbar__keyitem {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+
+/* 图例里的小色块：颜色由 ctxseg--* 给（与条上那一段同色），
+   于是"这截是什么"不用猜 */
+.ctxbar__dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+}
+
+.ctxbar__legend {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 2px 0 0;
+  font-size: 10px;
+  line-height: 1.2;
+  color: #9a9aa8;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.ctxbar__right {
+  margin-left: auto;
+}
+
 .stage {
   flex: 1;
   display: flex;
@@ -1382,8 +1563,11 @@ onUnmounted(() => {
   transform: translateY(0) scale(0.98);
 }
 
-/* 历史浮层盖住拖拽区以下的全部区域：只读浏览，不需要与桌宠争空间。
-   top 取 44px 是为了让拖拽区（含 ☰ 与 ×）露在外面，随时能收起菜单。 */
+/* 菜单浮层盖住拖拽区以下的全部区域：只读浏览，不需要与桌宠争空间。
+   top 取回 44px —— **菜单要连上下文条一起盖住**：
+   它是覆盖层，压在内容之上才是它该有的样子；之前为了露出那条进度条把 top 让到 95，
+   结果菜单顶上豁开一块、那条还杵在旁边，既不美也说不通（点开菜单时看的不是当前上下文）。
+   条子本身照旧渲染，只是被盖住——这样开关菜单不会让下面的桌宠跳一下。 */
 .menu {
   position: absolute;
   left: 10px;
