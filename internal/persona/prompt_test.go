@@ -18,7 +18,7 @@ func TestBuildSystemPromptBasics(t *testing.T) {
 		{Slot: "verbosity", Value: "归档层不该出现", Tier: TierArchived, Kind: KindVolatile, Enabled: true},
 	}
 
-	got, dropped := BuildSystemPrompt(p, rules, nil)
+	got, dropped, _ := BuildSystemPrompt(p, rules, nil)
 	if dropped != 0 {
 		t.Errorf("远未超预算时不该丢规则，实际丢了 %d 条", dropped)
 	}
@@ -59,7 +59,7 @@ func TestBuildSystemPromptRespectsBudget(t *testing.T) {
 		})
 	}
 
-	got, dropped := BuildSystemPrompt(p, rules, nil)
+	got, dropped, _ := BuildSystemPrompt(p, rules, nil)
 	if dropped == 0 {
 		t.Fatal("明显超预算时应当丢弃 recent 层规则")
 	}
@@ -93,7 +93,7 @@ func TestBuildSystemPromptMood(t *testing.T) {
 		{Slot: "查无此槽", Value: "x", Evidence: "x"},            // 不认识的槽位，也滤掉
 	}
 
-	got, _ := BuildSystemPrompt(p, rules, candidates)
+	got, _, _ := BuildSystemPrompt(p, rules, candidates)
 
 	if !strings.Contains(got, "称呼用户：主人") {
 		t.Errorf("用户明确的基准不该被观察到的顶掉：\n%s", got)
@@ -117,52 +117,92 @@ func TestBuildSystemPromptMood(t *testing.T) {
 	t.Logf("拼装结果：\n%s", got)
 }
 
-// 预算不够时情调先死：规则一条不丢，先砍情调。
+// 情调区有**自己的一笔**预算：人格再长也挤不掉它，它再多也挤不掉规则。
 //
-// 这条顺序是设计的一部分（core 永不截 → recent → 情调），反过来的话，
-// 一段"偶尔用用"的倾向会把用户明确说过的要求挤出上下文。
-func TestBuildSystemPromptMoodDroppedFirst(t *testing.T) {
-	// 主体撑到接近预算，情调才有多余开销可砍
+// 这条钉的是 2026-09-28 的那次修改。改之前两者共用一个 1500，顺序是"情调先牺牲"，
+// 后果是：主体一写长（主体单独能到 1200），情调就整段消失——而"这一轮到底注入了哪些候选"
+// 随之不可知，而那个时间戳正是候选淘汰的计时依据。
+func TestBuildSystemPromptMoodHasOwnBudget(t *testing.T) {
+	// 主体 1000 字：几乎吃满人格那 1500，以前的写法下情调一句都进不来
 	p := Persona{Name: "预算", SeedText: strings.Repeat("主", 1000)}
 	rules := []PersonaRule{
 		{Slot: "catchphrase", Value: "好耶", Tier: TierRecent, Kind: KindVolatile, Enabled: true},
 	}
+	candidates := []Candidate{{Slot: "tone", Value: "别太正经"}}
+
+	got, dropped, injected := BuildSystemPrompt(p, rules, candidates)
+
+	// ① 规则一条不丢
+	if dropped != 0 {
+		t.Errorf("情调区有自己的预算，不该再挤掉规则，实际丢了 %d 条", dropped)
+	}
+	// ② 情调照样进得去
+	if !strings.Contains(got, "语气：别太正经") {
+		t.Errorf("人格写得长不该把情调挤没：\n%s", got)
+	}
+	if len(injected) != 1 || injected[0].Value != "别太正经" {
+		t.Errorf("返回的「真的注入了哪些」不对：%+v", injected)
+	}
+}
+
+// 情调区自己的预算满了 → 只砍情调，且**返回的注入集合与文本逐条对上**。
+//
+// 后一条是给淘汰计时用的：调用方拿它刷新"最后一次被提起"，多了会让没注进去的永不过期，
+// 少了会让正在用的被判过期。所以它必须与真正渲染出来的那部分完全一致。
+func TestBuildSystemPromptMoodBudgetCutsOnlyMood(t *testing.T) {
+	p := Persona{Name: "预算", SeedText: "主体。"}
+	// 五个槽位各塞 200 字，合计远超情调那 500 的预算。
+	// 每条用**不同的字**重复：值必须能区分开，否则"哪条进去了"根本查不出来
 	var candidates []Candidate
-	for _, slot := range []string{"address_user", "tone", "verbosity", "catchphrase", "other"} {
-		candidates = append(candidates, Candidate{Slot: slot, Value: strings.Repeat("情", 200)})
+	for i, slot := range []string{"address_user", "tone", "verbosity", "catchphrase", "other"} {
+		candidates = append(candidates, Candidate{Slot: slot, Value: strings.Repeat(string(rune('一'+i)), 200)})
 	}
 
-	got, dropped := BuildSystemPrompt(p, rules, candidates)
+	text, dropped, injected := BuildSystemPrompt(p, nil, candidates)
 
 	if dropped == 0 {
 		t.Fatal("情调明显装不下时应当被丢弃")
 	}
-	if n := utf8.RuneCountInString(got); n > InjectBudgetRunes {
-		t.Errorf("拼装结果 %d 字，超过预算 %d 字", n, InjectBudgetRunes)
+	if len(injected) == 0 || len(injected) >= len(candidates) {
+		t.Fatalf("应当是「留一部分、砍一部分」，实际留下 %d 条（共 %d 条）", len(injected), len(candidates))
 	}
-	if !strings.Contains(got, "口头禅：好耶") {
-		t.Errorf("recent 层规则不该在情调之前被砍：\n%s", got)
+	injectedSet := make(map[string]bool, len(injected))
+	for _, c := range injected {
+		injectedSet[c.Value] = true
 	}
-	t.Logf("情调被砍 %d 条，最终 %d/%d 字", dropped, utf8.RuneCountInString(got), InjectBudgetRunes)
+	for _, c := range candidates {
+		if inText := strings.Contains(text, c.Value); inText != injectedSet[c.Value] {
+			t.Errorf("注入集合与文本不一致：返回的=%v、文本里=%v（值以 %q 开头）",
+				injectedSet[c.Value], inText, string([]rune(c.Value)[:1]))
+		}
+	}
+	// 两条预算各管各的：情调那 500 用满了，也不该让总长失控
+	if n := utf8.RuneCountInString(text); n > InjectBudgetRunes+MoodBudgetRunes {
+		t.Errorf("拼装结果 %d 字，超过两笔预算之和 %d 字", n, InjectBudgetRunes+MoodBudgetRunes)
+	}
+	t.Logf("情调被砍 %d 条，留下 %d 条，最终 %d 字", dropped, len(injected), utf8.RuneCountInString(text))
 }
 
 func TestBuildSystemPromptEmpty(t *testing.T) {
-	got, dropped := BuildSystemPrompt(Persona{}, nil, nil)
+	got, dropped, injected := BuildSystemPrompt(Persona{}, nil, nil)
 	if strings.TrimSpace(got) != "" {
 		t.Errorf("没有任何人格内容时应返回空串（调用方据此不带 system），实际 %q", got)
 	}
-	if dropped != 0 {
-		t.Errorf("dropped = %d，期望 0", dropped)
+	if dropped != 0 || len(injected) != 0 {
+		t.Errorf("dropped = %d、injected = %d，都期望 0", dropped, len(injected))
 	}
 }
 
 // 只有情调、没有主体与规则时，也得能用：她的"人设"可以全靠种子以外的东西撑着。
 func TestBuildSystemPromptMoodOnly(t *testing.T) {
-	got, dropped := BuildSystemPrompt(Persona{}, nil, []Candidate{{Slot: "tone", Value: "懒懒的"}})
+	got, dropped, injected := BuildSystemPrompt(Persona{}, nil, []Candidate{{Slot: "tone", Value: "懒懒的"}})
 	if dropped != 0 {
 		t.Errorf("dropped = %d，期望 0", dropped)
 	}
 	if !strings.Contains(got, "语气：懒懒的") {
 		t.Errorf("情调应当被注入：%q", got)
+	}
+	if len(injected) != 1 {
+		t.Errorf("应当返回那一条已注入的候选，实际 %+v", injected)
 	}
 }

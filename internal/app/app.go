@@ -366,11 +366,19 @@ func (a *App) buildMessages(personaID string, msgs []llm.Message, rec recallResu
 		log.Printf("[persona] 读取「她学到的」失败，本轮不注入: %v", err)
 		mood = nil
 	}
-	system, dropped := persona.BuildSystemPrompt(active, snap.Rules, mood)
+	system, dropped, injected := persona.BuildSystemPrompt(active, snap.Rules, mood)
 	if dropped > 0 {
 		log.Printf("[persona] 「%s」有 %d 条规则或倾向超出注入预算，本轮未注入", active.Name, dropped)
 	}
 	stat.Persona = utf8.RuneCountInString(system)
+
+	// 刷新「她学到的」的"最后一次被提起"（见 persona.Candidate.LastUsedAt）。
+	//
+	// 用 BuildSystemPrompt 返回的**那一份**（真的进了情调区的候选），而不是候选全集：
+	// 被同槽位新观察顶掉的、以及被情调预算挤掉的，都**不该**算作"提起过"——
+	// 否则它们的时钟一直在走，就永远不会过期。情调区有自己的预算之后，
+	// 这个集合是精确的（它不再与人格规则抢同一笔钱，见 MoodBudgetRunes）。
+	a.touchCandidates(injected)
 
 	out := make([]llm.Message, 0, len(msgs)+2)
 	if strings.TrimSpace(system) != "" {

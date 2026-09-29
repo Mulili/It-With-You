@@ -319,9 +319,7 @@ func (s *MemoryStore) AddCandidates(cs []persona.Candidate) error {
 		if c.ID == "" {
 			c.ID = uuid.NewString()
 		}
-		if c.CreatedAt == 0 {
-			c.CreatedAt = s.now()
-		}
+		c = persona.NormalizeCandidate(c, s.now())
 		s.candidates = append(s.candidates, c)
 	}
 	return nil
@@ -373,24 +371,82 @@ func (s *MemoryStore) DeleteCandidate(id string) error {
 	return nil // 找不到就是已经处理过了（提升与删掉都会删它）
 }
 
-// PruneStaleCandidates 实现 Store。
-//
-// 重新分配一个切片而不是原地 `[:0]` 压缩：后者会覆写底层数组，
-// 而 ListCandidates 是把它交给调用方的（虽然目前返回的是副本，但这层耦合不值得留着）。
-func (s *MemoryStore) PruneStaleCandidates(before int64) (int, error) {
+// TouchCandidates 实现 Store。
+func (s *MemoryStore) TouchCandidates(ids []string, at int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	kept := make([]persona.Candidate, 0, len(s.candidates))
+	// 找不到的 ID 直接跳过（可能刚被删或刚被提升），不报错——见接口上的说明
+	for _, id := range ids {
+		for i := range s.candidates {
+			if s.candidates[i].ID == id {
+				s.candidates[i].LastUsedAt = at
+				break
+			}
+		}
+	}
+	return nil
+}
+
+// PruneStaleCandidates 实现 Store。
+//
+// 两步：先挑出过期的，再**按人格**只给每组留最新的 keep 条——超出的才是要删的。
+// 于是"缓冲队列没满"就等于什么都不删（这正是它作为"最后机会"的意义）。
+//
+// 重新分配一个切片而不是原地 `[:0]` 压缩：后者会覆写底层数组，
+// 而 ListCandidates 是把它交给调用方的（虽然目前返回的是副本，但这层耦合不值得留着）。
+func (s *MemoryStore) PruneStaleCandidates(before int64, keep int) ([]persona.Candidate, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 按人格分组收集过期的。分组是必须的：队列是**每人格**的缓冲区，
+	// 全局只看总数的话，一个话痨人格会把别人格的候选挤掉
+	stale := map[string][]persona.Candidate{}
 	for _, c := range s.candidates {
-		if c.CreatedAt < before {
+		if c.LastUsedAt < before {
+			stale[c.PersonaID] = append(stale[c.PersonaID], c)
+		}
+	}
+
+	if keep < 0 {
+		keep = 0
+	}
+	doomed := make(map[string]bool)
+	for _, group := range stale {
+		// 排序键与 PG 侧的窗口函数逐字对齐（last_used_at DESC, created_at DESC, slot, value）：
+		// 两边一旦不同，"开发用内存、用户用 PG"就会删掉不同的条目
+		sort.SliceStable(group, func(i, j int) bool {
+			a, b := group[i], group[j]
+			if a.LastUsedAt != b.LastUsedAt {
+				return a.LastUsedAt > b.LastUsedAt
+			}
+			if a.CreatedAt != b.CreatedAt {
+				return a.CreatedAt > b.CreatedAt
+			}
+			if a.Slot != b.Slot {
+				return a.Slot < b.Slot
+			}
+			return a.Value < b.Value
+		})
+		for i := keep; i < len(group); i++ {
+			doomed[group[i].ID] = true
+		}
+	}
+
+	kept := make([]persona.Candidate, 0, len(s.candidates))
+	deleted := make([]persona.Candidate, 0, len(doomed))
+	for _, c := range s.candidates {
+		if doomed[c.ID] {
+			deleted = append(deleted, c)
 			continue
 		}
 		kept = append(kept, c)
 	}
-	n := len(s.candidates) - len(kept)
 	s.candidates = kept
-	return n, nil
+	return deleted, nil
 }
 
 // SaveRule 新增或更新一条规则（ID 为空即新增），返回规则 ID。

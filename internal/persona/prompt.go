@@ -22,14 +22,18 @@ const (
 
 // BuildSystemPrompt 把「人格主体 + 规则 + 她学到的情调」拼成注入用的 system 文本。
 //
-// 返回的第二个值是被预算丢掉的条数（>0 时调用方应当记一条日志：说明这人太长、需要瘦身）。
+// 返回值：文本、被预算丢掉的条数（规则 + 倾向合起来计数，>0 时调用方应当记一条日志）、
+// 以及**真的进了情调区的那些候选**。
+//
+// 第三个值是给"最后一次被提起"用的（见 Candidate.LastUsedAt）：候选淘汰按它计时，
+// 所以调用方必须拿到**精确的**那一份——用"候选全集"去刷新会把没进提示词的也标成用过了。
 //
 // 拼装顺序与预算规则（见 operation.md「注入规则」）：
 //  1. 主体与 core 层永不参与截断——它们承载身份与底线，丢了人格就崩了；
 //  2. recent 层按注入顺序逐个补，总长超过 InjectBudgetRunes 就**从那里开始停**
 //     （截断取前缀，不做"跳过大的留小的"，否则规则取舍会变得不可预测）；
-//  3. 情调区（candidates）排在最后，预算不够时它是**第一个被牺牲的**——
-//     它本来就是"偶尔用用"，少注入几条不影响她是谁；
+//  3. 情调区（candidates）排在最后，用它**自己的一笔预算** MoodBudgetRunes：
+//     两笔钱分开之后，人格写得再长也挤不掉情调，情调再多也挤不掉用户明确说过的要求；
 //  4. archived 层与停用的规则一律不注入。
 //
 // 为什么要分「recent 层」与「情调区」两段，而不是把情调也写成规则：
@@ -38,7 +42,7 @@ const (
 // 所以措辞不同（【最近用户希望你】vs【偶尔可以这样】），存储也分离——
 // 关键是不能落进 persona_rules 的单值槽位（那里再写入即覆盖，会把她观察到的称呼
 // 静默顶掉用户的基准称呼，连 core 层位置一起占走）。
-func BuildSystemPrompt(p Persona, rules []PersonaRule, candidates []Candidate) (string, int) {
+func BuildSystemPrompt(p Persona, rules []PersonaRule, candidates []Candidate) (string, int, []Candidate) {
 	sorted := append([]PersonaRule(nil), rules...)
 	SortRules(sorted)
 
@@ -100,19 +104,23 @@ func BuildSystemPrompt(p Persona, rules []PersonaRule, candidates []Candidate) (
 	// 这一段的措辞承载着整条设计：它没有配套的生效开关，"只是偶尔用一下"这件事
 	// 完全靠 moodNote 传达给模型。所以那行限定不能省，也不能简写——
 	// 少了它，模型会把"偶尔可以叫老板"当成"应该叫老板"，那就退化成了一条没经过允许的规则。
+	//
+	// 预算**自成一笔**（MoodBudgetRunes）：这样它不跟规则抢，人格写得再长也不会把它整段挤掉
+	// （挤掉的那点内容事小，"这一轮注入了哪些候选"变得不可知事大——淘汰计时靠它）。
 	mood := moodCandidates(candidates)
 	keptMood := make([]Candidate, 0, len(mood))
+	usedMood := 0
 	if len(mood) > 0 {
 		// 同 recent：标题与限定语先预扣
-		used += utf8.RuneCountInString(moodHead) + utf8.RuneCountInString(moodNote)
+		usedMood += utf8.RuneCountInString(moodHead) + utf8.RuneCountInString(moodNote)
 	}
 	for i, c := range mood {
 		cost := candidateCost(c)
-		if used+cost > InjectBudgetRunes {
+		if usedMood+cost > MoodBudgetRunes {
 			dropped += len(mood) - i
 			break
 		}
-		used += cost
+		usedMood += cost
 		keptMood = append(keptMood, c)
 	}
 	if text := renderMood(keptMood); text != "" {
@@ -121,15 +129,18 @@ func BuildSystemPrompt(p Persona, rules []PersonaRule, candidates []Candidate) (
 		b.WriteString(text)
 	}
 
-	return strings.TrimRight(b.String(), "\n"), dropped
+	return strings.TrimRight(b.String(), "\n"), dropped, keptMood
 }
 
-// moodCandidates 从候选里挑出真正能注入的那些，**每个槽位最多留一条**（最新的那条）。
+// moodCandidates 从候选里挑出**够格注入**的那些，**每个槽位最多留一条**（最新的那条）。
 //
 // 只留最新的理由：同时给她"老板；老大；掌柜"三个备选称呼，她会轮着叫，反而不像人。
 // 人换称呼是一阵一阵的，记住最近那一阵就够——更早的那些留在候选区里，界面看得见。
 //
 // candidates 按时间倒序（ListCandidates 的契约），所以"第一次见到某槽位"就是最新的那条。
+//
+// 注意它只是"够格"：真正进没进提示词还看预算，那个结果由 BuildSystemPrompt 返回
+// （调用方要拿它刷新候选的"最后一次被提起"，见 Candidate.LastUsedAt）。
 func moodCandidates(candidates []Candidate) []Candidate {
 	seen := make(map[string]struct{}, len(candidates))
 	out := make([]Candidate, 0, len(candidates))

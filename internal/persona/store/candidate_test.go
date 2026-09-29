@@ -138,7 +138,7 @@ func runCandidateContract(t *testing.T, s persona.Store) {
 		}
 	})
 
-	t.Run("PruneStaleCandidates 只清过期的，且不碰规则", func(t *testing.T) {
+	t.Run("PruneStaleCandidates：缓冲队列没满就一条都不删，且不碰规则", func(t *testing.T) {
 		pid := newPersona(t)
 		// 用"1970 年"这种极端时间戳，before 也取极小值：契约测试连的是**真实库**，
 		// 只要两头的量级都远离当下，就不可能误伤库里任何真实数据
@@ -156,20 +156,22 @@ func runCandidateContract(t *testing.T, s persona.Store) {
 			t.Fatalf("写规则失败: %v", err)
 		}
 
-		n, err := s.PruneStaleCandidates(1000)
+		// keep=50：过期的只有 1 条，远没堆满缓冲 → 什么都不删。
+		// 这一条是"缓冲区"的核心：过期只是**进队资格**，不是判决
+		gone, err := s.PruneStaleCandidates(1000, 50)
 		if err != nil {
 			t.Fatalf("清理失败: %v", err)
 		}
-		if n != 1 {
-			t.Errorf("应当只清掉那条 1970 年的候选，实际 %d 条", n)
+		if len(gone) != 0 {
+			t.Errorf("缓冲队列没满时不该删任何东西，实际删了 %d 条：%+v", len(gone), gone)
 		}
 
 		left, err := s.ListCandidates(pid, 10)
 		if err != nil {
 			t.Fatalf("列候选失败: %v", err)
 		}
-		if len(left) != 1 || left[0].Value != "别太正经" {
-			t.Errorf("留下的应当是那条没超窗的，实际 %+v", left)
+		if len(left) != 2 {
+			t.Errorf("两条都该还在（一条过期但队没满、一条没过期），实际 %d 条", len(left))
 		}
 
 		// 规则一条都不能少：懒归档**只清候选**。规则那侧没有无界增长的来源
@@ -182,14 +184,105 @@ func runCandidateContract(t *testing.T, s persona.Store) {
 		if len(rules) != 1 {
 			t.Errorf("清理候选不该动到规则，实际规则数 %d", len(rules))
 		}
+	})
 
-		// 再跑一次：已经没有可清的了（不该反复"清掉"同一条）
-		n, err = s.PruneStaleCandidates(1000)
+	t.Run("PruneStaleCandidates：队列满了只删最久没被提起的那些", func(t *testing.T) {
+		pid := newPersona(t)
+		// 造 keep+2 条过期候选，最后提起时间依次递增 → 该删的是最早的那两条。
+		// 同一个槽位放三条是刻意的：多值槽位（口头禅）本来就该攒好几条
+		if err := s.AddCandidates([]persona.Candidate{
+			{PersonaID: pid, Slot: "catchphrase", Value: "最早", CreatedAt: 100, LastUsedAt: 100},
+			{PersonaID: pid, Slot: "catchphrase", Value: "第二早", CreatedAt: 200, LastUsedAt: 200},
+			{PersonaID: pid, Slot: "catchphrase", Value: "较新", CreatedAt: 300, LastUsedAt: 300},
+			{PersonaID: pid, Slot: "tone", Value: "最新", CreatedAt: 400, LastUsedAt: 400},
+		}); err != nil {
+			t.Fatalf("写候选失败: %v", err)
+		}
+
+		gone, err := s.PruneStaleCandidates(1000, 2)
 		if err != nil {
 			t.Fatalf("清理失败: %v", err)
 		}
-		if n != 0 {
-			t.Errorf("第二次清理应当清 0 条，实际 %d 条", n)
+		if len(gone) != 2 {
+			t.Fatalf("留 2 条、共 4 条过期，应当删 2 条，实际 %d 条：%+v", len(gone), gone)
+		}
+		// 返回的必须是**真删掉的那些**：调用方要直接拿它写 `[archive]` 日志
+		for _, c := range gone {
+			if c.Value != "最早" && c.Value != "第二早" {
+				t.Errorf("删错了：%q（该删最久没被提起的两条）", c.Value)
+			}
+		}
+
+		left, err := s.ListCandidates(pid, 10)
+		if err != nil {
+			t.Fatalf("列候选失败: %v", err)
+		}
+		if len(left) != 2 {
+			t.Fatalf("应当留下 2 条，实际 %d 条：%+v", len(left), left)
+		}
+		for _, c := range left {
+			if c.Value != "较新" && c.Value != "最新" {
+				t.Errorf("留下的是错的：%q（该留被提起得最晚的两条）", c.Value)
+			}
+		}
+
+		// 再跑一次：队列已经只剩 2 条（正好等于 keep），不该再删
+		gone, err = s.PruneStaleCandidates(1000, 2)
+		if err != nil {
+			t.Fatalf("清理失败: %v", err)
+		}
+		if len(gone) != 0 {
+			t.Errorf("第二次清理应当清 0 条，实际 %d 条", len(gone))
+		}
+	})
+
+	t.Run("TouchCandidates 刷新最后提起时间，删过的 ID 不报错", func(t *testing.T) {
+		pid := newPersona(t)
+		if err := s.AddCandidates([]persona.Candidate{
+			{PersonaID: pid, Slot: "address_user", Value: "老板", CreatedAt: 1, LastUsedAt: 1},
+		}); err != nil {
+			t.Fatalf("写候选失败: %v", err)
+		}
+		all, err := s.ListCandidates(pid, 10)
+		if err != nil || len(all) != 1 {
+			t.Fatalf("列候选失败或条数不对: %v %+v", err, all)
+		}
+		if all[0].LastUsedAt != 1 {
+			t.Fatalf("准备数据不对：LastUsedAt 应当是 1，实际 %d", all[0].LastUsedAt)
+		}
+
+		// 写库时 LastUsedAt 缺省会取 CreatedAt（不是 0）——0 会让它在第一次清理时
+		// 就被当成"1970 年就没再用过"，那是升级时最容易踩的坑
+		if all[0].CreatedAt != 1 {
+			t.Errorf("缺省时间戳不对：%+v", all[0])
+		}
+
+		if err := s.TouchCandidates([]string{all[0].ID}, 9999); err != nil {
+			t.Fatalf("刷新失败: %v", err)
+		}
+		after, err := s.ListCandidates(pid, 10)
+		if err != nil {
+			t.Fatalf("列候选失败: %v", err)
+		}
+		if after[0].LastUsedAt != 9999 {
+			t.Errorf("最后提起时间应当被刷成 9999，实际 %d", after[0].LastUsedAt)
+		}
+		if after[0].CreatedAt != 1 {
+			t.Errorf("刷新不该动 CreatedAt，实际 %d", after[0].CreatedAt)
+		}
+
+		// 刷新过的这条不该再被当成过期（before=5000 时它还在窗口内）
+		gone, err := s.PruneStaleCandidates(5000, 0)
+		if err != nil {
+			t.Fatalf("清理失败: %v", err)
+		}
+		if len(gone) != 0 {
+			t.Errorf("刚刷新过的不该被清掉，实际 %+v", gone)
+		}
+
+		// 找不到的 ID（刚被删或刚被提升）不该报错
+		if err := s.TouchCandidates([]string{"00000000-0000-0000-0000-000000000000"}, 1); err != nil {
+			t.Errorf("刷新不存在的候选不该报错: %v", err)
 		}
 	})
 }

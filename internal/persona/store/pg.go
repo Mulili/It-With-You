@@ -380,21 +380,17 @@ func (s *PgStore) AddCandidates(cs []persona.Candidate) error {
 	now := time.Now().UnixMilli()
 	return s.inTx(ctx, func(tx pgx.Tx) error {
 		for _, c := range cs {
-			id := c.ID
-			if id == "" {
-				id = uuid.NewString()
+			if c.ID == "" {
+				c.ID = uuid.NewString()
 			}
-			created := c.CreatedAt
-			if created == 0 {
-				created = now
-			}
+			c = persona.NormalizeCandidate(c, now)
 			// DO NOTHING 而不是 DO UPDATE：同一件事被反复抽到时，先出现的那条（带它当时的原话）
 			// 更值得留；而且这样它对重放是幂等的（结算失败重放会把这批再写一遍）。
 			if _, err := tx.Exec(ctx, `
-				INSERT INTO persona_rule_candidates (id, persona_id, slot, value, evidence, created_at)
-				VALUES ($1, $2, $3, $4, $5, $6)
+				INSERT INTO persona_rule_candidates (id, persona_id, slot, value, evidence, created_at, last_used_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7)
 				ON CONFLICT (persona_id, slot, value) DO NOTHING`,
-				id, c.PersonaID, c.Slot, c.Value, c.Evidence, created); err != nil {
+				c.ID, c.PersonaID, c.Slot, c.Value, c.Evidence, c.CreatedAt, c.LastUsedAt); err != nil {
 				return fmt.Errorf("写入规则候选失败: %w", err)
 			}
 		}
@@ -408,7 +404,7 @@ func (s *PgStore) ListCandidates(personaID string, limit int) ([]persona.Candida
 	defer cancel()
 
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, persona_id, slot, value, evidence, created_at
+		SELECT id, persona_id, slot, value, evidence, created_at, last_used_at
 		FROM persona_rule_candidates
 		WHERE persona_id = $1::uuid
 		ORDER BY created_at DESC
@@ -421,7 +417,8 @@ func (s *PgStore) ListCandidates(personaID string, limit int) ([]persona.Candida
 	out := make([]persona.Candidate, 0, 8)
 	for rows.Next() {
 		var c persona.Candidate
-		if err := rows.Scan(&c.ID, &c.PersonaID, &c.Slot, &c.Value, &c.Evidence, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.PersonaID, &c.Slot, &c.Value, &c.Evidence,
+			&c.CreatedAt, &c.LastUsedAt); err != nil {
 			return nil, fmt.Errorf("解析规则候选失败: %w", err)
 		}
 		out = append(out, c)
@@ -445,20 +442,70 @@ func (s *PgStore) DeleteCandidate(id string) error {
 	return nil
 }
 
-// PruneStaleCandidates 实现 Store。
-//
-// 一条 DELETE 就够，不需要事务：这里没有配套的日志要写——候选表本来就没有变更记录
-// （它不是"用户的东西"，删掉无痕可留）。
-func (s *PgStore) PruneStaleCandidates(before int64) (int, error) {
+// TouchCandidates 实现 Store。
+func (s *PgStore) TouchCandidates(ids []string, at int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
 	ctx, cancel := s.ctx()
 	defer cancel()
 
-	tag, err := s.pool.Exec(ctx,
-		`DELETE FROM persona_rule_candidates WHERE created_at < $1`, before)
-	if err != nil {
-		return 0, fmt.Errorf("清理过期候选失败: %w", err)
+	// 逐条 UPDATE，而不是 ANY($1::uuid[])：理由与 memory.MarkRecalled 一样——
+	// []string 编码成 uuid[] 要靠 pgx 的类型推断，传错只在运行时炸；而这里最多几条
+	for _, id := range ids {
+		// 影响 0 行不报错：候选可能刚被用户删掉或提升（见接口上的说明）
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE persona_rule_candidates SET last_used_at = $2 WHERE id = $1::uuid`,
+			id, at); err != nil {
+			return fmt.Errorf("刷新规则候选的最后提起时间失败: %w", err)
+		}
 	}
-	return int(tag.RowsAffected()), nil
+	return nil
+}
+
+// PruneStaleCandidates 实现 Store。
+//
+// 不让 Go 侧"先查再删"：那要两次往返，而且两条查询的条件容易走样。这里一句 SQL 说清规则，
+// 并用 RETURNING 把删掉的带回来（调用方要拿它写 `[archive]` 日志）。
+//
+// 窗口函数那段是"每人格只留最后提起时间最新的 keep 条"：
+// rn > keep 的就是该组里最老的那些。排序键与内存实现逐字对齐。
+func (s *PgStore) PruneStaleCandidates(before int64, keep int) ([]persona.Candidate, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	rows, err := s.pool.Query(ctx, `
+		DELETE FROM persona_rule_candidates
+		 WHERE id IN (
+		   SELECT id FROM (
+		     SELECT id,
+		            row_number() OVER (PARTITION BY persona_id
+		                               ORDER BY last_used_at DESC, created_at DESC, slot, value) AS rn
+		       FROM persona_rule_candidates
+		      WHERE last_used_at < $1
+		   ) ranked
+		   WHERE ranked.rn > $2
+		 )
+		RETURNING id, persona_id, slot, value, evidence, created_at, last_used_at`,
+		before, keep)
+	if err != nil {
+		return nil, fmt.Errorf("清理过期候选失败: %w", err)
+	}
+	defer rows.Close()
+
+	var out []persona.Candidate
+	for rows.Next() {
+		var c persona.Candidate
+		if err := rows.Scan(&c.ID, &c.PersonaID, &c.Slot, &c.Value, &c.Evidence,
+			&c.CreatedAt, &c.LastUsedAt); err != nil {
+			return nil, fmt.Errorf("解析被清理的候选失败: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历被清理的候选失败: %w", err)
+	}
+	return out, nil
 }
 
 // SaveRule 新增或更新一条规则（ID 为空即新增），返回规则 ID。

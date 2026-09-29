@@ -296,7 +296,7 @@ async function switchPersona(p) {
 
 const slots = ref([])          // 规范槽位清单，由后端 SlotSpecs() 提供
 // 各字段的字数上限。先给一份保守默认值，取到真值前按钮也能用（后端仍会兜底校验）
-const limits = ref({ seedTextRunes: 1200, ruleValueRunes: 200, injectBudgetRunes: 1500 })
+const limits = ref({ seedTextRunes: 1200, ruleValueRunes: 200, injectBudgetRunes: 1500, moodBudgetRunes: 500 })
 const detailId = ref('')       // 空 = 列表视图；否则为正在查看的人格 ID
 const detailRules = ref([])    // 详情页里那个人格的规则
 const detailChanges = ref([])  // 详情页里那个人格的最近变更（时间倒序）
@@ -347,6 +347,7 @@ async function loadMeta() {
       seedTextRunes: m?.seedTextRunes ?? 1200,
       ruleValueRunes: m?.ruleValueRunes ?? 200,
       injectBudgetRunes: m?.injectBudgetRunes ?? 1500,
+      moodBudgetRunes: m?.moodBudgetRunes ?? 500,
     }
   } catch (e) {
     console.error('读取元信息失败', e)
@@ -669,6 +670,16 @@ function fmtTime(at) {
   return d.toDateString() === new Date().toDateString()
     ? hm
     : `${d.getMonth() + 1}-${d.getDate()} ${hm}`
+}
+
+// 「她学到的」要看的是"多久没被提起了"（超过阈值就进淘汰缓冲），
+// 所以那里给的是相对天数——绝对时刻要自己去做减法，反而看不出紧迫感
+function fmtAgo(at) {
+  if (!at) return '还没被提起过'
+  const days = Math.floor((Date.now() - at) / 86400000)
+  if (days <= 0) return '今天'
+  if (days === 1) return '昨天'
+  return `${days} 天前`
 }
 
 function say(text) {
@@ -1070,6 +1081,9 @@ onUnmounted(() => {
                     <p class="rule__value">{{ c.value }}</p>
                     <!-- 原话是她"从哪句听出来的"：用户要不要让她一直这样，看的就是这个 -->
                     <p v-if="c.evidence" class="cand__quote">「{{ c.evidence }}」</p>
+                    <!-- 最后一次被注入进她提示词的时间：淘汰按它算（太久没被提起就进缓冲队列），
+                         摆出来才看得见"哪条快要被清掉了" -->
+                    <p class="cand__quote">最后提起：{{ fmtAgo(c.lastUsedAt) }}</p>
                   </div>
                   <div class="rule__acts">
                     <button class="iconbtn" title="让她以后一直这样" @click="promoteCandidate(c)">
@@ -1092,6 +1106,7 @@ onUnmounted(() => {
             </p>
             <p v-else class="pane__note">
               注入有 {{ limits.injectBudgetRunes }} 字预算：超预算先截「近期」层，主体与核心层不截。
+              「她学到的」另有 {{ limits.moodBudgetRunes }} 字（它不跟规则抢这笔钱）。
             </p>
             <ul v-if="detailRules.length" class="rules">
               <li

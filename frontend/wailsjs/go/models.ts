@@ -24,6 +24,7 @@ export namespace persona {
 	    value: string;
 	    evidence: string;
 	    createdAt: number;
+	    lastUsedAt: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new Candidate(source);
@@ -37,6 +38,7 @@ export namespace persona {
 	        this.value = source["value"];
 	        this.evidence = source["evidence"];
 	        this.createdAt = source["createdAt"];
+	        this.lastUsedAt = source["lastUsedAt"];
 	    }
 	}
 	export class SlotSpec {
@@ -66,6 +68,7 @@ export namespace persona {
 	    seedTextRunes: number;
 	    ruleValueRunes: number;
 	    injectBudgetRunes: number;
+	    moodBudgetRunes: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new Meta(source);
@@ -77,6 +80,7 @@ export namespace persona {
 	        this.seedTextRunes = source["seedTextRunes"];
 	        this.ruleValueRunes = source["ruleValueRunes"];
 	        this.injectBudgetRunes = source["injectBudgetRunes"];
+	        this.moodBudgetRunes = source["moodBudgetRunes"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

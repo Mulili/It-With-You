@@ -83,6 +83,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS persona_rule_candidates_uniq_idx
 CREATE INDEX IF NOT EXISTS persona_rule_candidates_persona_idx
     ON persona_rule_candidates (persona_id, created_at DESC);
 
+-- v4 → v6：加"最后一次被**注入**"的时间。
+--
+-- 淘汰按它算，不再按 created_at：旧规则会把"她天天在用的说法"也删掉，
+-- 只要那条观察抽出来够久（见 persona.Candidate.LastUsedAt 的说明）。
+ALTER TABLE persona_rule_candidates
+    ADD COLUMN IF NOT EXISTS last_used_at bigint NOT NULL DEFAULT 0;
+
+-- 老行没有这个值，用创建时间兜底。**必须回填成具体时刻，不能留 0**：
+-- 淘汰判据是 `last_used_at < now − 窗口`，0 会让所有老候选当场算成"1970 年就没再用过"，
+-- 于是升级后的第一次清理就把它们整批删光。
+-- 幂等：只碰还是 0 的行，重启再跑一遍无事发生。
+UPDATE persona_rule_candidates SET last_used_at = created_at WHERE last_used_at = 0;
+
+-- 清理是"按最后提起时间排序、每人格留最新的一批"，给它一条配套索引
+CREATE INDEX IF NOT EXISTS persona_rule_candidates_lru_idx
+    ON persona_rule_candidates (persona_id, last_used_at DESC);
+
 -- ---------- 阶段4：会话 ----------
 --
 -- 会话是历史的组织单位：历史落库后按会话分组，而"只发当前会话的消息"天然给出了

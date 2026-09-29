@@ -2,6 +2,7 @@ package app
 
 import (
 	"testing"
+	"time"
 
 	"agent-for-you-love/internal/history"
 	historystore "agent-for-you-love/internal/history/store"
@@ -154,6 +155,52 @@ func TestSaveSeedTextTargetsGivenPersona(t *testing.T) {
 	}
 	if err := app.SaveSeedText("builtin:a", "试着改内置"); err == nil {
 		t.Fatal("内置人格应当只读")
+	}
+}
+
+// 「她学到的」的"最后一次被提起"是**注入即算**——刷新点在拼上下文那一轮。
+//
+// 两条断言各钉一件事：
+//   - 进了提示词的那些会被刷成"刚刚"：淘汰（30 天没被提起 → 进缓冲队列）看的就是它，
+//     不刷新的话，一条她天天在用的说法会凭空过期；
+//   - 刚刷过的不会再写一次（节流）：判据是 30 天，每轮都写纯属白花。
+func TestBuildMessagesTouchesInjectedCandidates(t *testing.T) {
+	app, st, _ := newPersonaApp(t)
+
+	id, err := st.CreatePersona("最后提起测试", "")
+	if err != nil {
+		t.Fatalf("新建人格失败: %v", err)
+	}
+	old := time.Now().Add(-48 * time.Hour).UnixMilli()
+	fresh := time.Now().UnixMilli()
+	if err := st.AddCandidates([]persona.Candidate{
+		{PersonaID: id, Slot: "verbosity", Value: "说话简短一点", CreatedAt: old, LastUsedAt: old},
+		{PersonaID: id, Slot: "catchphrase", Value: "好耶", CreatedAt: fresh, LastUsedAt: fresh},
+	}); err != nil {
+		t.Fatalf("准备候选失败: %v", err)
+	}
+
+	app.buildMessages(id, []llm.Message{{Role: llm.RoleUser, Content: "在吗"}}, recallResult{})
+
+	got := app.RuleCandidates(id)
+	if len(got) != 2 {
+		t.Fatalf("应当还是 2 条候选（刷新时间不该动条数），实际 %d 条", len(got))
+	}
+	for _, c := range got {
+		switch c.Value {
+		case "说话简短一点":
+			if c.LastUsedAt <= old {
+				t.Errorf("进了提示词的候选应当刷新最后提起时间，实际还是 %d", c.LastUsedAt)
+			}
+			if c.CreatedAt != old {
+				t.Errorf("刷新不该动创建时间，实际 %d", c.CreatedAt)
+			}
+		case "好耶":
+			// 1 小时以内刚刷过 → 这一轮不写（节流）。判据是 30 天，分钟级精度没有意义
+			if c.LastUsedAt != fresh {
+				t.Errorf("刚刷过的不该再写一次，实际 %d（期望仍是 %d）", c.LastUsedAt, fresh)
+			}
+		}
 	}
 }
 

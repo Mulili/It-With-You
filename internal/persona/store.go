@@ -77,14 +77,29 @@ type Store interface {
 	// 找不到不报错：界面上的重复点击不该变成一个错误弹窗（与 memory.Store.Delete 同一口径）。
 	DeleteCandidate(id string) error
 
-	// PruneStaleCandidates 删掉"放着很久没动过"的候选，返回删了几条。
+	// TouchCandidates 把这几条候选的"最后一次被注入"时间更新到 at。
 	//
-	// 为什么候选**直接删**而不是像规则那样降层：它只是情调素材——表里连 tier 都没有，
-	// 也不参与检索。她三个月前观察到的一个称呼，留着既不会再用、又会在界面上一直占一行。
+	// 调用点是**拼上下文的那一轮**（见 App.buildMessages）：候选是"注入即算被提起"，
+	// 所以刷新点只能在注入处——在别处刷新就成了"没被提起的也算被提起"。
 	//
-	// 为什么**只清候选、不动规则**：见 App.pruneStaleCandidates 的说明——
-	// 规则那侧现在没有任何无界增长的来源（单值槽位写入即覆盖，多值槽位靠用户明说或亲手提升）。
-	PruneStaleCandidates(before int64) (int, error)
+	// 找不到的 ID 直接跳过，不报错：候选可能刚被用户删掉或提升，
+	// 而这只影响"它多留一阵子"，不值得让这一轮对话看到一个错误。
+	TouchCandidates(ids []string, at int64) error
+
+	// PruneStaleCandidates 清理"太久没被注入过"的候选，返回**被删掉的那些**。
+	//
+	// 规则分两段（2026-09-28 定）：
+	//  1. 过期 = `LastUsedAt < before`；
+	//  2. 过期的条目是**缓冲队列**，每人格最多留 keep 条（最后提起时间最新的那些）——
+	//     只有缓冲也满了，才从最老的开始删。这句话的另一面是：**队列没满时一条都不删**，
+	//     过期本身不等于没价值（这个月没提这个说法，不代表以后不提）。
+	//
+	// 为什么返回条目而不是条数：调用方要拿它写 `[archive]` 日志，而"删了什么"是唯一的校准依据。
+	// 让调用方自己先查一遍再删会多一次读，而且查询条件还容易跟这里走样。
+	//
+	// 只清候选、不动规则：规则那侧没有无界增长的来源（单值槽位写入即覆盖，多值槽位靠用户
+	// 明说或亲手提升），而按时间淘汰它们会造成"用户明说了'叫我主人'，30 天后她忘了"这种伤害。
+	PruneStaleCandidates(before int64, keep int) ([]Candidate, error)
 
 	ExportFile(id string) (PersonaFile, error)
 	ImportFile(f PersonaFile) (Persona, error)

@@ -30,12 +30,32 @@ const SettleTimeout = 90 * time.Second
 // 每轮顺带补几片，很快就追平了。
 const settlePerRun = 3
 
-// CandidateTTL 是「她学到的」保留多久。
+// CandidateTTL 是「她学到的」多久没被提起就算"过期"。
 //
-// 30 天是**拍的**，与 recallMinScore 一样要靠实际使用校。校准依据是 `[archive]` 日志里
-// 每次清掉几条：一直清不完说明留得太久（界面会被一堆早就用不上的旧观察占满），
-// 几乎不清说明太短（她刚学会的说法转眼就没了）。
+// ⚠️ 它算的是**最后一次被注入**（persona.Candidate.LastUsedAt），**不是创建时间**：
+// 一条她还在用的说法不该因为"抽出来很久了"被删掉（旧规则正是这么删的）。
+//
+// 30 天是默认策略、不是"待校准的参数"（2026-09-28 定）：校准依据理应是
+// "过期之后用户有没有觉得她忘了"，而那个信号不在日志里、只在人的感受里。
+//
+// 注意"过期"不等于"被删"：它只是**进缓冲队列**的资格，见 candidateQueueSize。
 const CandidateTTL = 30 * 24 * time.Hour
+
+// candidateQueueSize 是每个人的**缓冲队列**长度：过期候选最多留这么多条。
+//
+// 为什么要缓冲区而不是过期即删（2026-09-28 用户定的）：过期只说明"这个月她没提这个说法"，
+// 不代表以后不会提——这一段就是这些条目的**最后机会**：界面看得见、用户还能把它提升成规则；
+// 而被提升/被删掉之后，同槽位更早的那条会重新变成"最新的那条"（见 persona.MoodCandidates），
+// 于是它又被注入、时间被刷新、自动出队。
+//
+// 只有缓冲也堆满了，才从最老的开始删。
+const candidateQueueSize = 50
+
+// candidateTouchThrottle 是刷新"最后一次被提起"的最小间隔。
+//
+// 淘汰判据是 30 天，所以分钟级精度毫无意义；而每轮都写一次是白花。
+// 有了它，一个一直在用的说法每小时最多写一次。
+const candidateTouchThrottle = time.Hour
 
 // judgeTopic 是每轮跑一次的后台判断：这一句是否结束了当前话题。
 //
@@ -128,11 +148,14 @@ func (a *App) settlePending() {
 	a.pruneStaleCandidates()
 }
 
-// pruneStaleCandidates 清掉放太久没动过的「她学到的」。
+// pruneStaleCandidates 淘汰"太久没被提起"的「她学到的」。
 //
 // 它是**懒**的：不设定时器，搭两个本来就在跑的点——
 //   - 启动时（应用关着的那段时间没有结算，候选不会自己过期）；
 //   - 每次结算跑完之后（候选只由结算产生，见上）。
+//
+// 规则见 Store.PruneStaleCandidates：过期（超过 CandidateTTL 没被注入）的进缓冲队列，
+// 每人格最多留 candidateQueueSize 条，队列满了才从最老的开始删。
 //
 // **为什么只清候选，不按同样口径去降规则的层**：那个待做项写在「隐式演化会把东西攒进
 // recent 层」这个前提上，而「基准 + 情调」那次改动之后**前提已经不成立**了——
@@ -150,41 +173,49 @@ func (a *App) pruneStaleCandidates() {
 	}
 	before := time.Now().Add(-CandidateTTL).UnixMilli()
 
-	// 先看清要删什么再删：清理**不可逆**，而这些条目正是 CandidateTTL 的校准依据。
-	a.logStaleCandidates(before)
-
-	n, err := a.personas.PruneStaleCandidates(before)
+	// 用**返回值**写日志，而不是先查一遍再删：这样"日志里说的"与"真删掉的"必然一致。
+	//（旧写法是另发一次 ListCandidates 去看，而它的 limit 是注入窗口那种小数字，
+	//  候选多了就会漏报——正是被清掉的那批看不见。）
+	gone, err := a.personas.PruneStaleCandidates(before, candidateQueueSize)
 	if err != nil {
 		log.Printf("[archive] 清理过期候选失败: %v", err)
 		return
 	}
-	if n > 0 {
-		// 一直有这行说明窗口太长，从来没它说明可能太短
-		log.Printf("[archive] 清掉了 %d 条放太久没动过的「她学到的」", n)
+	if len(gone) == 0 {
+		return
+	}
+	// 逐条打出内容：这是判断"30 天窗口定得对不对"的唯一依据——只看到条数没法判断
+	// 被删的是"她其实还在用的说法"（窗口该放宽）还是"早就没再用过的"（窗口合适）。
+	log.Printf("[archive] 缓冲队列（%d 条/人格）已满，清掉了 %d 条最久没被提起的「她学到的」",
+		candidateQueueSize, len(gone))
+	for _, c := range gone {
+		log.Printf("[archive]   已清掉：「%s」%s（最后提起：%s）",
+			persona.SlotLabel(c.Slot), clip(c.Value, 30), relativeDay(c.LastUsedAt))
 	}
 }
 
-// logStaleCandidates 打出即将被清理的候选。
+// touchCandidates 把这一轮**真的进了提示词**的候选标成"刚被提起过"。
 //
-// 为什么要"先看一眼再删"：这些条目正是 CandidateTTL 的校准依据——如果被删的是
-// "她其实还在用的那个称呼"，说明窗口太长（该放宽）；如果都是早就没再用过的，说明合适。
-// 而**只打一个条数时，这两种情况在日志里长得一模一样**。
-func (a *App) logStaleCandidates(before int64) {
-	if a.personas == nil {
+// 调用点是拼上下文那一轮（见 buildMessages）：候选是"注入即算被提起"，刷新点只能在注入处。
+//
+// 节流：判据是 30 天，所以只有当上次刷新已经过去 candidateTouchThrottle 时才写。
+// 写失败只记日志：这是维护性数据，坏了的后果是"某条候选多留几天"，不该影响这一轮对话。
+func (a *App) touchCandidates(cs []persona.Candidate) {
+	if len(cs) == 0 || a.personas == nil {
 		return
 	}
-	for _, p := range a.personas.Snapshot().Personas {
-		rows, err := a.personas.ListCandidates(p.ID, moodInjectLimit)
-		if err != nil {
-			continue // 读不到就当没有：清理本身照常进行，不因日志失败而中断
+	now := time.Now().UnixMilli()
+	ids := make([]string, 0, len(cs))
+	for _, c := range cs {
+		if now-c.LastUsedAt > candidateTouchThrottle.Milliseconds() {
+			ids = append(ids, c.ID)
 		}
-		for _, c := range rows {
-			if c.CreatedAt >= before {
-				continue
-			}
-			log.Printf("[archive]   即将清掉：「%s」%s（%s 记下的）",
-				persona.SlotLabel(c.Slot), clip(c.Value, 30), relativeDay(c.CreatedAt))
-		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	if err := a.personas.TouchCandidates(ids, now); err != nil {
+		log.Printf("[archive] 刷新「她学到的」最后提起时间失败: %v", err)
 	}
 }
 

@@ -68,12 +68,25 @@ const (
 	MaxEvidenceRunes  = 500
 )
 
-// InjectBudgetRunes 是每轮注入 system 的预算上限（字符数）。
+// InjectBudgetRunes 是每轮注入 system 里**人格与规则**那一部分的预算上限（字符数）。
 //
-// 人格是"每轮必带"的固定开销，所以必须有硬上限：超预算时先截 recent 层规则，
-// 主体与 core 层永不截。④ 注入链路按这个值截断；内置人格作者也可以用它自查——
-// internal/persona/builtin 里的 TestRealBuiltinPersonasUsable 会按这个值报出超预算的人格。
+// 它覆盖：名字行 + 主体文本 + core/recent 规则。**不含情调区**——情调区有自己的
+// MoodBudgetRunes（见下），两笔钱分开。人格是"每轮必带"的固定开销，所以必须有硬上限：
+// 超预算时先截 recent 层规则，主体与 core 层永不截。④ 注入链路按这个值截断；
+// 内置人格作者也可以用它自查——internal/persona/builtin 里的 TestRealBuiltinPersonasUsable
+// 会按这个值报出超预算的人格。
 const InjectBudgetRunes = 1500
+
+// MoodBudgetRunes 是情调区（「她学到的」）**单独**的预算上限（字符数，含标题与限定语）。
+//
+// 为什么不让它和规则抢同一笔钱（2026-09-28 用户定的）：挤在一起时，人格主体一写长
+// （主体单独能到 1200），情调区就会整段消失——而它的代价不只是"少了几句情调"：
+// **"这一轮到底注入了哪些候选"从此不可知**，而那个时间戳正是候选淘汰的计时依据，
+// 于是计时会跟着失准。
+//
+// 划开之后，两边各自独立：人格再长也不会挤掉情调，情调再多也不会挤掉用户明确说过的要求。
+// 500 是拍的，但它比规则那 1500 宽松得多——情调每槽位最多一条，实际用量通常只有一两百字。
+const MoodBudgetRunes = 500
 
 // Meta 是前端渲染编辑器所需的"静态元信息"：槽位清单 + 各字段的长度上限。
 //
@@ -84,6 +97,7 @@ type Meta struct {
 	SeedTextRunes     int        `json:"seedTextRunes"`
 	RuleValueRunes    int        `json:"ruleValueRunes"`
 	InjectBudgetRunes int        `json:"injectBudgetRunes"`
+	MoodBudgetRunes   int        `json:"moodBudgetRunes"`
 }
 
 // MetaInfo 返回静态元信息（副本，调用方改不到内部表）。
@@ -93,6 +107,7 @@ func MetaInfo() Meta {
 		SeedTextRunes:     MaxSeedTextRunes,
 		RuleValueRunes:    MaxRuleValueRunes,
 		InjectBudgetRunes: InjectBudgetRunes,
+		MoodBudgetRunes:   MoodBudgetRunes,
 	}
 }
 
@@ -163,4 +178,34 @@ type Candidate struct {
 	Evidence string `json:"evidence"`
 	// CreatedAt 是这条候选被抽出来的时刻，Unix 毫秒
 	CreatedAt int64 `json:"createdAt"`
+	// LastUsedAt 是这条候选**最后一次被注入进她的提示词**的时刻，Unix 毫秒。
+	//
+	// 淘汰看的是它，**不是 CreatedAt**：一条她天天在用的说法，不该因为"抽出来很久了"被删掉
+	// （旧规则正是这么删的，能把还在生效的观察清掉）。
+	//
+	// 为什么把"被提起"定义成"被注入"、而不是"她真的说出口了"（2026-09-28 用户定的）：
+	//   - 候选的注入块在**人格提示词**里，而回忆的自标（`[[used:…]]`）在另一个 system 块里，
+	//     两套编号混在一起会互相干扰；
+	//   - "注入"这个信号零成本、也不受漏标影响（漏一次自标就会让一条候选永远显得没人用）。
+	// 语义上也说得通：她只会在**每个槽位最新的那一条**上说话（见 MoodCandidates），
+	// 所以"还在她提示词里"≈"她还在用这个说法"。
+	LastUsedAt int64 `json:"lastUsedAt"`
+}
+
+// NormalizeCandidate 补全候选的两个时间戳。
+//
+// LastUsedAt 缺省取 CreatedAt 而**不能留 0**，这一条是必须的：淘汰判据是
+// `LastUsedAt < now − 窗口`，留 0 会让刚抽出来的候选当场算成"1970 年就没再用过"，
+// 一升级就被整批清掉。放在领域包而不是各 store 里，理由与 history.NormalizeMessage 相同：
+// 这是业务规则，两种存储实现必须一致（否则"开发用内存、用户用 PG"就成了两套行为）。
+//
+// ID 不在这里生成：那是存储层的活（两边都已经有各自的做法）。
+func NormalizeCandidate(c Candidate, now int64) Candidate {
+	if c.CreatedAt == 0 {
+		c.CreatedAt = now
+	}
+	if c.LastUsedAt == 0 {
+		c.LastUsedAt = c.CreatedAt
+	}
+	return c
 }
