@@ -243,6 +243,7 @@ export namespace ui {
 	    total: number;
 	    recallFacts: number;
 	    recallChunks: number;
+	    recallRules: number;
 	    capacity: number;
 	    messages: number;
 	    messageLimit: number;
@@ -260,6 +261,7 @@ export namespace ui {
 	        this.total = source["total"];
 	        this.recallFacts = source["recallFacts"];
 	        this.recallChunks = source["recallChunks"];
+	        this.recallRules = source["recallRules"];
 	        this.capacity = source["capacity"];
 	        this.messages = source["messages"];
 	        this.messageLimit = source["messageLimit"];

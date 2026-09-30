@@ -24,9 +24,12 @@ type ContextStat struct {
 	// Total 是四段之和，也就是这一轮真正发出去的体量
 	Total int `json:"total"`
 
-	// RecallFacts / RecallChunks 是回忆块里各有几条，用来看"注入量从哪来"
+	// RecallFacts / RecallChunks / RecallRules 是回忆块里各有几条，用来看"注入量从哪来"
 	RecallFacts  int `json:"recallFacts"`
 	RecallChunks int `json:"recallChunks"`
+	// RecallRules 是**归档规则**（"你以前的做法"）的条数——它也是注入来的，
+	// 但来源与前两者不同：不是记忆库的事实，而是人格里被收起来的那部分
+	RecallRules int `json:"recallRules"`
 
 	// Capacity 是"满"的参照：片的字符上限。到它就在下一条用户消息前切开，
 	// 所以它比模型窗口更贴近用户感受到的"上下文有多满"。

@@ -207,6 +207,104 @@ func (s *PgStore) SearchChunks(personaID string, vec []float32, limit int) ([]me
 	return out, nil
 }
 
+// IndexRule 实现 memory.Store。
+func (s *PgStore) IndexRule(ri memory.RuleIndex, vec []float32) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	if ri.CreatedAt == 0 {
+		ri.CreatedAt = timeutil.NowMillis()
+	}
+	// 与 IndexChunk 同一姿态：冲突时只覆盖内容、向量与版本，保留原有 created_at
+	// （它表示"这条索引是什么时候建的"，重嵌不该把它刷成现在）
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO rule_index (rule_id, persona_id, content, embedding, source_updated_at, created_at)
+		VALUES ($1::uuid, $2::uuid, $3, $4::vector, $5, $6)
+		ON CONFLICT (rule_id) DO UPDATE
+		   SET content = EXCLUDED.content,
+		       embedding = EXCLUDED.embedding,
+		       source_updated_at = EXCLUDED.source_updated_at`,
+		ri.RuleID, ri.PersonaID, ri.Content, vectorLiteral(vec), ri.SourceUpdatedAt, ri.CreatedAt); err != nil {
+		return fmt.Errorf("写入规则索引失败: %w", err)
+	}
+	return nil
+}
+
+// DropRuleIndex 实现 memory.Store。
+func (s *PgStore) DropRuleIndex(ruleID string) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	// 影响 0 行不报错：规则可能刚被删掉（外键级联已经把它带走）
+	if _, err := s.pool.Exec(ctx, `DELETE FROM rule_index WHERE rule_id = $1::uuid`, ruleID); err != nil {
+		return fmt.Errorf("删除规则索引失败: %w", err)
+	}
+	return nil
+}
+
+// RuleIndexVersions 实现 memory.Store。
+func (s *PgStore) RuleIndexVersions(personaID string) (map[string]int64, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT rule_id, source_updated_at
+		FROM rule_index
+		WHERE persona_id = $1::uuid`, personaID)
+	if err != nil {
+		return nil, fmt.Errorf("读取规则索引版本失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]int64)
+	for rows.Next() {
+		var id string
+		var version int64
+		if err := rows.Scan(&id, &version); err != nil {
+			return nil, fmt.Errorf("解析规则索引版本失败: %w", err)
+		}
+		out[id] = version
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历规则索引版本失败: %w", err)
+	}
+	return out, nil
+}
+
+// SearchRules 实现 memory.Store。
+func (s *PgStore) SearchRules(personaID string, vec []float32, limit int) ([]memory.RuleHit, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	// rule_index.persona_id 不可空（规则必然属于某个人格），所以这里是严格相等，
+	// 与"记忆可公共"的语义不同。同样不做任何丢弃式过滤（见接口上的说明）
+	rows, err := s.pool.Query(ctx, `
+		SELECT rule_id, persona_id, content, source_updated_at, created_at,
+		       1 - (embedding <=> $1::vector) AS score
+		FROM rule_index
+		WHERE persona_id = $2::uuid
+		ORDER BY embedding <=> $1::vector
+		LIMIT $3`, vectorLiteral(vec), personaID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("检索规则索引失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]memory.RuleHit, 0, 2)
+	for rows.Next() {
+		var h memory.RuleHit
+		if err := rows.Scan(&h.Rule.RuleID, &h.Rule.PersonaID, &h.Rule.Content,
+			&h.Rule.SourceUpdatedAt, &h.Rule.CreatedAt, &h.Score); err != nil {
+			return nil, fmt.Errorf("解析规则索引失败: %w", err)
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历规则索引失败: %w", err)
+	}
+	return out, nil
+}
+
 // MarkRecalled 实现 memory.Store。
 func (s *PgStore) MarkRecalled(ids []string, sessionID string) error {
 	if len(ids) == 0 {

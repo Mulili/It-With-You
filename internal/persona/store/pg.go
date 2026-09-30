@@ -602,6 +602,50 @@ func (s *PgStore) SaveRule(r persona.PersonaRule) (string, error) {
 	return r.ID, nil
 }
 
+// ArchiveRule 实现 Store。
+func (s *PgStore) ArchiveRule(id string) error {
+	return s.setRuleTier(id, persona.TierArchived, persona.ActionArchive)
+}
+
+// ReviveRule 实现 Store。
+func (s *PgStore) ReviveRule(id string) error {
+	return s.setRuleTier(id, persona.TierRecent, persona.ActionRevive)
+}
+
+// setRuleTier 是归档 / 放回的共同实现，约束与内存实现逐条一致（见 persona.Store 的说明）。
+func (s *PgStore) setRuleTier(id, tier, action string) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	personaID, rule, err := s.locateRule(ctx, id)
+	if err != nil {
+		return err
+	}
+	if _, err := s.loadWritablePersona(ctx, personaID); err != nil {
+		return err
+	}
+
+	switch {
+	case action == persona.ActionArchive && rule.Tier != persona.TierRecent:
+		return fmt.Errorf("只有「近期」层的规则可以收起来（这条在「%s」层）", rule.Tier)
+	case action == persona.ActionRevive && rule.Tier != persona.TierArchived:
+		return fmt.Errorf("这条规则不在归档层，不用放回来")
+	}
+
+	now := time.Now().UnixMilli()
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`UPDATE persona_rules SET tier = $1, updated_at = $2 WHERE id = $3::uuid`,
+			tier, now, id); err != nil {
+			return err
+		}
+		return s.logChange(ctx, tx, persona.PersonaChange{
+			PersonaID: personaID, RuleID: id, Action: action, Field: rule.Slot,
+			Source: persona.SourceManual, CreatedAt: now,
+		})
+	})
+}
+
 // DeleteRule 删除规则。
 func (s *PgStore) DeleteRule(id string) error {
 	ctx, cancel := s.ctx()

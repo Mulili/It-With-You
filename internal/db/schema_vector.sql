@@ -98,3 +98,33 @@ CREATE INDEX IF NOT EXISTS memories_embedding_idx ON memories USING hnsw (embedd
 CREATE INDEX IF NOT EXISTS memories_persona_idx   ON memories (persona_id, created_at DESC);
 -- 部分索引：只索引"待回访"的那几行
 CREATE INDEX IF NOT EXISTS memories_follow_up_idx ON memories (follow_up_at) WHERE follow_up_at IS NOT NULL;
+
+-- ---------- 规则索引：**归档层规则**的检索入口 ----------
+--
+-- 为什么要它：归档层的规则"不注入 system，但可被检索回来"（见 persona.TierArchived）。
+-- **没有这张表，降层就等于静默删除**——用户看到的是"她忘了"，
+-- 而这正是纯按时间淘汰被推翻的原因。
+--
+-- 只索引归档层：core / recent 每轮都注入，不需要检索；索引它们纯属浪费嵌入调用。
+-- 于是这张表天然很小（通常 0 行），检索也就几句 SQL 的事。
+--
+-- 与前两张表的区别在**语义**：memories 是"记得的事"、chunk_index 是"聊过的经历"，
+-- 这张是"她以前的做法"——命中后注入的是"你以前怎么怎么样"，措辞与那两条线不同。
+
+CREATE TABLE IF NOT EXISTS rule_index (
+    -- 与 persona_rules 一一对应，直接用 rule_id 做主键：天然防重复
+    rule_id    uuid PRIMARY KEY REFERENCES persona_rules (id) ON DELETE CASCADE,
+    persona_id uuid NOT NULL REFERENCES personas (id) ON DELETE CASCADE,
+    -- 嵌入的文本（槽位标签 + 取值）。它同时也是命中后注入时给模型看的那句话：
+    -- 检索命中的东西必须与注入的东西是同一份，否则"匹配上了"和"看到了"会对不上
+    content    text NOT NULL,
+    embedding  vector(1024) NOT NULL,
+    -- 建这条索引时**规则自身**的 updated_at。
+    -- 规则改了要重嵌，判据就是这个比对（见 app 层 indexArchivedRules）——
+    -- 于是不必再存一个 dirty 标志，也不用关心"上次嵌入时服务是不是刚好不可用"
+    source_updated_at bigint NOT NULL,
+    created_at bigint NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS rule_index_persona_idx   ON rule_index (persona_id);
+CREATE INDEX IF NOT EXISTS rule_index_embedding_idx ON rule_index USING hnsw (embedding vector_cosine_ops);

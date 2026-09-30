@@ -12,6 +12,7 @@ import (
 	"agent-for-you-love/internal/llm"
 	"agent-for-you-love/internal/memory"
 	memorystore "agent-for-you-love/internal/memory/store"
+	"agent-for-you-love/internal/persona"
 	"agent-for-you-love/internal/persona/store"
 
 	"github.com/google/uuid"
@@ -455,6 +456,75 @@ func TestContextStatMatchesWhatWasSent(t *testing.T) {
 	}
 	if stat.Messages != len(msgs) {
 		t.Errorf("条数应当是 %d，实际 %d", len(msgs), stat.Messages)
+	}
+}
+
+// 归档层能被检索回来，而且"她真的用到了"就复活——这两条合起来才是"降层不等于删除"。
+//
+// 少了前一条：收起来的规则等于被删掉（用户看到的是"她忘了"）；
+// 少了后一条：她还在用却回不来，归档变成单向的（只能靠用户手动放回）。
+func TestArchivedRuleRecalledAndRevived(t *testing.T) {
+	app, mems, _ := newRecallApp(t)
+
+	// 用自建人格：内置人格只读，没法归档它的规则
+	pid, err := app.personas.CreatePersona("归档测试", "")
+	if err != nil {
+		t.Fatalf("新建人格失败: %v", err)
+	}
+	ruleID, err := app.personas.SaveRule(persona.PersonaRule{
+		PersonaID: pid, Slot: "tone", Value: "别太正经",
+		Source: persona.SourceManual, Tier: persona.TierRecent,
+		Kind: persona.KindVolatile, Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("写规则失败: %v", err)
+	}
+
+	// 收起来，再补索引（真运行时这一步由 ArchiveRule 在后台起）
+	if err := app.personas.ArchiveRule(ruleID); err != nil {
+		t.Fatalf("归档失败: %v", err)
+	}
+	app.indexArchivedRules()
+	if versions, err := mems.RuleIndexVersions(pid); err != nil || len(versions) != 1 {
+		t.Fatalf("归档之后应当建好索引，实际 %+v（err=%v）", versions, err)
+	}
+
+	// ① 它得能被检索回来，而且注入的措辞必须说明"现在不再要求"——
+	// 少了这句，她会把归档当成现行规则照做，那"归档"这件事就白做了
+	msgs := []llm.Message{{Role: llm.RoleUser, Content: "你今天说话怎么这么正经"}}
+	rec := app.recall(pid, "", msgs)
+	if !strings.Contains(rec.Text, "你以前的做法") {
+		t.Fatalf("归档规则应当被检索回来，实际：\n%s", rec.Text)
+	}
+	if !strings.Contains(rec.Text, "别太正经") {
+		t.Fatalf("注入文本里应当有它的内容，实际：\n%s", rec.Text)
+	}
+	if len(rec.Refs) != 1 || rec.Refs[0].RuleID != ruleID {
+		t.Fatalf("编号对照表应当指向那条规则，实际 %+v", rec.Refs)
+	}
+	if rec.Rules != 1 {
+		t.Errorf("「旧做法」的计数应当是 1，实际 %d", rec.Rules)
+	}
+
+	// ② 她自标"用到了第 1 条" → 它该回来（这是整个机制的复位阀门）
+	app.markUsed(rec.Refs, []int{1}, "")
+
+	rules, err := app.personas.RulesOf(pid)
+	if err != nil {
+		t.Fatalf("读规则失败: %v", err)
+	}
+	for _, r := range rules {
+		if r.ID != ruleID {
+			continue
+		}
+		if r.Tier != persona.TierRecent {
+			t.Errorf("她还在用，就该放回 %s，实际 %s", persona.TierRecent, r.Tier)
+		}
+	}
+	// 索引要跟着撤掉：它回到活跃层之后每轮都注入 system，
+	// 留着会让同一件事既在人格提示词里、又在回忆块里再出现一遍
+	if versions, err := mems.RuleIndexVersions(pid); err != nil || len(versions) != 0 {
+		t.Errorf("复活之后不该还留着索引，实际 %+v（err=%v）", versions, err)
 	}
 }
 

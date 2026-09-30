@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"agent-for-you-love/internal/history"
@@ -217,6 +218,105 @@ func (a *App) touchCandidates(cs []persona.Candidate) {
 	if err := a.personas.TouchCandidates(ids, now); err != nil {
 		log.Printf("[archive] 刷新「她学到的」最后提起时间失败: %v", err)
 	}
+}
+
+// indexArchivedRules 给**归档层**的规则补索引 / 重嵌。
+//
+// 为什么只有归档层需要索引：core / recent 每轮都注入，不需要检索；而归档层的定义是
+// "不注入、但可被检索回来"——**没有索引它就检索不回来，降层与删除没有区别**
+//（纯按时间淘汰被推翻，正是因为"她忘了"和"她真的忘了"用户分不出来）。
+//
+// 判据是"索引缺失，或索引落后于规则本身"（比对 source_updated_at）。于是：
+//   - 规则改了取值 → 下次自动重嵌；
+//   - 上次嵌入时服务不可用 → 下次自动补；
+//   - 规则被放回活跃层 / 被停用 / 被删掉 → 反过来把索引清掉
+//     （不清的话检索还会命中一条每轮都在注入、或者已经不存在的规则）。
+//
+// 于是不需要 dirty 标志，也不需要一次"写规则时必须嵌入成功"的强耦合。
+//
+// 触发点都是**写操作**（见各处调用）而不是每一轮：规则很少变，而扫描要按人格读两次表。
+// 启动时也跑一次——那能兜住"应用关着的时候改了库"以及上面说的嵌入失败。
+//
+// 失败只记日志：索引是"想起旧做法"的加分项，不该影响对话。
+func (a *App) indexArchivedRules() {
+	if a.personas == nil || a.memories == nil || a.embedder == nil || a.ctx == nil {
+		// 嵌入不可用时记忆功能整体停用（见 App.embedder）：归档层也就无从检索，
+		// 那时连"归档"这个动作本身都该被劝住（界面上会提示），这里安静收场
+		return
+	}
+
+	for _, p := range a.personas.Snapshot().Personas {
+		rules, err := a.personas.RulesOf(p.ID)
+		if err != nil {
+			log.Printf("[archive] 读取「%s」的规则失败，跳过它的归档索引: %v", p.Name, err)
+			continue
+		}
+		indexed, err := a.memories.RuleIndexVersions(p.ID)
+		if err != nil {
+			log.Printf("[archive] 读取「%s」的规则索引版本失败: %v", p.Name, err)
+			continue
+		}
+
+		archived := make(map[string]persona.PersonaRule, len(rules))
+		var pending []persona.PersonaRule
+		for _, r := range rules {
+			// 停用的归档规则不索引：它连"以前的做法"都不算，注入了反而误导
+			if r.Tier != persona.TierArchived || !r.Enabled {
+				continue
+			}
+			archived[r.ID] = r
+			if v, ok := indexed[r.ID]; !ok || v != r.UpdatedAt {
+				pending = append(pending, r)
+			}
+		}
+		for id := range indexed {
+			if _, still := archived[id]; still {
+				continue
+			}
+			if err := a.memories.DropRuleIndex(id); err != nil {
+				log.Printf("[archive] 清理过期的规则索引失败（%s）: %v", id, err)
+			}
+		}
+		if len(pending) == 0 {
+			continue
+		}
+
+		texts := make([]string, 0, len(pending))
+		for _, r := range pending {
+			texts = append(texts, ruleIndexText(r))
+		}
+		// 用预热那一档超时：这不在关键路径上（写操作之后的维护），宁可慢也别失败
+		ctx, cancel := context.WithTimeout(a.ctx, EmbedWarmTimeout)
+		vecs, err := a.embedder.Embed(ctx, texts)
+		cancel()
+		if err != nil {
+			log.Printf("[archive] 归档规则嵌入失败，下次写规则时会再补: %v", err)
+			continue
+		}
+		for i, r := range pending {
+			if i >= len(vecs) {
+				break
+			}
+			if err := a.memories.IndexRule(memory.RuleIndex{
+				RuleID:          r.ID,
+				PersonaID:       r.PersonaID,
+				Content:         texts[i],
+				SourceUpdatedAt: r.UpdatedAt,
+			}, vecs[i]); err != nil {
+				log.Printf("[archive] 写入规则索引失败: %v", err)
+			}
+		}
+		log.Printf("[archive] 已为「%s」的 %d 条归档规则建好索引（它们能被检索回来了）", p.Name, len(pending))
+	}
+}
+
+// ruleIndexText 是归档规则**嵌入用的文本**，同时也是命中后注入给模型看的那句话。
+//
+// 两者是同一份是有意的（与片摘要同一个约定）：否则会出现"检索匹配上的是 A、注入的却是 B"。
+// 写法与注入时的渲染一致（见 persona.renderRules：`- 标签：取值`），
+// 这样"她被什么勾起了回忆"与"她看到了什么"也一致。
+func ruleIndexText(r persona.PersonaRule) string {
+	return persona.SlotLabel(r.Slot) + "：" + strings.TrimSpace(r.Value)
 }
 
 // settleChunk 结算一片。

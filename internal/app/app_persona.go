@@ -397,6 +397,10 @@ func (a *App) DeleteRule(id string) error {
 	if err := a.personas.DeleteRule(id); err != nil {
 		return err
 	}
+	// 它的归档索引要跟着走：PG 侧靠 rule_index 的外键级联（ON DELETE CASCADE）自动清，
+	// 内存实现没有级联，靠这次扫描按"索引还在、规则已经不在归档层"把它删掉。
+	// 不删的症状是"检索命中一条已经不存在的规则"，她就会说起一件并不存在的事
+	go a.indexArchivedRules()
 	a.notifyPersonaChanged(personaID, persona.ActionDelete, "已删除 "+label)
 	return nil
 }
@@ -410,11 +414,59 @@ func (a *App) SetRuleEnabled(id string, enabled bool) error {
 	if err := a.personas.SetRuleEnabled(id, enabled); err != nil {
 		return err
 	}
+	// 停用的若是归档规则，它的索引得跟着撤掉（归档索引只收"启用的归档规则"）；
+	// 启用一条归档规则同理要补上。这次扫描顺带把两边都对平
+	go a.indexArchivedRules()
 	action, prefix := persona.ActionDisable, "已停用 "
 	if enabled {
 		action, prefix = persona.ActionEnable, "已启用 "
 	}
 	a.notifyPersonaChanged(personaID, action, prefix+label)
+	return nil
+}
+
+// ArchiveRule 把一条规则收进归档层（界面上是「收起来」）。
+//
+// 归档之后它**不再每轮注入**，但可以被检索回来（见 persona.TierArchived 与 indexArchivedRules）。
+// 所以这比"删掉"温和：她不再保持这个做法，但需要的时候还能想起来自己以前是这样。
+//
+// 只对「近期」层开放（core 是"她是谁"，要取消就直说删除），见 persona.Store.ArchiveRule。
+func (a *App) ArchiveRule(id string) error {
+	if err := a.requireStore(); err != nil {
+		return err
+	}
+	label, personaID := a.ruleLabel(id)
+	if err := a.personas.ArchiveRule(id); err != nil {
+		return err
+	}
+	// 立刻补索引，而且**后台跑**：不补的话它检索不回来，这次"收起来"就等于删掉；
+	// 但嵌入要几十毫秒到几秒，界面不该等它（补不上也没关系，下次写规则或启动时会再补）
+	go a.indexArchivedRules()
+	a.notifyPersonaChanged(personaID, persona.ActionArchive, "已收起来 "+label+"（需要时她还能想起来）")
+	return nil
+}
+
+// ReviveRule 把一条归档规则放回近期层（界面上是「放回来」）。
+//
+// 与 ArchiveRule 对称——**只有降没有升，归档就等于删除**。
+// 除了用户手动点，检索命中之后她自标"用到了"也会走这条（见 markUsed）：
+// 那是这套机制里的复位阀门，"她其实还在用"就该回来。
+func (a *App) ReviveRule(id string) error {
+	if err := a.requireStore(); err != nil {
+		return err
+	}
+	label, personaID := a.ruleLabel(id)
+	if err := a.personas.ReviveRule(id); err != nil {
+		return err
+	}
+	// 索引**当场**删掉、不等后台扫描：它回到活跃层之后每轮都注入 system，
+	// 索引留着会让同一件事既在人格提示词里、又在回忆块里再出现一遍
+	if a.memories != nil {
+		if err := a.memories.DropRuleIndex(id); err != nil {
+			log.Printf("[archive] 放回规则时清理它的索引失败: %v", err)
+		}
+	}
+	a.notifyPersonaChanged(personaID, persona.ActionRevive, "已放回来 "+label)
 	return nil
 }
 

@@ -23,6 +23,8 @@ type MemoryStore struct {
 	// chunkIndex 按 chunk_id 存片索引。用 map 而不是切片：PG 那边靠主键保证
 	// "一片只有一条"，这边得自己找个等价物，而 map 的键天然就是它。
 	chunkIndex map[string]indexEntry
+	// ruleIndex 同理按 rule_id 存**归档规则**的索引（见 memory.RuleIndex）。
+	ruleIndex map[string]ruleIndexEntry
 }
 
 type entry struct {
@@ -32,6 +34,11 @@ type entry struct {
 
 type indexEntry struct {
 	ci  memory.ChunkIndex
+	vec []float32
+}
+
+type ruleIndexEntry struct {
+	ri  memory.RuleIndex
 	vec []float32
 }
 
@@ -219,6 +226,67 @@ func (s *MemoryStore) MarkChunksRecalled(chunkIDs []string, sessionID string) er
 	return nil
 }
 
+// IndexRule 实现 memory.Store。
+func (s *MemoryStore) IndexRule(ri memory.RuleIndex, vec []float32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.ruleIndex == nil {
+		s.ruleIndex = make(map[string]ruleIndexEntry)
+	}
+	// 覆盖时保留原有的 created_at，与 PG 的 ON CONFLICT DO UPDATE 保持一致
+	// （两个实现在"重嵌会不会刷新索引时间"上分叉，契约测试会看到不同结果）
+	if old, ok := s.ruleIndex[ri.RuleID]; ok && ri.CreatedAt == 0 {
+		ri.CreatedAt = old.ri.CreatedAt
+	}
+	if ri.CreatedAt == 0 {
+		ri.CreatedAt = timeutil.NowMillis()
+	}
+	s.ruleIndex[ri.RuleID] = ruleIndexEntry{ri: ri, vec: vec}
+	return nil
+}
+
+// DropRuleIndex 实现 memory.Store。
+func (s *MemoryStore) DropRuleIndex(ruleID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 找不到不报错：规则可能刚被删掉（PG 侧是外键级联，这边没有级联）
+	delete(s.ruleIndex, ruleID)
+	return nil
+}
+
+// RuleIndexVersions 实现 memory.Store。
+func (s *MemoryStore) RuleIndexVersions(personaID string) (map[string]int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make(map[string]int64)
+	for id, e := range s.ruleIndex {
+		if e.ri.PersonaID == personaID {
+			out[id] = e.ri.SourceUpdatedAt
+		}
+	}
+	return out, nil
+}
+
+// SearchRules 实现 memory.Store。
+func (s *MemoryStore) SearchRules(personaID string, vec []float32, limit int) ([]memory.RuleHit, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	hits := make([]memory.RuleHit, 0, len(s.ruleIndex))
+	for _, e := range s.ruleIndex {
+		// 规则必然属于某个人格，所以这里是严格相等（与片索引同，与"记忆可公共"不同）
+		if e.ri.PersonaID != personaID {
+			continue
+		}
+		hits = append(hits, memory.RuleHit{Rule: e.ri, Score: cosine(vec, e.vec)})
+	}
+	sortHits(hits, func(h memory.RuleHit) float64 { return h.Score })
+	return trimHits(hits, limit), nil
+}
+
 // sortHits 按分数倒序排。
 //
 // 用 SliceStable 而不是 Slice：分数相同时至少保持"插入顺序"这一确定的次序。
@@ -266,6 +334,13 @@ func (s *MemoryStore) DeletePersona(personaID string) error {
 		}
 	}
 	s.entries = kept
+
+	// 规则索引跟着人格走（PG 侧靠外键级联做同一件事）
+	for id, e := range s.ruleIndex {
+		if e.ri.PersonaID == personaID {
+			delete(s.ruleIndex, id)
+		}
+	}
 	return nil
 }
 

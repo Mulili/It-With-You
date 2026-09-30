@@ -31,7 +31,8 @@ import (
 //	v4 → v5：memories 加 last_recalled_session（抑制"同一段对话里反复提同一件事"）
 //	v5 → v6：persona_rule_candidates 加 last_used_at（淘汰改按"最后一次被注入"算，
 //	         不再按 created_at——否则还在用的说法也会被时间删掉）
-const SchemaVersion = 6
+//	v6 → v7：加 rule_index（**归档层规则**的检索入口——没有它，降层就等于静默删除）
+const SchemaVersion = 7
 
 // envDSN 是连接串所在的环境变量名。
 const envDSN = "COMPANION_PG_DSN"

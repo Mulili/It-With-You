@@ -4,6 +4,8 @@ import {ui} from '../models';
 import {persona} from '../models';
 import {app} from '../models';
 
+export function ArchiveRule(arg1:string):Promise<void>;
+
 export function Ask(arg1:string):Promise<string>;
 
 export function Cancel():Promise<void>;
@@ -45,6 +47,8 @@ export function PromoteRuleCandidate(arg1:persona.Candidate):Promise<void>;
 export function Quit():Promise<void>;
 
 export function RenamePersona(arg1:string,arg2:string):Promise<void>;
+
+export function ReviveRule(arg1:string):Promise<void>;
 
 export function RuleCandidates(arg1:string):Promise<Array<persona.Candidate>>;
 

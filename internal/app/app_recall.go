@@ -76,15 +76,30 @@ const (
 	// 只给 1：一条片摘要就有两千字上下，"同时想起两段往事"在真实对话里很少见，
 	// 而代价是双倍的注入预算。要放更多就改这个数（候选已经按相似度排好）。
 	recallChunkLimit = 1
+	// recallRuleLimit 是最多注入几条**归档规则**（"你以前的做法"）。
+	//
+	// 也只给 1：归档规则是"她不再专门遵守、但可以想起来"的东西，
+	// 一次想起好几条会让语气忽然变回从前，比想不起来更奇怪。
+	recallRuleLimit = 1
+	// recallRuleMinScore 是归档规则"多像才算相关"的门槛。
+	//
+	// 与 recallMinScore 分开一个常量、先取同一个值 0.55：两者测的是不同的东西
+	//（对话 ↔ 行为规则 vs 对话 ↔ 事实/经历），分布未必一样，而真机数据还没有。
+	// 分开是为了**能单独校准**——日志里那一行会同时打出两者的分数。
+	//
+	// ⚠️ 门槛偏高对归档层是**双重**代价：不仅这一轮想不起来，而且"被用到就复活"
+	// 也就永远不触发，于是一条归档规则实际等同于被删掉。所以这个数宁可偏低。
+	recallRuleMinScore = 0.55
 )
 
-// recall 是本轮的"想起"：拿当下的话题去记忆库里问两条线，拼成一段可注入的文本。
+// recall 是本轮的"想起"：拿当下的话题去记忆库里问**三条线**，拼成一段可注入的文本。
 //
-// 两条线（见 operation.md「检索」）：
+// 三条线（见 operation.md「检索」）：
 //   - **片索引线**给"经历"——你们以前聊过什么，命中后注入那一段的抽取式摘要
 //   - **事实线**给"背景"——关于他的事（公共）与你们之间的事（本私有）
+//   - **规则线**给"她以前的做法"——**归档层**的规则（不注入 system，只能靠这里想起来）
 //
-// 它跑在关键路径上，所以**只做一次嵌入 + 两次向量查询，不加任何 LLM 调用**：
+// 它跑在关键路径上，所以**只做一次嵌入 + 三次向量查询，不加任何 LLM 调用**：
 // 加一次 1~2 秒的"该不该提这件事"的判断，会让每一轮回复都慢半拍；
 // 而"要不要说出口"本来就可以交给模型在生成时自己决定——注入块里明确写了允许忽略。
 //
@@ -98,7 +113,7 @@ const (
 // 连着问"草莓 / 芒果 / 菠萝三种口味喜不喜欢"，第三次起若不再注入，她会答"喜欢"。
 // **编出来的答案比重复提一句有害得多。**
 // 返回值里的 Refs 是"编号 → ID"对照表，供 stream 解析她自标的 [[used:…]] 用——
-// 那是计数归口的唯一依据（见 markUsed）。
+// 那是计数归口（以及归档规则复活）的唯一依据（见 markUsed）。
 func (a *App) recall(personaID, sessionID string, msgs []llm.Message) recallResult {
 	if a.memories == nil || a.embedder == nil {
 		return recallResult{} // 记忆功能整体停用（见 App.embedder 的注释）
@@ -120,7 +135,7 @@ func (a *App) recall(personaID, sessionID string, msgs []llm.Message) recallResu
 		return recallResult{}
 	}
 
-	// 两条线各自独立取候选：一条挂了不影响另一条。
+	// 三条线各自独立取候选：一条挂了不影响另外两条。
 	// 取 recallTopN 的**三倍**：提过多次的那些会被抬高的门槛挡掉（见 recallThreshold），
 	// 让它们占掉名额就等于"越提越轮不到新的"。
 	memHits, err := a.memories.Search(personaID, vecs[0], recallTopN*3)
@@ -130,6 +145,10 @@ func (a *App) recall(personaID, sessionID string, msgs []llm.Message) recallResu
 	chunkHits, err := a.memories.SearchChunks(personaID, vecs[0], recallTopN*3)
 	if err != nil {
 		log.Printf("[recall] 检索往事失败: %v", err)
+	}
+	ruleHits, err := a.memories.SearchRules(personaID, vecs[0], recallTopN*3)
+	if err != nil {
+		log.Printf("[recall] 检索归档规则失败: %v", err)
 	}
 
 	// 逐条判门槛。**不能"遇到第一条低于就 break"**：门槛逐条不同——
@@ -154,18 +173,33 @@ func (a *App) recall(personaID, sessionID string, msgs []llm.Message) recallResu
 		}
 		chunks = append(chunks, h)
 	}
+	// 归档规则不做"越提门槛越高"那一套：它只有"想起来了"与"她用得着"两种状态，
+	// 而一旦她自标用到了，它当场就复活回活跃层（见 markUsed）——那时它不再走这条路
+	var rules []memory.RuleHit
+	for _, h := range ruleHits {
+		if len(rules) >= recallRuleLimit {
+			break
+		}
+		if h.Score < recallRuleMinScore {
+			continue
+		}
+		rules = append(rules, h)
+	}
 
 	// 这一行是**校准阈值的依据**：把候选的最高相似度一直打出来，
-	// 才能回答"recallMinScore 该定多少"（现在那个 0.5 是拍的）
-	memTop, chunkTop := 0.0, 0.0
+	// 才能回答"recallMinScore / recallRuleMinScore 该定多少"
+	memTop, chunkTop, ruleTop := 0.0, 0.0, 0.0
 	if len(memHits) > 0 {
 		memTop = memHits[0].Score
 	}
 	if len(chunkHits) > 0 {
 		chunkTop = chunkHits[0].Score
 	}
-	log.Printf("[recall] 候选最高相似度 事实 %.3f / 往事 %.3f；注入 %d 条事实、%d 段往事",
-		memTop, chunkTop, len(mems), len(chunks))
+	if len(ruleHits) > 0 {
+		ruleTop = ruleHits[0].Score
+	}
+	log.Printf("[recall] 候选最高相似度 事实 %.3f / 往事 %.3f / 归档规则 %.3f；注入 %d 条事实、%d 段往事、%d 条旧做法",
+		memTop, chunkTop, ruleTop, len(mems), len(chunks), len(rules))
 
 	// 再逐条打出候选与去向。上面那行只有分数，**校准不了阈值**——
 	// 知道"0.47 被筛掉了"没有用，得知道**那 0.47 是什么内容**：
@@ -184,8 +218,14 @@ func (a *App) recall(personaID, sessionID string, msgs []llm.Message) recallResu
 			recallVerdict(h.Score, th), h.Score, th, h.Chunk.RecallCount,
 			clip(h.Chunk.Summary, 40), relativeDay(h.Chunk.CreatedAt))
 	}
+	// 归档规则这一行也是**校准 recallRuleMinScore 的依据**：它是三条线里唯一
+	// "门槛定高了就永远回不来"的一条（详见常量上的说明）
+	for _, h := range ruleHits {
+		log.Printf("[recall]   %s 旧做法 %.3f（门槛 %.2f）：%s",
+			recallVerdict(h.Score, recallRuleMinScore), h.Score, recallRuleMinScore, clip(h.Rule.Content, 40))
+	}
 
-	if len(mems) == 0 && len(chunks) == 0 {
+	if len(mems) == 0 && len(chunks) == 0 && len(rules) == 0 {
 		return recallResult{}
 	}
 
@@ -194,8 +234,8 @@ func (a *App) recall(personaID, sessionID string, msgs []llm.Message) recallResu
 	// 为什么：一条记忆被人看了十轮、却一次都没提，按"注入就记"的话计数照样涨到十、
 	// 门槛升到顶——**你以后问起它就再也拿不到了**，尽管它从没造成过任何重复。
 	// 用户的原话是："按照采取次数累加，llm 认为这个记忆应该采取时才累加。"
-	text, refs := formatRecall(mems, chunks, sessionID)
-	return recallResult{Text: text, Refs: refs, Facts: len(mems), Chunks: len(chunks)}
+	text, refs := formatRecall(mems, chunks, rules, sessionID)
+	return recallResult{Text: text, Refs: refs, Facts: len(mems), Chunks: len(chunks), Rules: len(rules)}
 }
 
 // warmEmbedder 在后台补一次嵌入，目的只是让 Ollama 把模型重新读进显存。
@@ -251,6 +291,11 @@ func recallQuery(msgs []llm.Message) string {
 type recallRef struct {
 	MemoryID string // 非空 = 这是一条事实
 	ChunkID  string // 非空 = 这是一段往事
+	// RuleID 非空 = 这是一条**归档规则**（"你以前的做法"）。
+	//
+	// 与另外两种不同的后果：她自标用到了它 → 这条规则**复活**回活跃层
+	//（"她其实还在用"就该回来，见 markUsed）。所以这个对照表不只服务计数。
+	RuleID string
 }
 
 // recallResult 是一次检索的产物。
@@ -259,22 +304,26 @@ type recallResult struct {
 	Text string
 	// Refs[i] 对应注入文本里编号 i+1 的条目
 	Refs []recallRef
-	// Facts / Chunks 是这一次"想起来"各注入了几条，给界面顶部的状态条用。
-	// 与 Refs 的区别：Refs 是"编号 → ID"的对照表（含降档那一段），这两个只是计数。
+	// Facts / Chunks / Rules 是这一次"想起来"各注入了几条，给界面顶部的状态条用。
+	// 与 Refs 的区别：Refs 是"编号 → ID"的对照表（含降档那一段），这几个只是计数。
 	Facts  int
 	Chunks int
+	Rules  int
 }
 
-// formatRecall 把命中的两条线渲染成一段注入文本，并给出"编号 → ID"的对照表。
+// formatRecall 把命中的三条线渲染成一段注入文本，并给出"编号 → ID"的对照表。
 //
-// 四处写法是有意的：
+// 几处写法是有意的：
 //   - 开头明说"可能无关、没关系就别提"——否则她会把每一条都当任务汇报一遍（最容易翻车的地方）
 //   - 带**时间**（"昨天""3 天前"）：摘要本身不带时间，而"上次""前几天"这类说法全靠它，
 //     让模型自己从毫秒时间戳里推算是不现实的
 //   - 空的那条线不出标题：只写"以前聊过："却什么也没有，是在引导她编
 //   - **本段对话里已经提过一遭的单独成段**，并附上"别再主动提、他问起才答"的限定。
 //     这一档不能简单地"不注入"：用户主动问起时她得答得上细节——而那正是最需要它的时刻。
-func formatRecall(mems []memory.MemoryHit, chunks []memory.ChunkHit, sessionID string) (string, []recallRef) {
+//   - 归档规则那一段的措辞要多说一句"现在已不再要求"：少了它，她会把"以前的做法"
+//     当成现行要求照做——那等于归档从来没发生过
+func formatRecall(mems []memory.MemoryHit, chunks []memory.ChunkHit, rules []memory.RuleHit,
+	sessionID string) (string, []recallRef) {
 	// 拆成两组：本段对话里**还没提过**的、和**已经提过一遭**的（后者用弱化措辞）
 	var freshMems, saidMems []memory.MemoryHit
 	for _, h := range mems {
@@ -312,6 +361,17 @@ func formatRecall(mems []memory.MemoryHit, chunks []memory.ChunkHit, sessionID s
 		for _, h := range freshChunks {
 			refs = append(refs, recallRef{ChunkID: h.Chunk.ChunkID})
 			fmt.Fprintf(&b, "%d. %s，%s\n", len(refs), relativeDay(h.Chunk.CreatedAt), h.Chunk.Summary)
+		}
+	}
+	// 归档规则（"你以前的做法"）排在最后：它是三条线里最不该主动提的一条——
+	// 提它等于她拿过去的自己说事，用户会困惑"你怎么又这样了"
+	if len(rules) > 0 {
+		// 这一句"现在已不再要求"是**必须**的：少了它，她会把归档当成现行规则照做，
+		// 而"归档"这个动作（用户说"别这样了"，或系统降层）就白做了
+		b.WriteString("\n你以前的做法（现在不再要求你这样，但要是这一轮刚好用得着，就自然一点用）：\n")
+		for _, h := range rules {
+			refs = append(refs, recallRef{RuleID: h.Rule.RuleID})
+			fmt.Fprintf(&b, "%d. %s\n", len(refs), h.Rule.Content)
 		}
 	}
 
@@ -500,25 +560,33 @@ func cleanBody(s string) string {
 	return strings.TrimRight(s, " \t\r\n")
 }
 
-// markUsed 只给她**真的用到了**的那些累加一次计数。
+// markUsed 处理她自标的"这一轮用到了哪几条"。
 //
+// 对事实与往事：**只给真的用到了的**累加一次计数。
 // 为什么不是"注入了就记"——见 recall 里那段注释：一条被看了十轮、一次都没提的记忆，
 // 按"注入就记"会把门槛顶到最高，结果**你以后问起它反而拿不到了**。
+//
+// 对归档规则：用到了 = **它该回来了**。这是整套"降层不等于删除"的复位阀门——
+// 没有它，归档就是单向删除，只是绕了一圈（用户看到的还是"她忘了"）。
+// 所以这里会真的把它从归档层提回近期层，并推一条回执告诉用户发生了什么。
 //
 // 编号越界、或模型写了不存在的编号，直接忽略：那是它的小失误，不该影响这一轮。
 func (a *App) markUsed(refs []recallRef, used []int, sessionID string) {
 	if len(used) == 0 || a.memories == nil {
 		return
 	}
-	var memIDs, chunkIDs []string
+	var memIDs, chunkIDs, ruleIDs []string
 	for _, n := range used {
 		if n < 1 || n > len(refs) {
 			continue
 		}
-		if r := refs[n-1]; r.MemoryID != "" {
+		switch r := refs[n-1]; {
+		case r.MemoryID != "":
 			memIDs = append(memIDs, r.MemoryID)
-		} else if r.ChunkID != "" {
+		case r.ChunkID != "":
 			chunkIDs = append(chunkIDs, r.ChunkID)
+		case r.RuleID != "":
+			ruleIDs = append(ruleIDs, r.RuleID)
 		}
 	}
 	if len(memIDs) > 0 {
@@ -530,6 +598,23 @@ func (a *App) markUsed(refs []recallRef, used []int, sessionID string) {
 		if err := a.memories.MarkChunksRecalled(chunkIDs, sessionID); err != nil {
 			log.Printf("[recall] 记录往事取用失败: %v", err)
 		}
+	}
+	// 归档规则：她还在用 → 放回活跃层
+	for _, id := range ruleIDs {
+		if a.personas == nil {
+			break
+		}
+		if err := a.personas.ReviveRule(id); err != nil {
+			// 找不到是正常的：用户可能刚把这条规则删掉（界面上的动作与这一轮回复是并发的）
+			log.Printf("[archive] 复活归档规则失败（可能刚被删掉）: %v", err)
+			continue
+		}
+		// 索引当场撤掉：它回到活跃层之后每轮都注入 system，
+		// 索引留着会让同一件事既在人格提示词里、又在回忆块里出现一遍
+		if err := a.memories.DropRuleIndex(id); err != nil {
+			log.Printf("[archive] 复活后清理它的索引失败: %v", err)
+		}
+		log.Printf("[archive] 她这一轮真的用到了那条归档规则，已把它放回活跃层（%s）", id)
 	}
 }
 

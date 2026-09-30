@@ -60,6 +60,23 @@ type Store interface {
 	DeleteRule(id string) error
 	SetRuleEnabled(id string, enabled bool) error
 
+	// ArchiveRule 把一条规则收进归档层，ReviveRule 把它放回近期层。
+	//
+	// 归档层的语义是"不再每轮注入，但可以被检索回来"（见 TierArchived）——
+	// 所以这两个动作必须成对存在：**只有降没有升，归档就等于删除**。
+	//
+	// 约束：
+	//   - 只收「近期」层。core 是"她是谁"，要取消就直说删除；而且放回来一律回 recent，
+	//     允许 core 降层会让"放回来"把身份级的东西降成偏好；
+	//   - 放回来的目标是 recent（不是 core），理由同上；
+	//   - 内置人格只读，两条都会失败（与 SaveRule 同一个闸门）。
+	//
+	// ⚠️ 归档之后要由调用方保证它**被索引**（见 memory.Store.IndexRule）：
+	// 没有索引，它检索不回来，降层与删除没有区别。这个顺序是调用方的事，不在存储层里做
+	//（存储层跨不过记忆库那道边界）。
+	ArchiveRule(id string) error
+	ReviveRule(id string) error
+
 	// AddCandidates 批量写入「隐式演化」的候选（幂等：同 persona + slot + value 已存在就跳过）。
 	//
 	// 幂等是必须的：结算是每段会话都跑一次，同一件事会被反复抽到；

@@ -6,7 +6,7 @@ import {
   Ask, Cancel, Say, HideWindow, Quit, History, SessionMessages, Memories, DeleteMemory, SetMenuOpen,
   GetPersonaSnapshot, SetActivePersona, GetPersonaRules, GetPersonaChanges, GetPersonaMeta,
   CreatePersona, RenamePersona, DeletePersona, SaveSeedText,
-  SaveRule, DeleteRule, SetRuleEnabled,
+  SaveRule, DeleteRule, SetRuleEnabled, ArchiveRule, ReviveRule,
   RuleCandidates, PromoteRuleCandidate, DeleteRuleCandidate,
   GetSettings, SetThinkingDisabled, ExportPersonaToFile, ImportPersonaFromFile,
   ContextStat,
@@ -72,6 +72,8 @@ const recallDetail = computed(() => {
   const parts = []
   if (s.recallFacts) parts.push(`${s.recallFacts} 条事实`)
   if (s.recallChunks) parts.push(`${s.recallChunks} 段往事`)
+  // 「旧做法」= 归档层的规则被检索回来了（见 internal/persona 的 TierArchived）
+  if (s.recallRules) parts.push(`${s.recallRules} 条旧做法`)
   return parts.join(' + ')
 })
 
@@ -335,7 +337,10 @@ function fieldLabel(field) {
 }
 
 function actionLabel(action) {
-  return { create: '新增', update: '修改', delete: '删除', enable: '启用', disable: '停用' }[action] ?? action
+  return {
+    create: '新增', update: '修改', delete: '删除',
+    enable: '启用', disable: '停用', archive: '收起', revive: '放回',
+  }[action] ?? action
 }
 
 async function loadMeta() {
@@ -584,6 +589,28 @@ async function toggleRule(r) {
     await loadRules(detailId.value)
   } catch (e) {
     showToast('操作失败：' + errText(e))
+  }
+}
+
+// 「收起」= 降到归档层：不再每轮遵守，但需要时她还能想起来（后端会给这条规则建检索索引）。
+// 所以它不是删除的替身，而是比删除温和得多的选择——这也是"降层不等于删除"这句话的入口。
+async function archiveRule(r) {
+  try {
+    await ArchiveRule(r.id)
+    await loadRules(detailId.value)
+  } catch (e) {
+    showToast('收起来失败：' + errText(e))
+  }
+}
+
+// 「放回」= 从归档层回到近期层。她自己在对话里用到那条规则时，后端也会走同一条路
+//（所以你会先看到一条"已放回来"的回执，再看到这里的变化）。
+async function reviveRule(r) {
+  try {
+    await ReviveRule(r.id)
+    await loadRules(detailId.value)
+  } catch (e) {
+    showToast('放回失败：' + errText(e))
   }
 }
 
@@ -1137,6 +1164,22 @@ onUnmounted(() => {
                   <p class="rule__value">{{ r.value }}</p>
                 </div>
                 <div v-if="canEdit" class="rule__acts">
+                  <button
+                    v-if="r.tier === 'recent'"
+                    class="iconbtn"
+                    title="收起来：不再每轮遵守，但需要时她还能想起来"
+                    @click="archiveRule(r)"
+                  >
+                    收
+                  </button>
+                  <button
+                    v-else-if="r.tier === 'archived'"
+                    class="iconbtn"
+                    title="放回来：回到每轮都遵守的规则里"
+                    @click="reviveRule(r)"
+                  >
+                    放回
+                  </button>
                   <button
                     class="iconbtn"
                     :title="r.enabled ? '停用（仍保留，可再启用）' : '启用'"

@@ -55,6 +55,12 @@ const (
 	ActionDelete  = "delete"
 	ActionEnable  = "enable"
 	ActionDisable = "disable"
+	// ActionArchive / ActionRevive 是"收进归档层 / 放回近期层"。
+	//
+	// 单独两个动作而不是复用 update：变更记录里这两件事没有"旧值 → 新值"，
+	// 它们的含义就是动作本身（"她学到的被我收起来了"），界面上直接显示成"收起 / 放回"。
+	ActionArchive = "archive"
+	ActionRevive  = "revive"
 )
 
 // 字段长度硬上限（按字符数，不是字节数——中文一个字算一个）。

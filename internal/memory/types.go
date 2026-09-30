@@ -132,6 +132,34 @@ type ChunkHit struct {
 	Score float64
 }
 
+// RuleIndex 是「归档规则」的检索入口：向量库里的第三条线。
+//
+// 前两条线给"记得的事"（事实）与"聊过的经历"（往事），这条给**"她以前的做法"**：
+// 归档层的规则不注入 system，只能靠检索被想起来。
+//
+// 它的存在就是"降层不等于删除"这句话的兑现——没有它，降层与删除没有区别，
+// 而"她忘了"和"她真的忘了"用户是分不出来的（纯按时间淘汰正是死在这里）。
+type RuleIndex struct {
+	// RuleID 与 persona_rules 一一对应，所以它直接当主键——天然防重复
+	RuleID string
+	// PersonaID 冗余一列（反范式），理由与 chunk_index 相同：
+	// 按人格过滤要发生在 HNSW 取 Top-N **之前**，否则会出现"取了 10 条、过滤后剩 1 条"
+	PersonaID string
+	// Content 是嵌入的文本，也是命中后注入时给模型看的那句话（槽位标签 + 取值）。
+	// 两者必须是同一份，否则"匹配上了"与"看到了"会对不上（与 ChunkIndex.Summary 同一约定）
+	Content string
+	// SourceUpdatedAt 是建这条索引时**规则自身**的 updated_at。
+	// 规则改了要重嵌，判据就是这个比对（见 app 层 indexArchivedRules）
+	SourceUpdatedAt int64
+	CreatedAt       int64
+}
+
+// RuleHit 是一条检索命中的归档规则，语义同 MemoryHit。
+type RuleHit struct {
+	Rule  RuleIndex
+	Score float64
+}
+
 // Store 是长期记忆的存储契约。
 //
 // 检索相关的方法在第 4 步补上（原先只有 3b 收尾结算需要的），回访（PendingFollowUps）等
@@ -204,6 +232,31 @@ type Store interface {
 	// 与它分开而不是合并成一个调用：两者操作的是两张表（memories / chunk_index），
 	// 合起来会让"哪个 id 属于哪一边"变成调用方要操心的事。
 	MarkChunksRecalled(chunkIDs []string, sessionID string) error
+
+	// IndexRule 写入/覆盖一条归档规则的索引（rule_id 是主键，重复写是覆盖）。
+	//
+	// 覆盖时保留原有的 created_at：它表示"这条索引是什么时候建的"，
+	// 重嵌不该把它刷成现在（与 IndexChunk 同一理由）。
+	IndexRule(ri RuleIndex, vec []float32) error
+
+	// DropRuleIndex 删掉一条规则索引。
+	//
+	// 两种场景都用它：规则被放回活跃层（归档已经不成立，索引就该消失）、
+	// 以及规则被删除（PG 侧外键会级联，内存实现靠它）。
+	DropRuleIndex(ruleID string) error
+
+	// RuleIndexVersions 返回该人格**已建索引的规则** → 建索引时规则的 updated_at。
+	//
+	// 给"哪些归档规则还没索引 / 索引过期了"的懒扫描用（见 app 层 indexArchivedRules）：
+	// 比对源规则的 updated_at 就知道要不要重嵌，不必再存 dirty 标志、
+	// 也不必关心"上次嵌入时服务是不是刚好不可用"。
+	RuleIndexVersions(personaID string) (map[string]int64, error)
+
+	// SearchRules 语义检索该人格的**归档规则**，按相似度倒序，最多 limit 条。
+	//
+	// 与另两条线一样**不做丢弃式过滤**：命中只是"她想起了自己以前的做法"，
+	// 要不要用由模型在那一轮自己决定（措辞见 app 层 formatRecall）。
+	SearchRules(personaID string, vec []float32, limit int) ([]RuleHit, error)
 
 	// DeletePersona 删除该人格的**私有**记忆。
 	//

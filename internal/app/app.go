@@ -160,6 +160,10 @@ func (a *App) Startup(ctx context.Context) {
 	// 顺手清一次过期的「她学到的」：应用关着的那段时间没有结算，候选不会自己过期。
 	// 也放后台：它是维护动作，与"能不能开始聊"同样无关。
 	go a.pruneStaleCandidates()
+
+	// 再顺手核对一遍归档规则的索引：兜住"应用关着的时候改了库"，以及上次嵌入时服务不可用。
+	// 归档层"不注入、但可被检索回来"——索引没建好，它就等于被删了。
+	go a.indexArchivedRules()
 }
 
 // Shutdown 由 Wails 在应用退出时调用（导出理由同 Startup）。
@@ -337,6 +341,7 @@ func (a *App) buildMessages(personaID string, msgs []llm.Message, rec recallResu
 		Recall:       utf8.RuneCountInString(rec.Text),
 		RecallFacts:  rec.Facts,
 		RecallChunks: rec.Chunks,
+		RecallRules:  rec.Rules,
 	}
 	// msgs 的最后一条就是本轮用户说的话（见 Ask 里"先写库、再读"），单独拆出来——
 	// 用户想分清的是"我这一句"与"之前的历史"，混在一起就看不出来了。

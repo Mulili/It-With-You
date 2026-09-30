@@ -526,6 +526,125 @@ func runStoreContract(t *testing.T, s memory.Store, chunk testChunk) {
 func TestMemoryStoreContract(t *testing.T) {
 	// 内存实现没有外键，片 id 随便给一组 uuid 就行
 	runStoreContract(t, NewMemoryStore(), testChunk{ChunkID: uuid.NewString(), SessionID: uuid.NewString()})
+	// 规则索引同理：内存实现没有 persona_rules 可挂
+	runRuleIndexContract(t, NewMemoryStore(), testRule{RuleID: uuid.NewString(), PersonaID: testPersonaA})
+}
+
+// testRule 是规则索引测试要用的那一行。
+//
+// rule_index 有外键挂在 persona_rules 上，所以 PG 侧必须先真的建出这条规则；
+// 内存实现没有外键，随便给个 uuid 就行（与 testChunk 同一个套路）。
+type testRule struct {
+	RuleID    string
+	PersonaID string
+}
+
+// runRuleIndexContract 是**归档规则索引**的契约：写入/覆盖/删除、版本表、按人格隔离。
+//
+// 为什么它值得一套契约：这是"降层不等于删除"唯一的落点。索引一旦分叉，
+// 用户在 PG 上"想得起来"、在内存里想不起来（或反过来），而症状只是
+// "她有时候记得、有时候不记得"——最难定位的那一类。
+//
+// 三个子测试按顺序依赖同一条索引（与片索引那组同一姿态）。
+func runRuleIndexContract(t *testing.T, s memory.Store, r testRule) {
+	t.Helper()
+
+	t.Run("规则索引：写入后能按人格检索到，别的人格看不到", func(t *testing.T) {
+		if err := s.IndexRule(memory.RuleIndex{
+			RuleID: r.RuleID, PersonaID: r.PersonaID,
+			Content: "语气：别太正经", SourceUpdatedAt: 100,
+		}, makeVec(0, 1)); err != nil {
+			t.Fatalf("写规则索引失败: %v", err)
+		}
+
+		hits, err := s.SearchRules(r.PersonaID, makeVec(0, 1), 5)
+		if err != nil {
+			t.Fatalf("检索规则索引失败: %v", err)
+		}
+		if len(hits) != 1 {
+			t.Fatalf("应当命中 1 条，实际 %d 条：%+v", len(hits), hits)
+		}
+		if hits[0].Rule.Content != "语气：别太正经" {
+			t.Errorf("命中的内容不对：%q", hits[0].Rule.Content)
+		}
+		// 同方向单分量 → 余弦 1。分数低于这个说明口径与 PG 的 <=> 不一致
+		if hits[0].Score < 0.99 {
+			t.Errorf("同向向量应当几乎完全相似，实际 %.3f", hits[0].Score)
+		}
+
+		// 规则索引按人格**严格隔离**（不像记忆可以公共）
+		other, err := s.SearchRules(testPersonaB, makeVec(0, 1), 5)
+		if err != nil {
+			t.Fatalf("检索别的人格失败: %v", err)
+		}
+		if len(other) != 0 {
+			t.Errorf("别的人格不该检索到这条索引：%+v", other)
+		}
+
+		// 版本表：调用方靠它判断"这条索引是不是落后于规则了"
+		versions, err := s.RuleIndexVersions(r.PersonaID)
+		if err != nil {
+			t.Fatalf("读索引版本失败: %v", err)
+		}
+		if v, ok := versions[r.RuleID]; !ok || v != 100 {
+			t.Errorf("版本表应当是 %s → 100，实际 %+v", r.RuleID, versions)
+		}
+	})
+
+	t.Run("规则索引：重复写是覆盖，内容与版本都换新", func(t *testing.T) {
+		if err := s.IndexRule(memory.RuleIndex{
+			RuleID: r.RuleID, PersonaID: r.PersonaID,
+			Content: "语气：还是正经一点", SourceUpdatedAt: 200,
+		}, makeVec(1, 1)); err != nil {
+			t.Fatalf("覆盖规则索引失败: %v", err)
+		}
+
+		// 主键是 rule_id，所以同一条规则只会有一条索引
+		hits, err := s.SearchRules(r.PersonaID, makeVec(1, 1), 5)
+		if err != nil {
+			t.Fatalf("检索失败: %v", err)
+		}
+		if len(hits) != 1 {
+			t.Fatalf("同一条规则应当只有一条索引，实际 %d 条", len(hits))
+		}
+		if hits[0].Rule.Content != "语气：还是正经一点" || hits[0].Rule.SourceUpdatedAt != 200 {
+			t.Errorf("覆盖后应当是新的内容与版本：%+v", hits[0].Rule)
+		}
+
+		versions, err := s.RuleIndexVersions(r.PersonaID)
+		if err != nil {
+			t.Fatalf("读索引版本失败: %v", err)
+		}
+		if versions[r.RuleID] != 200 {
+			t.Errorf("版本应当跟到 200，实际 %d", versions[r.RuleID])
+		}
+	})
+
+	t.Run("规则索引：删掉之后检索不到，重复删不报错", func(t *testing.T) {
+		if err := s.DropRuleIndex(r.RuleID); err != nil {
+			t.Fatalf("删除规则索引失败: %v", err)
+		}
+
+		hits, err := s.SearchRules(r.PersonaID, makeVec(0, 1), 5)
+		if err != nil {
+			t.Fatalf("检索失败: %v", err)
+		}
+		if len(hits) != 0 {
+			t.Errorf("删掉之后不该还能检索到：%+v", hits)
+		}
+		versions, err := s.RuleIndexVersions(r.PersonaID)
+		if err != nil {
+			t.Fatalf("读索引版本失败: %v", err)
+		}
+		if _, ok := versions[r.RuleID]; ok {
+			t.Errorf("删掉之后版本表里不该还有它：%+v", versions)
+		}
+
+		// 用户在界面上的动作与回复那一轮是并发的，重复删很常见
+		if err := s.DropRuleIndex(r.RuleID); err != nil {
+			t.Errorf("删一条不存在的索引不该报错: %v", err)
+		}
+	})
 }
 
 // 内存实现的片索引是 map，PG 那边靠 chunk_id 主键——两者都要满足"一片只有一条"。
@@ -581,6 +700,28 @@ func TestPgStoreContract(t *testing.T) {
 	// chunk_index 有外键挂在 session_chunks 上，所以片索引那几条断言必须先造出真实的片
 	chunk := createTestChunk(t, pool, testPersonaA)
 	runStoreContract(t, st, chunk)
+	// rule_index 同理工挂在 persona_rules 上
+	runRuleIndexContract(t, st, createTestRule(t, pool, testPersonaA))
+}
+
+// createTestRule 造一行最小的人格规则：rule_index 的外键要求它真实存在。
+// 跑完删掉规则——外键级联会把它的索引一起带走。
+func createTestRule(t *testing.T, pool *pgxpool.Pool, personaID string) testRule {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+
+	r := testRule{RuleID: uuid.NewString(), PersonaID: personaID}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO persona_rules (id, persona_id, slot, value, source, evidence, tier, kind, priority, enabled, created_at, updated_at)
+		VALUES ($1, $2, 'tone', '别太正经', 'manual', '', 'archived', 'volatile', 0, true, $3, $3)`,
+		r.RuleID, personaID, now); err != nil {
+		t.Fatalf("准备测试规则失败: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM persona_rules WHERE id = $1`, r.RuleID)
+	})
+	return r
 }
 
 // createTestChunk 造"会话 → 片"这条最小链路，返回它们的 id。

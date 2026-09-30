@@ -521,6 +521,50 @@ func (s *MemoryStore) SaveRule(r persona.PersonaRule) (string, error) {
 	return r.ID, nil
 }
 
+// ArchiveRule 实现 Store。
+func (s *MemoryStore) ArchiveRule(id string) error {
+	return s.setRuleTier(id, persona.TierArchived, persona.ActionArchive)
+}
+
+// ReviveRule 实现 Store。
+func (s *MemoryStore) ReviveRule(id string) error {
+	return s.setRuleTier(id, persona.TierRecent, persona.ActionRevive)
+}
+
+// setRuleTier 是归档 / 放回的共同实现：改 tier + 记一条变更。
+//
+// 两条约束（见 Store 接口上的说明）：
+//   - 归档只能从 recent 出发（core 是身份，要取消就删除）；
+//   - 放回来一律回 recent——允许把 core 降层再升回 core，会让"放着不用"变成降级，
+//     而"她是谁"这件事不该被一次检索命中牵连。
+func (s *MemoryStore) setRuleTier(id, tier, action string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	personaID, idx, p, err := s.locateRuleLocked(id)
+	if err != nil {
+		return err
+	}
+	if _, err := s.writableLocked(personaID); err != nil {
+		return err
+	}
+
+	cur := s.rules[personaID][idx]
+	switch {
+	case action == persona.ActionArchive && cur.Tier != persona.TierRecent:
+		return fmt.Errorf("只有「近期」层的规则可以收起来（这条在「%s」层）", cur.Tier)
+	case action == persona.ActionRevive && cur.Tier != persona.TierArchived:
+		return fmt.Errorf("这条规则不在归档层，不用放回来")
+	}
+
+	now := s.now()
+	s.rules[personaID][idx].Tier = tier
+	s.rules[personaID][idx].UpdatedAt = now
+	s.logLocked(persona.PersonaChange{PersonaID: p.ID, RuleID: id, Action: action,
+		Field: cur.Slot, Source: persona.SourceManual, CreatedAt: now})
+	return nil
+}
+
 // DeleteRule 删除规则。
 func (s *MemoryStore) DeleteRule(id string) error {
 	s.mu.Lock()
