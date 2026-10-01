@@ -77,6 +77,18 @@ type Store interface {
 	ArchiveRule(id string) error
 	ReviveRule(id string) error
 
+	// MarkDowngradeAsked 记下"她已经开口问过要不要把这条收起来"（只问一次，避免反复提）。
+	//
+	// 为什么不写变更记录：那是"规则内容/层级变了"的账本，而这里记的是**一次对话状态**
+	//（她问了、你还没答）。写进去会让变更记录被"问了/拒绝了"这种条目淹掉。
+	MarkDowngradeAsked(id string, at int64) error
+
+	// MarkDowngradeRefused 记下"用户说了不用收"，此后这条永不再被提起。
+	//
+	// 与 AskedAt 的区别是它带**否决**的语义：只记"问过"的话，
+	// 用户拒绝之后隔一阵又会收到同一个提议，那是很讨厌的执着。
+	MarkDowngradeRefused(id string, at int64) error
+
 	// AddCandidates 批量写入「隐式演化」的候选（幂等：同 persona + slot + value 已存在就跳过）。
 	//
 	// 幂等是必须的：结算是每段会话都跑一次，同一件事会被反复抽到；
@@ -147,6 +159,7 @@ func SortRules(rules []PersonaRule) {
 //	manual   人工在 UI 改     → 任何槽位、任何层级
 //	explicit 用户明说的指令   → 任何槽位，但只能落 core / recent
 //	inferred 模型自动抽取     → 只能写 volatile 槽位的 recent 层
+//	promoted 用户提升的候选   → 同 manual（决定是用户下的，只是内容来自她）
 //
 // 这道闸门是防人格漂移的主要手段：身份、底线、禁忌这些 stable 维度不允许被模型自动改写。
 func CheckWrite(source, slot, tier string) error {
@@ -161,7 +174,10 @@ func CheckWrite(source, slot, tier string) error {
 	}
 
 	switch source {
-	case SourceManual:
+	case SourceManual, SourcePromoted:
+		// 提升与手写在这里是同一档：都是用户在界面上主动下的决定。
+		// 它们的区别只在"来源标签"——那是给"能不能请她让位"用的（见 DowngradeCandidate），
+		// 不是写入权限上的区别。
 		return nil
 	case SourceExplicit:
 		if tier == TierArchived {
@@ -178,6 +194,7 @@ func CheckWrite(source, slot, tier string) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("写入来源 %q 非法（可用：%s / %s / %s）", source, SourceManual, SourceExplicit, SourceInferred)
+		return fmt.Errorf("写入来源 %q 非法（可用：%s / %s / %s / %s）", source,
+			SourceManual, SourcePromoted, SourceExplicit, SourceInferred)
 	}
 }

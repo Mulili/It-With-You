@@ -375,6 +375,17 @@ func (a *App) buildMessages(personaID string, msgs []llm.Message, rec recallResu
 	if dropped > 0 {
 		log.Printf("[persona] 「%s」有 %d 条规则或倾向超出注入预算，本轮未注入", active.Name, dropped)
 	}
+	// 她问过、还在等他回话的那件事，这一轮要让她开口（见 downgradeAskNote）。
+	//
+	// 接在人格段之后、而不是像回忆块那样压在末尾：那一小段属于"她这一轮的心思"，
+	// 与人格是一体的。代价是这几轮的前缀缓存会失效（它在变动），
+	// 但"等她回话"是个短暂状态（要么他答了、要么这条永不提了），可以接受。
+	//
+	// ⚠️ 字数算进"人格"那一段（ContextStat.Persona），这样状态条上的四段之和
+	// 仍然等于真正发出去的体量（有测试钉着这条）。
+	if ask, ok := pendingDowngrade(snap.Rules); ok {
+		system += downgradeAskNote(ask)
+	}
 	stat.Persona = utf8.RuneCountInString(system)
 
 	// 刷新「她学到的」的"最后一次被提起"（见 persona.Candidate.LastUsedAt）。

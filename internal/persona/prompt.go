@@ -43,39 +43,15 @@ const (
 // 关键是不能落进 persona_rules 的单值槽位（那里再写入即覆盖，会把她观察到的称呼
 // 静默顶掉用户的基准称呼，连 core 层位置一起占走）。
 func BuildSystemPrompt(p Persona, rules []PersonaRule, candidates []Candidate) (string, int, []Candidate) {
-	sorted := append([]PersonaRule(nil), rules...)
-	SortRules(sorted)
-
-	var core, recent []PersonaRule
-	for _, r := range sorted {
-		if !r.Enabled {
-			continue
-		}
-		switch r.Tier {
-		case TierCore:
-			core = append(core, r)
-		case TierRecent:
-			recent = append(recent, r)
-		}
-	}
+	core, recent := splitRules(rules)
 
 	var b strings.Builder
-	// 先给模型一个明确的"你是谁"，比让它从种子里自己猜更稳
-	if name := strings.TrimSpace(p.Name); name != "" {
-		fmt.Fprintf(&b, "你正在扮演「%s」。以下是你的人格设定，请始终保持，不要跳出角色。\n", name)
-	}
-	if seed := strings.TrimSpace(p.SeedText); seed != "" {
-		b.WriteString("\n")
-		b.WriteString(seed)
-		b.WriteString("\n")
-	}
-	if text := renderRules(core); text != "" {
-		b.WriteString(coreHead)
-		b.WriteString(text)
-	}
+	// 主体部分（名字 + 主体文本 + core 段）永不参与截断，所以整块渲染
+	base := renderBase(p, core)
+	b.WriteString(base)
 
 	// recent 层：先算出已占用的字数，再按顺序补到预算为止
-	used := utf8.RuneCountInString(b.String())
+	used := utf8.RuneCountInString(base)
 	kept := make([]PersonaRule, 0, len(recent))
 	dropped := 0
 	if len(recent) > 0 {
@@ -180,6 +156,67 @@ func renderMood(cs []Candidate) string {
 // candidateCost 估算一条情调占用的预算，与 ruleCost 同一口径（略高估，见那里说明）。
 func candidateCost(c Candidate) int {
 	return utf8.RuneCountInString(SlotLabel(c.Slot)) + utf8.RuneCountInString(strings.TrimSpace(c.Value)) + 4
+}
+
+// splitRules 把规则分成"永不截断的 core"与"参与预算的 recent"两组，各自按注入顺序排好。
+//
+// 抽出来是因为有第二个调用方了（PromptBudgetUsed）：两处若各写一遍筛选与排序，
+// 迟早会出现"算出来的占用"与"实际注入的"对不上。
+func splitRules(rules []PersonaRule) (core, recent []PersonaRule) {
+	sorted := append([]PersonaRule(nil), rules...)
+	SortRules(sorted)
+	for _, r := range sorted {
+		if !r.Enabled {
+			continue
+		}
+		switch r.Tier {
+		case TierCore:
+			core = append(core, r)
+		case TierRecent:
+			recent = append(recent, r)
+		}
+	}
+	return core, recent
+}
+
+// renderBase 渲染人格里**永不参与截断**的那部分：名字 + 主体文本 + core 段。
+func renderBase(p Persona, core []PersonaRule) string {
+	var b strings.Builder
+	// 先给模型一个明确的"你是谁"，比让它从种子里自己猜更稳
+	if name := strings.TrimSpace(p.Name); name != "" {
+		fmt.Fprintf(&b, "你正在扮演「%s」。以下是你的人格设定，请始终保持，不要跳出角色。\n", name)
+	}
+	if seed := strings.TrimSpace(p.SeedText); seed != "" {
+		b.WriteString("\n")
+		b.WriteString(seed)
+		b.WriteString("\n")
+	}
+	if text := renderRules(core); text != "" {
+		b.WriteString(coreHead)
+		b.WriteString(text)
+	}
+	return b.String()
+}
+
+// PromptBudgetUsed 返回"这个人格这一轮**想要**多少预算"——**含会被截掉的那部分**。
+//
+// 与 BuildSystemPrompt 用的筛选、渲染与 ruleCost 都是同一套，所以两个数不会走样。
+// 用途只有一个：判断"该不该请她腾个位置"（见 App.maybeAskDowngrade）——
+// 那条路的判据必须是"想要多少"，而不是"实际注入多少"（后者被截过，永远不超）。
+//
+// 与 BuildSystemPrompt 一样是**推算值**：多值槽位渲染时会归组合并（"禁忌：A；B"），
+// 逐条相加会偏大。方向是"早一点发现挤"，对这个用途正好。
+func PromptBudgetUsed(p Persona, rules []PersonaRule) int {
+	core, recent := splitRules(rules)
+	used := utf8.RuneCountInString(renderBase(p, core))
+	if len(recent) == 0 {
+		return used
+	}
+	used += utf8.RuneCountInString(recentHead)
+	for _, r := range recent {
+		used += ruleCost(r)
+	}
+	return used
 }
 
 // renderRules 把规则按槽位归组渲染成人类可读的列表。

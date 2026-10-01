@@ -39,6 +39,13 @@ const (
 	SourceInferred = "inferred"
 	// SourceManual 人工在 UI 里直接改。
 	SourceManual = "manual"
+	// SourcePromoted 是用户点了「一直这样」，把一条**她学来的**候选提升成规则。
+	//
+	// 它与 SourceManual 分开，是为了回答一个问题：**这条可以请她让位吗**。
+	// 内容是她提的，只有"采纳"这个决定是用户下的——所以预算挤的时候可以先请用户
+	// 把它收起来；而手写的、明说的，永远不主动提这件事（见 DowngradeCandidate、
+	// App.maybeAskDowngrade）。
+	SourcePromoted = "promoted"
 )
 
 // 人格来源。
@@ -148,6 +155,68 @@ type PersonaRule struct {
 	Enabled   bool  `json:"enabled"` // 停用而不删
 	CreatedAt int64 `json:"createdAt"`
 	UpdatedAt int64 `json:"updatedAt"`
+	// DowngradeAskedAt 非零 = 她已经问过"这条要不要收起来"（Unix 毫秒）。
+	//
+	// 为什么要落库而不是每轮现算：那一问发生在**对话里**，回答可能在几天之后，
+	// 中间会重启应用。而且"只问一次"这句话必须有地方记——不然她会反复提，很烦。
+	DowngradeAskedAt int64 `json:"downgradeAskedAt"`
+	// DowngradeRefusedAt 非零 = 用户明确说了不用收（Unix 毫秒），此后**永不再提**。
+	//
+	// 与 AskedAt 的区别：那个是"问过了"，这个是"问过、也被拒绝了"。
+	// 没有这一列，同一件事会在用户拒绝之后隔一阵再被翻出来，那是很讨厌的执着。
+	DowngradeRefusedAt int64 `json:"downgradeRefusedAt"`
+}
+
+// DowngradeCandidate 从她的规则里挑出**最该让位**的那一条，用于"请她腾个位置"。
+//
+// 谁是"她的"：来源是 SourcePromoted 的那些——内容是她提的，只有采纳这个决定是用户下的。
+// **用户手写的（manual）与明说的（explicit）永远不在这里**：那是用户的基准，
+// 系统没有资格主动提议收掉它们（真不要了，用户会自己删）。
+//
+// 只在「近期」层里挑：core 是身份；archived 已经收起来了，没什么可让的。
+//
+// 挑选顺序（越靠前越先让位）：
+//  1. **Priority 最小的先让位**——那是用户/系统明确标过"不重要"的；
+//  2. 再比**最旧的先让位**（CreatedAt 小的）——同样是让位，"先来后到"最不伤感情，
+//     而且旧的那条更可能已经被新习惯取代了。
+//
+// ⚠️ 它**只负责挑**，不决定"要不要挑"（那要看预算挤不挤，见 App.maybeAskDowngrade），
+// 也不负责"谁没被问过/被拒绝过"——那些是状态，由调用方按规则上的两个时间戳过滤：
+// 把这两个条件放进这里会让它既要懂业务又要懂状态，测试也难写。
+//
+// 返回 ok=false 表示"没有人该让位"（没有可降的候选，或全都问过/被拒过了）。
+func DowngradeCandidate(rules []PersonaRule) (PersonaRule, bool) {
+	var best PersonaRule
+	found := false
+	for _, r := range rules {
+		if !r.Enabled || r.Tier != TierRecent || r.Source != SourcePromoted {
+			continue
+		}
+		// 已经问过、或者用户已经拒绝过的，跳过：前者等回话，后者不该再提
+		if r.DowngradeAskedAt != 0 || r.DowngradeRefusedAt != 0 {
+			continue
+		}
+		// 只动 volatile 的：stable 维度（身份、底线、禁忌的语义边界）不该由系统提议收掉
+		if spec, ok := LookupSlot(r.Slot); !ok || spec.Kind != KindVolatile {
+			continue
+		}
+		if !found || betterCandidate(r, best) {
+			best, found = r, true
+		}
+	}
+	return best, found
+}
+
+// betterCandidate 判断 a 是否比 b 更该先让位（见 DowngradeCandidate 的排序说明）。
+func betterCandidate(a, b PersonaRule) bool {
+	if a.Priority != b.Priority {
+		return a.Priority < b.Priority
+	}
+	if a.CreatedAt != b.CreatedAt {
+		return a.CreatedAt < b.CreatedAt
+	}
+	// 时间戳完全相同（同一批写进来的）时用 ID 兜底，保证与存储顺序无关、可复现
+	return a.ID < b.ID
 }
 
 // PersonaChange 是变更日志的一条。

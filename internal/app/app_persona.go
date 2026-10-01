@@ -330,15 +330,17 @@ func (a *App) RuleCandidates(personaID string) []persona.Candidate {
 // 只是候选多留一条，再点一次就是幂等的覆盖。两害相权，留下看得见的痕迹。
 //
 // 两个关键决定：
-//   - Source 记 **manual 而不是 inferred**。内容是模型抽的没错，但"以后就这么说"这个决定
+//   - Source 记 **promoted 而不是 inferred**。内容是模型抽的没错，但"以后就这么说"这个决定
 //     是用户下的，这条规则从此是基准，进【最近用户希望你】那一段，不再是"偶尔可以这样"。
 //     记成 inferred 会让它永远停在情调强度上，用户点了半天没反应。
+//     ⚠️ 也不用 manual 了（2026-09-29 改）：manual 是"用户亲手写的"，而这条是**她学来的**——
+//     预算快满时要请谁让位，靠的正是这个区别（见 persona.DowngradeCandidate）。
 //   - Tier 仍是 recent。提升的是**强度**，不是身份——她说话的语气不该混进 core
 //     （那一层是"她是谁"）。唯一的例外是覆盖到已有的 core 单值槽位（如称呼），
 //     那时 SaveRule 的"单值覆盖"会沿用旧的 tier，那是**用户主动**要替换基准，符合预期。
 //
 // 校验里有一处**不能**交给 SaveRule：槽位必须是 volatile。
-// 因为矩阵是按 source 判权限的，而这里 source 记 manual，它必然会放行 stable 槽位——
+// 因为矩阵是按 source 判权限的，而这里 source 与 manual 同级放行 stable 槽位——
 // 于是"先往候选表塞一条 personality、再点提升"就能绕开权限矩阵。这条约束只属于提升路径。
 func (a *App) PromoteRuleCandidate(c persona.Candidate) error {
 	if err := a.requireStore(); err != nil {
@@ -355,7 +357,7 @@ func (a *App) PromoteRuleCandidate(c persona.Candidate) error {
 		PersonaID: c.PersonaID,
 		Slot:      slot,
 		Value:     c.Value,
-		Source:    persona.SourceManual,
+		Source:    persona.SourcePromoted,
 		Tier:      persona.TierRecent,
 		Evidence:  c.Evidence,
 	}); err != nil {
@@ -422,6 +424,88 @@ func (a *App) SetRuleEnabled(id string, enabled bool) error {
 		action, prefix = persona.ActionEnable, "已启用 "
 	}
 	a.notifyPersonaChanged(personaID, action, prefix+label)
+	return nil
+}
+
+// pendingDowngrade 从规则里挑出"她问过、还在等他回话"的那一条。
+//
+// 判据全是规则上已有的字段，**不需要额外的状态**：
+//   - 问过（DowngradeAskedAt ≠ 0）、没被拒绝（DowngradeRefusedAt = 0）；
+//   - 还在近期层——用户点头之后它就被收进归档层了，于是自动不再是"待回答"。
+//
+// 它是个纯函数（吃快照里那份规则），因为它要在两个地方用：buildMessages 每轮都要读
+// （决定这一轮要不要注入那段商量），而 PendingDowngrade 给界面读。两处各查一次库没必要。
+func pendingDowngrade(rules []persona.PersonaRule) (persona.PersonaRule, bool) {
+	for _, r := range rules {
+		if r.Tier != persona.TierRecent || !r.Enabled {
+			continue
+		}
+		if r.DowngradeAskedAt != 0 && r.DowngradeRefusedAt == 0 {
+			return r, true
+		}
+	}
+	return persona.PersonaRule{}, false
+}
+
+// downgradeAskNote 是她"想跟他商量收起来某条做法"时注入的那一小段。
+//
+// 只给**大意与要点**，措辞交给她——这正是这条设计要的效果：一个能自然开口的请求，
+// 而不是一条系统通知。三件事必须写进要点里：
+//  1. 是哪条做法（否则她只会说一句空洞的"我最近变了"）；
+//  2. 她现在可以不用再守着它了（否则她会以为自己在违背什么）；
+//  3. **他不同意就继续守着**——少了这句，"问"就变成了通知。
+//
+// 外加两条克制：别硬插、只问这一次（她要是没接话，这件事就此放下）。
+//
+// ⚠️ 不要提"预算""位置"这类词：那是系统内部的账，她嘴里的理由应该是"我最近不太这样了"。
+func downgradeAskNote(r persona.PersonaRule) string {
+	return fmt.Sprintf(`
+【想跟他商量一件事】
+你学到的这条，你现在觉得自己已经不太这样了：%s：%s
+这一轮找个自然的时候，用你自己的话问问他：以后还要不要继续这样。
+要说清三件事：① 是哪条做法；② 你已经不太这样了；③ 他要是不同意，你就继续守着。
+⚠️ 别硬插、别反复提；他要是没接话，这件事就此放下。
+`, persona.SlotLabel(r.Slot), strings.TrimSpace(r.Value))
+}
+
+// PendingDowngrade 返回"她问过、还在等你回话"的那条规则（没有就是 nil）。
+//
+// 界面据此显示一条"她在等你回话"，给两个按钮。**这是那条提议目前的唯一正式回答入口**：
+// 口头回答（"好呀"）暂时不会被识别——因为"误判成同意"会直接改掉人格，方向太危险；
+// 先把确定的入口做通，识别口头回答留到看过真机上她问得怎么样之后再说。
+func (a *App) PendingDowngrade() (*persona.PersonaRule, error) {
+	if a.personas == nil {
+		return nil, nil
+	}
+	r, ok := pendingDowngrade(a.personas.Snapshot().Rules)
+	if !ok {
+		return nil, nil
+	}
+	return &r, nil
+}
+
+// ApproveDowngrade 你点头了：把那条收起来（降到归档层，之后仍能被检索回来）。
+//
+// 直接复用 ArchiveRule：收起来这件事只有一条路，不然"她提议的"与"我手动收的"
+// 迟早会在某处走样（比如漏了补索引那一步）。
+func (a *App) ApproveDowngrade(ruleID string) error {
+	return a.ArchiveRule(ruleID)
+}
+
+// RefuseDowngrade 你不愿意：那就继续守着，而且**这条以后不再提**。
+//
+// 记的是 RefusedAt 而不是清掉 AskedAt：只清"问过"的话，她过一阵又会拿同一件事来问，
+// 那是很讨厌的执着（见 persona.PersonaRule 上那两列的说明）。
+func (a *App) RefuseDowngrade(ruleID string) error {
+	if err := a.requireStore(); err != nil {
+		return err
+	}
+	label, personaID := a.ruleLabel(ruleID)
+	if err := a.personas.MarkDowngradeRefused(ruleID, time.Now().UnixMilli()); err != nil {
+		return fmt.Errorf("记下你的答复失败: %w", err)
+	}
+	// action 只用于客户端的记账（前端目前只读 summary），这里没有更贴切的取值
+	a.notifyPersonaChanged(personaID, persona.ActionUpdate, "好，那就不收，继续这样："+label)
 	return nil
 }
 

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -204,11 +205,121 @@ func TestBuildMessagesTouchesInjectedCandidates(t *testing.T) {
 	}
 }
 
-// 提升一条候选 = 写成真规则 + 删掉候选；规则落在 recent 层，且**来源记为 manual**。
+// 「她开口问一句」这条路的端到端：预算挤 + 有她学来的规则 → 她问 → 你点头才降 / 你拒绝就永不再提。
 //
-// source 是"提升"与"情调"的分水岭：inferred 将来可能被自动演化改写，
-// 而用户明确认可过的基准不该被动摇；注入时它也因此进【最近用户希望你】那一段，
-// 不再是【偶尔可以这样】。
+// 这是整个应用里**唯一一处会改人格的动作**，所以全程必须有人点头：
+// 触发条件、问话的注入、两条答复路径，都在这里钉住。
+func TestDowngradeAskFlow(t *testing.T) {
+	app, st, _ := newPersonaApp(t)
+
+	id, err := st.CreatePersona("降级测试", "")
+	if err != nil {
+		t.Fatalf("新建人格失败: %v", err)
+	}
+	if err := st.SetActivePersona(id); err != nil {
+		t.Fatalf("切换人格失败: %v", err)
+	}
+	addPromoted := func(value string) string {
+		t.Helper()
+		ruleID, err := st.SaveRule(persona.PersonaRule{
+			PersonaID: id, Slot: "catchphrase", Value: value,
+			Source: persona.SourcePromoted, Tier: persona.TierRecent,
+			Kind: persona.KindVolatile, Enabled: true,
+		})
+		if err != nil {
+			t.Fatalf("写规则失败: %v", err)
+		}
+		return ruleID
+	}
+	tierOf := func(ruleID string) string {
+		t.Helper()
+		rules, err := st.RulesOf(id)
+		if err != nil {
+			t.Fatalf("读规则失败: %v", err)
+		}
+		for _, r := range rules {
+			if r.ID == ruleID {
+				return r.Tier
+			}
+		}
+		t.Fatalf("规则 %s 不在了", ruleID)
+		return ""
+	}
+
+	first := addPromoted("好耶")
+
+	// ① 不挤的时候不许问：她只是学来了一条口头禅，还没到要腾位置的地步。
+	//    少了这条约束，她会时不时就问一句"我要不要收起点什么"，很烦
+	app.maybeAskDowngrade()
+	if p, _ := app.PendingDowngrade(); p != nil {
+		t.Fatal("预算还富余，不该去请她问收不收")
+	}
+
+	// ② 把主体写到上限 → 想要的注入量接近预算
+	if err := st.SaveSeedText(id, strings.Repeat("主", persona.MaxSeedTextRunes)); err != nil {
+		t.Fatalf("写主体失败: %v", err)
+	}
+	app.maybeAskDowngrade()
+	pending, err := app.PendingDowngrade()
+	if err != nil {
+		t.Fatalf("读待回答失败: %v", err)
+	}
+	if pending == nil || pending.ID != first {
+		t.Fatalf("应当有一条在等她回话（那条她学来的），实际 %+v", pending)
+	}
+
+	// ③ 这一轮她得真的开口：那段商量要进 system，而且要说清是哪条做法
+	msgs := app.buildMessages(id, []llm.Message{{Role: llm.RoleUser, Content: "在吗"}}, recallResult{})
+	var sys strings.Builder
+	for _, m := range msgs {
+		if m.Role == llm.RoleSystem {
+			sys.WriteString(m.Content)
+		}
+	}
+	if !strings.Contains(sys.String(), "想跟他商量一件事") {
+		t.Errorf("她该开口问一句，实际 system：\n%s", sys.String())
+	}
+	if !strings.Contains(sys.String(), "好耶") {
+		t.Errorf("得说清是哪条做法，否则她只会讲一句空洞的「我最近变了」：\n%s", sys.String())
+	}
+
+	// ④ 你不同意 → 继续守着，而且这条**永不再提**
+	if err := app.RefuseDowngrade(first); err != nil {
+		t.Fatalf("拒绝失败: %v", err)
+	}
+	if p, _ := app.PendingDowngrade(); p != nil {
+		t.Error("拒绝了就不该还在等回话")
+	}
+	if got := tierOf(first); got != persona.TierRecent {
+		t.Errorf("拒绝之后它该继续生效，实际在 %s 层", got)
+	}
+	app.maybeAskDowngrade()
+	if p, _ := app.PendingDowngrade(); p != nil {
+		t.Error("拒绝过的永不再提——反复问同一件事很讨厌")
+	}
+
+	// ⑤ 新学来的一条：她可以再问一次；你点头才真的收起来
+	second := addPromoted("得嘞")
+	app.maybeAskDowngrade()
+	if p, _ := app.PendingDowngrade(); p == nil || p.ID != second {
+		t.Fatalf("新学来的那条应当重新问一次，实际 %+v", p)
+	}
+	if err := app.ApproveDowngrade(second); err != nil {
+		t.Fatalf("点头失败: %v", err)
+	}
+	if got := tierOf(second); got != persona.TierArchived {
+		t.Errorf("点头之后应当收进归档层，实际在 %s 层", got)
+	}
+	if p, _ := app.PendingDowngrade(); p != nil {
+		t.Error("收起来之后就不该还在等回话（它已经不在近期层了）")
+	}
+}
+
+// 提升一条候选 = 写成真规则 + 删掉候选；规则落在 recent 层，且**来源记为 promoted**。
+//
+// source 是"提升"与"情调"的分水岭：候选是"偶尔可以这样"，提升之后进【最近用户希望你】那一段。
+// 而 promoted 又特意与 manual 分开：manual 是"用户亲手写的"，promoted 是"她学来的"——
+// 预算快满时能请谁让位，靠的正是这个区别（见 persona.DowngradeCandidate）。
 func TestPromoteRuleCandidateWritesRuleAndRemovesCandidate(t *testing.T) {
 	app, st, _ := newPersonaApp(t)
 
@@ -243,8 +354,8 @@ func TestPromoteRuleCandidateWritesRuleAndRemovesCandidate(t *testing.T) {
 	if r.Slot != "verbosity" || r.Value != "说话简短一点" {
 		t.Errorf("规则内容不对：%+v", r)
 	}
-	if r.Source != persona.SourceManual || r.Tier != persona.TierRecent {
-		t.Errorf("提升后的规则应当是 manual + recent，实际 %s + %s", r.Source, r.Tier)
+	if r.Source != persona.SourcePromoted || r.Tier != persona.TierRecent {
+		t.Errorf("提升后的规则应当是 promoted + recent，实际 %s + %s", r.Source, r.Tier)
 	}
 	if !r.Enabled {
 		t.Error("新规则应当默认启用")

@@ -4,6 +4,8 @@ import {ui} from '../models';
 import {persona} from '../models';
 import {app} from '../models';
 
+export function ApproveDowngrade(arg1:string):Promise<void>;
+
 export function ArchiveRule(arg1:string):Promise<void>;
 
 export function Ask(arg1:string):Promise<string>;
@@ -42,9 +44,13 @@ export function ImportPersonaFromFile():Promise<persona.Persona>;
 
 export function Memories():Promise<Array<ui.MemoryItem>>;
 
+export function PendingDowngrade():Promise<persona.PersonaRule>;
+
 export function PromoteRuleCandidate(arg1:persona.Candidate):Promise<void>;
 
 export function Quit():Promise<void>;
+
+export function RefuseDowngrade(arg1:string):Promise<void>;
 
 export function RenamePersona(arg1:string,arg2:string):Promise<void>;
 

@@ -565,6 +565,36 @@ func (s *MemoryStore) setRuleTier(id, tier, action string) error {
 	return nil
 }
 
+// MarkDowngradeAsked 实现 Store。
+func (s *MemoryStore) MarkDowngradeAsked(id string, at int64) error {
+	return s.setRuleMark(id, func(r *persona.PersonaRule) { r.DowngradeAskedAt = at })
+}
+
+// MarkDowngradeRefused 实现 Store。
+func (s *MemoryStore) MarkDowngradeRefused(id string, at int64) error {
+	return s.setRuleMark(id, func(r *persona.PersonaRule) { r.DowngradeRefusedAt = at })
+}
+
+// setRuleMark 是这两个标记的共同实现：改字段、**不动 UpdatedAt**、不写变更记录。
+//
+// 为什么不动 UpdatedAt：它是"规则内容什么时候变过"，而这两个标记记的是**一次对话状态**。
+// 动了它会让这条规则在注入顺序里跳到最前（排序里比 UpdatedAt），
+// 于是"她问了一句要不要收"就变成了"这条规则刚被改过、要优先注入"——完全不相干。
+func (s *MemoryStore) setRuleMark(id string, set func(*persona.PersonaRule)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	personaID, idx, _, err := s.locateRuleLocked(id)
+	if err != nil {
+		return err
+	}
+	if _, err := s.writableLocked(personaID); err != nil {
+		return err
+	}
+	set(&s.rules[personaID][idx])
+	return nil
+}
+
 // DeleteRule 删除规则。
 func (s *MemoryStore) DeleteRule(id string) error {
 	s.mu.Lock()

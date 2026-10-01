@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS persona_rules (
     -- 用数据库约束去跟代码里的清单对齐只会制造迁移负担，校验在写入路径上做
     slot       text    NOT NULL,
     value      text    NOT NULL,
-    -- source: explicit / inferred / manual
+    -- source: explicit / inferred / manual / promoted
+    --   promoted = 用户点了「一直这样」把一条**她学来的**候选提升成规则（内容是她提的，决定是用户下的）
+    --   它与 manual 分开，是为了回答"这条可以请她让位吗"——见下面两列
     source     text    NOT NULL,
     -- evidence 是触发这条规则的原始话（敏感内容，导出时不带）
     evidence   text    NOT NULL DEFAULT '',
@@ -41,6 +43,22 @@ CREATE TABLE IF NOT EXISTS persona_rules (
 );
 
 CREATE INDEX IF NOT EXISTS persona_rules_persona_idx ON persona_rules (persona_id, slot);
+
+-- v7 → v8：她"提议把某条旧做法收起来"这一问的状态。
+--
+-- 背景：注入预算快满时，需要有人腾位置。以前的想法是系统自己降层（静默），
+-- 但那会让用户只看到"她变了"、与"她真的忘了"无从分辨——而这个应用里其它影响人格的动作
+-- 都要用户拍板。所以改成：**她开口问一句**（"以前老爱那样，最近不太这样了，以后就不这样了好不好"），
+-- 用户点头才降。这两列就是那一问的状态。
+ALTER TABLE persona_rules ADD COLUMN IF NOT EXISTS downgrade_asked_at   bigint NOT NULL DEFAULT 0;
+ALTER TABLE persona_rules ADD COLUMN IF NOT EXISTS downgrade_refused_at bigint NOT NULL DEFAULT 0;
+
+-- 把"她学来的"与"用户手写的"分开：两者以前都记 manual。
+-- 老数据用 evidence 反推——提升时会把候选的原话带进来，而**手写规则的 evidence 是空的**
+--（导出人格文件时 evidence 会被丢掉，所以导入的规则也落在"空"这一侧，方向是安全的：
+--  宁可不建议它让位，也不要误请用户收掉他自己写的东西）。
+-- 幂等：只改还是 manual 且带原话的行。
+UPDATE persona_rules SET source = 'promoted' WHERE source = 'manual' AND evidence <> '';
 
 CREATE TABLE IF NOT EXISTS persona_changes (
     id         uuid PRIMARY KEY,

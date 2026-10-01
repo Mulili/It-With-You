@@ -150,6 +150,61 @@ func runRuleTierContract(t *testing.T, s persona.Store) {
 			t.Error("内置人格只读，收起来应当被拒绝")
 		}
 	})
+
+	t.Run("降级提议的两个时间戳：只记状态，不动规则本身", func(t *testing.T) {
+		pid := newPersona(t)
+		id := saveRule(t, pid, "tone", persona.TierRecent)
+		ruleOf := func(t *testing.T) persona.PersonaRule {
+			t.Helper()
+			rules, err := s.RulesOf(pid)
+			if err != nil {
+				t.Fatalf("读规则失败: %v", err)
+			}
+			for _, r := range rules {
+				if r.ID == id {
+					return r
+				}
+			}
+			t.Fatal("规则不在列表里")
+			return persona.PersonaRule{}
+		}
+		changeCount := func(t *testing.T) int {
+			t.Helper()
+			changes, err := s.ChangesOf(pid)
+			if err != nil {
+				t.Fatalf("读变更记录失败: %v", err)
+			}
+			n := 0
+			for _, c := range changes {
+				if c.RuleID == id {
+					n++
+				}
+			}
+			return n
+		}
+
+		before, changes := ruleOf(t), changeCount(t)
+		if err := s.MarkDowngradeAsked(id, 1234); err != nil {
+			t.Fatalf("记下「问过」失败: %v", err)
+		}
+		if err := s.MarkDowngradeRefused(id, 5678); err != nil {
+			t.Fatalf("记下「被拒绝」失败: %v", err)
+		}
+
+		after := ruleOf(t)
+		if after.DowngradeAskedAt != 1234 || after.DowngradeRefusedAt != 5678 {
+			t.Errorf("两个时间戳应当被记下，实际 %d / %d", after.DowngradeAskedAt, after.DowngradeRefusedAt)
+		}
+		// ⚠️ UpdatedAt 不能动：它在注入排序里代表"这条规则什么时候改过"，
+		// 动了它会让"她问了一句要不要收"变成"这条刚改过、要优先注入"——完全不相干
+		if after.UpdatedAt != before.UpdatedAt {
+			t.Errorf("记状态不该动 UpdatedAt：%d → %d", before.UpdatedAt, after.UpdatedAt)
+		}
+		// 变更记录是"规则内容/层级变了"的账本，这两个标记不该往里写
+		if got := changeCount(t); got != changes {
+			t.Errorf("这两个标记不该写变更记录：%d → %d 条", changes, got)
+		}
+	})
 }
 
 func TestMemoryStoreRuleTier(t *testing.T) {

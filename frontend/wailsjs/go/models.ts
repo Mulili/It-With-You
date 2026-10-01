@@ -170,6 +170,8 @@ export namespace persona {
 	    enabled: boolean;
 	    createdAt: number;
 	    updatedAt: number;
+	    downgradeAskedAt: number;
+	    downgradeRefusedAt: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new PersonaRule(source);
@@ -189,6 +191,8 @@ export namespace persona {
 	        this.enabled = source["enabled"];
 	        this.createdAt = source["createdAt"];
 	        this.updatedAt = source["updatedAt"];
+	        this.downgradeAskedAt = source["downgradeAskedAt"];
+	        this.downgradeRefusedAt = source["downgradeRefusedAt"];
 	    }
 	}
 	

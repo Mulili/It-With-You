@@ -147,6 +147,66 @@ func (a *App) settlePending() {
 
 	// 候选只由结算产生，所以结算跑完就是清理它们的最好时机（懒归档，不另起定时器）。
 	a.pruneStaleCandidates()
+
+	// 顺便看看要不要请他腾个位置（同样只在结算后做，理由同上）
+	a.maybeAskDowngrade()
+}
+
+// downgradeBudgetRatio 是"该不该请她腾位置"的那条线：这一轮**想要**的注入量到了预算的多少。
+//
+// 0.8 是拍的，但两头都有约束，所以它不能太小也不能太大：
+//   - 太小：她会时不时问一句"我要不要收起点什么"，很烦，而且那时候根本不缺位置；
+//   - 太大：`downgradeAskNote` 自己也要占几十个字，真到 95% 时它反而会把 recent 层的规则
+//     挤掉一条——为了腾位置先挤掉一条，得不偿失。
+//
+// ⚠️ 判据必须用 `persona.PromptBudgetUsed`（**想要多少**，含会被截掉的部分）：
+// 换成"实际注入多少"就永远是超不了预算的（超了的部分被截掉了），这条路永远不触发。
+const downgradeBudgetRatio = 0.8
+
+// maybeAskDowngrade 决定"这一轮该不该请她开口问一句"。
+//
+// 三个条件同时成立才问：
+//  1. 这一轮**想要**的注入量已经接近预算（见 downgradeBudgetRatio）；
+//  2. 有一条**她学来的**规则可以让位（见 persona.DowngradeCandidate：来源是 promoted、
+//     在近期层、priority 最低、最旧的那条）；
+//  3. 她还没问过、你也没拒绝过（那两个时间戳，在 DowngradeCandidate 里一起过滤）。
+//
+// 为什么先"问"而不是直接降：这是整个应用里**唯一一个会改人格的动作**，而其它影响人格的
+// 动作都要用户拍板（提升要点、stable 槽位只有人工能写、候选不会自己变成规则）。
+// 静默降层的话，用户只会觉得"她变了"，而这与"她真的忘了"无从分辨。
+//
+// 它落在**结算之后**那一趟（与清候选、补规则索引并列，都是懒维护，不另起调度器），
+// 而且只针对**当前人格**——别的人格不会说话，问了也没人答。
+//
+// ⚠️ 这里**只落"问过"的时间戳**，一个字都不注入：那一小段指令由 buildMessages
+// 在下一轮拼上下文时加进去（她只在回复里才有说话的机会）。
+func (a *App) maybeAskDowngrade() {
+	if a.personas == nil {
+		return
+	}
+	snap := a.personas.Snapshot()
+	active, ok := findPersona(snap.Personas, snap.ActiveID)
+	if !ok {
+		return
+	}
+	if _, ok := pendingDowngrade(snap.Rules); ok {
+		return // 上一次问的还等着回话，别再问
+	}
+	used := persona.PromptBudgetUsed(active, snap.Rules)
+	if used < int(float64(persona.InjectBudgetRunes)*downgradeBudgetRatio) {
+		return
+	}
+	target, ok := persona.DowngradeCandidate(snap.Rules)
+	if !ok {
+		return // 没有可以让位的（没有她学来的，或者都问过/被拒过了）
+	}
+
+	if err := a.personas.MarkDowngradeAsked(target.ID, time.Now().UnixMilli()); err != nil {
+		log.Printf("[archive] 记下这次提议失败: %v", err)
+		return
+	}
+	log.Printf("[archive] 「%s」想要的注入量 %d/%d 字，已经接近预算；请她问一句要不要把「%s」收起来",
+		active.Name, used, persona.InjectBudgetRunes, clip(target.Value, 30))
 }
 
 // pruneStaleCandidates 淘汰"太久没被提起"的「她学到的」。

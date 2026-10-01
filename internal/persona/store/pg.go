@@ -646,6 +646,38 @@ func (s *PgStore) setRuleTier(id, tier, action string) error {
 	})
 }
 
+// MarkDowngradeAsked 实现 Store。
+func (s *PgStore) MarkDowngradeAsked(id string, at int64) error {
+	return s.setRuleMark(id, "downgrade_asked_at", at)
+}
+
+// MarkDowngradeRefused 实现 Store。
+func (s *PgStore) MarkDowngradeRefused(id string, at int64) error {
+	return s.setRuleMark(id, "downgrade_refused_at", at)
+}
+
+// setRuleMark 是这两个标记的共同实现（列名由调用方给）：
+// **不动 updated_at**、不写变更记录——理由见 persona.Store 上的说明。
+//
+// 列名是拼进 SQL 的，所以只允许来自上面两个常量式的调用——不接收外部输入。
+func (s *PgStore) setRuleMark(id, column string, at int64) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	personaID, _, err := s.locateRule(ctx, id)
+	if err != nil {
+		return err
+	}
+	if _, err := s.loadWritablePersona(ctx, personaID); err != nil {
+		return err
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE persona_rules SET `+column+` = $1 WHERE id = $2::uuid`, at, id); err != nil {
+		return fmt.Errorf("记录降级提议的状态失败: %w", err)
+	}
+	return nil
+}
+
 // DeleteRule 删除规则。
 func (s *PgStore) DeleteRule(id string) error {
 	ctx, cancel := s.ctx()
@@ -812,10 +844,11 @@ func (s *PgStore) inTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
 func (s *PgStore) insertRule(ctx context.Context, tx pgx.Tx, r persona.PersonaRule) error {
 	_, err := tx.Exec(ctx,
 		`INSERT INTO persona_rules
-		   (id, persona_id, slot, value, source, evidence, tier, kind, priority, enabled, created_at, updated_at)
-		 VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+		   (id, persona_id, slot, value, source, evidence, tier, kind, priority, enabled,
+		    created_at, updated_at, downgrade_asked_at, downgrade_refused_at)
+		 VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
 		r.ID, r.PersonaID, r.Slot, r.Value, r.Source, r.Evidence, r.Tier, r.Kind,
-		r.Priority, r.Enabled, r.CreatedAt, r.UpdatedAt)
+		r.Priority, r.Enabled, r.CreatedAt, r.UpdatedAt, r.DowngradeAskedAt, r.DowngradeRefusedAt)
 	if err != nil {
 		return fmt.Errorf("写入规则失败: %w", err)
 	}
@@ -877,7 +910,8 @@ func (s *PgStore) rulesOf(ctx context.Context, personaID string) ([]persona.Pers
 	}
 
 	rows, err := s.pool.Query(ctx,
-		`SELECT id::text, persona_id::text, slot, value, source, evidence, tier, kind, priority, enabled, created_at, updated_at
+		`SELECT id::text, persona_id::text, slot, value, source, evidence, tier, kind, priority, enabled,
+		        created_at, updated_at, downgrade_asked_at, downgrade_refused_at
 		   FROM persona_rules WHERE persona_id = $1::uuid ORDER BY created_at`, personaID)
 	if err != nil {
 		return nil, fmt.Errorf("读取规则失败: %w", err)
@@ -888,7 +922,8 @@ func (s *PgStore) rulesOf(ctx context.Context, personaID string) ([]persona.Pers
 	for rows.Next() {
 		var r persona.PersonaRule
 		if err := rows.Scan(&r.ID, &r.PersonaID, &r.Slot, &r.Value, &r.Source, &r.Evidence,
-			&r.Tier, &r.Kind, &r.Priority, &r.Enabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			&r.Tier, &r.Kind, &r.Priority, &r.Enabled, &r.CreatedAt, &r.UpdatedAt,
+			&r.DowngradeAskedAt, &r.DowngradeRefusedAt); err != nil {
 			return nil, fmt.Errorf("解析规则失败: %w", err)
 		}
 		out = append(out, r)
@@ -904,10 +939,12 @@ func (s *PgStore) rulesOf(ctx context.Context, personaID string) ([]persona.Pers
 func (s *PgStore) locateRule(ctx context.Context, ruleID string) (string, persona.PersonaRule, error) {
 	var r persona.PersonaRule
 	err := s.pool.QueryRow(ctx,
-		`SELECT id::text, persona_id::text, slot, value, source, evidence, tier, kind, priority, enabled, created_at, updated_at
+		`SELECT id::text, persona_id::text, slot, value, source, evidence, tier, kind, priority, enabled,
+		        created_at, updated_at, downgrade_asked_at, downgrade_refused_at
 		   FROM persona_rules WHERE id = $1::uuid`, ruleID).
 		Scan(&r.ID, &r.PersonaID, &r.Slot, &r.Value, &r.Source, &r.Evidence,
-			&r.Tier, &r.Kind, &r.Priority, &r.Enabled, &r.CreatedAt, &r.UpdatedAt)
+			&r.Tier, &r.Kind, &r.Priority, &r.Enabled, &r.CreatedAt, &r.UpdatedAt,
+			&r.DowngradeAskedAt, &r.DowngradeRefusedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", persona.PersonaRule{}, fmt.Errorf("规则 %s 不存在", ruleID)
 	}

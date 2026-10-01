@@ -7,6 +7,7 @@ import {
   GetPersonaSnapshot, SetActivePersona, GetPersonaRules, GetPersonaChanges, GetPersonaMeta,
   CreatePersona, RenamePersona, DeletePersona, SaveSeedText,
   SaveRule, DeleteRule, SetRuleEnabled, ArchiveRule, ReviveRule,
+  PendingDowngrade, ApproveDowngrade, RefuseDowngrade,
   RuleCandidates, PromoteRuleCandidate, DeleteRuleCandidate,
   GetSettings, SetThinkingDisabled, ExportPersonaToFile, ImportPersonaFromFile,
   ContextStat,
@@ -302,6 +303,9 @@ const limits = ref({ seedTextRunes: 1200, ruleValueRunes: 200, injectBudgetRunes
 const detailId = ref('')       // 空 = 列表视图；否则为正在查看的人格 ID
 const detailRules = ref([])    // 详情页里那个人格的规则
 const detailChanges = ref([])  // 详情页里那个人格的最近变更（时间倒序）
+// 她提议"把某条旧做法收起来"、正等着你回话的那条（null = 没有）。
+// 只对**当前人格**有意义：这一问是她在对话里问出来的，别的人格开不了口
+const pendingAsk = ref(null)
 // 详情页里那个人格的「她学到的」：她自己琢磨出来的说话倾向，**已经在偶尔用了**
 const candidates = ref([])
 const seedForm = ref(null)     // null = 未在编辑；否则为 { text }
@@ -322,9 +326,9 @@ function slotLabel(key) {
   return slots.value.find((s) => s.key === key)?.label ?? key
 }
 
-// 规则来源：让人一眼看出"这条是它自己记下的，还是我手动写的"
+// 规则来源：让人一眼看出"这条是她自己学来的，还是我写的"
 function sourceLabel(src) {
-  return { manual: '手动', explicit: '你的要求', inferred: '自动' }[src] ?? src
+  return { manual: '我来定', explicit: '你的要求', inferred: '自动', promoted: '她学来的' }[src] ?? src
 }
 
 function tierLabel(tier) {
@@ -365,6 +369,47 @@ async function loadRules(id) {
   } catch (e) {
     detailRules.value = []
     console.error('读取规则失败', e)
+  }
+}
+
+// 她提议收起来的某条旧做法，正等着你回话（见 internal/app 的 maybeAskDowngrade）。
+//
+// 这一问发生在**对话里**（她会在回复中用自己的话问你），这里只是那个提议的回答入口。
+// 只有当前人格才可能有一问——别的人格不会说话，问了也没人答。
+async function loadPendingAsk(id) {
+  if (!id || id !== activePersonaId.value) {
+    pendingAsk.value = null
+    return
+  }
+  try {
+    pendingAsk.value = await PendingDowngrade()
+  } catch (e) {
+    pendingAsk.value = null
+    console.error('读取她的提议失败', e)
+  }
+}
+
+// 点头 = 收起来（降到归档层，之后仍能被检索回来）。复用后端那条手动「收起」的通路，
+// 所以两种来源不会在某处走样。
+async function approveAsk() {
+  if (!pendingAsk.value) return
+  try {
+    await ApproveDowngrade(pendingAsk.value.id)
+    await loadRules(detailId.value)
+    await loadPendingAsk(detailId.value)
+  } catch (e) {
+    formError.value = errText(e)
+  }
+}
+
+// 不愿意 = 继续守着，而且这条以后不再提（后端记的是"被拒绝过"，不是清掉"问过"）。
+async function refuseAsk() {
+  if (!pendingAsk.value) return
+  try {
+    await RefuseDowngrade(pendingAsk.value.id)
+    await loadPendingAsk(detailId.value)
+  } catch (e) {
+    formError.value = errText(e)
   }
 }
 
@@ -427,7 +472,7 @@ function resetForms() {
 async function openDetail(p) {
   resetForms()
   detailId.value = p.id
-  await Promise.all([loadRules(p.id), loadChanges(p.id), loadCandidates(p.id)])
+  await Promise.all([loadRules(p.id), loadChanges(p.id), loadCandidates(p.id), loadPendingAsk(p.id)])
 }
 
 function closeDetail() {
@@ -645,6 +690,8 @@ function onPersonaChanged(p) {
   if (detailId.value && detailId.value === p.personaId) {
     loadRules(detailId.value)
     loadChanges(detailId.value)
+    // 她那句提议可能刚刚被回答（后端回执先到，状态随后刷）
+    loadPendingAsk(detailId.value)
   }
 }
 
@@ -1123,6 +1170,24 @@ onUnmounted(() => {
                 </li>
               </ul>
             </template>
+
+            <!-- 她在等你回话：她因为要腾位置，提议把某条旧做法收起来（见 internal/app 的 maybeAskDowngrade）。
+                 这是那条提议的回答入口——她已经**在对话里用自己的话问过你**了，
+                 这里只是把答复变成确定的一下（口头说"好呀"目前不会被识别：
+                 误判成同意会直接改人格，方向太危险） -->
+            <div v-if="pendingAsk" class="askbox">
+              <p class="askbox__text">
+                她在等你回话：「{{ slotLabel(pendingAsk.slot) }}：{{ pendingAsk.value }}」
+                —— 她觉得自己已经不太这样了，想收起来。
+              </p>
+              <p class="askbox__hint">
+                收起来之后她不再每轮这么做，但需要的时候还能想起来自己以前是这样。
+              </p>
+              <div class="askbox__acts">
+                <button class="btn" @click="approveAsk">好呀，就这样</button>
+                <button class="btn btn--ghost" @click="refuseAsk">不用了，继续这样</button>
+              </div>
+            </div>
 
             <div class="rules__head">
               <span>规则（{{ detailRules.length }}）</span>
@@ -2003,6 +2068,42 @@ onUnmounted(() => {
   border-top: 1px solid rgba(0, 0, 0, 0.06);
   font-size: 11px;
   color: #6b6b7b;
+}
+
+/* 她在等你回话的那条提议。用左侧色条 + 浅底，与普通规则行区分开：
+   它不是"一条数据"，而是"一件要你拍板的事" */
+.askbox {
+  margin: 8px 10px 2px;
+  padding: 8px 10px;
+  border-left: 3px solid #b58cf0;
+  border-radius: 4px;
+  background: rgba(181, 140, 240, 0.1);
+}
+
+.askbox__text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #3d3d4b;
+}
+
+/* 收起来的后果要提前说清：它是"不再每轮这么做"，不是"忘掉" */
+.askbox__hint {
+  margin: 4px 0 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #6b6b7b;
+}
+
+.askbox__acts {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.askbox__acts .btn {
+  padding: 3px 10px;
+  font-size: 11px;
 }
 
 .rules__head .btn {
