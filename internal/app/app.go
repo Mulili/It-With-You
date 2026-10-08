@@ -15,6 +15,7 @@ import (
 	"agent-for-you-love/internal/llm"
 	"agent-for-you-love/internal/memory"
 	"agent-for-you-love/internal/persona"
+	"agent-for-you-love/internal/tool"
 	"agent-for-you-love/internal/ui"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -99,6 +100,13 @@ type App struct {
 	// 而写入口只有 SetThinkingDisabled 一处，所以缓存不会走样。
 	thinkingDisabled bool
 
+	// tools 是能给模型调用的工具集（阶段4.5）。
+	//
+	// 与其它字段不同，它**不是依赖注入**：工具表由 internal/tool 自己组（内置集合），
+	// 这里持有它只是为了"给模型看哪些"与"按名字执行"来自同一张表。
+	// nil 与空表等价——都表示"这一轮不带 tools 字段"（见 llm.ChatOptions.Tools）。
+	tools *tool.Registry
+
 	// lastCtxStat 是**最近一轮**的上下文构成（界面顶部那条状态条用）。
 	//
 	// 缓存的理由与 thinkingDisabled 不同：这个值算出来就是给人看的，
@@ -113,6 +121,22 @@ func (a *App) nextID() string {
 	return fmt.Sprintf("m%d", a.msgSeq)
 }
 
+// emit 向前端推一个事件，是**推事件的唯一出口**。
+//
+// ⚠️ win 为 nil 时直接丢弃，这不是"防御性编程"而是必须的：Wails 的 EventsEmit 拿到
+// **非生命周期**的 ctx 会直接把进程干掉（不是返回错误）。而测试里 ctx 是
+// context.Background()、win 是 nil——少了这道判断，任何走到推事件那一步的测试
+// 都会把测试进程弄死（publishContextStat 当初就是这么加上的）。
+//
+// 集中成一个出口的理由：分散地调 runtime.EventsEmit 迟早会出现某一处忘了判断 win
+// （只炸测试）或者在生产里漏推事件（只丢功能），而这两种都不容易在本地发现。
+func (a *App) emit(name string, payload any) {
+	if a.ctx == nil || a.win == nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, name, payload)
+}
+
 // NewApp 组装应用。
 //
 // embedder 传 nil 表示嵌入服务不可用，此时记忆功能整体停用（不结算、不抽取），
@@ -121,7 +145,8 @@ func (a *App) nextID() string {
 func NewApp(provider llm.Provider, personas persona.Store, hist history.Store,
 	mems memory.Store, embedder llm.Embedder, trayIcon []byte) *App {
 	a := &App{provider: provider, personas: personas, history: hist,
-		memories: mems, embedder: embedder, trayIcon: trayIcon}
+		memories: mems, embedder: embedder, trayIcon: trayIcon,
+		tools: tool.Builtins()}
 	// 思考开关读一次就缓存在内存：Ask 每轮都要用它，不该每次都查库。
 	// 读失败按默认（false = 跟随官方默认的"思考开启"）继续——一个设置读不到，
 	// 不该让整个应用起不来。
@@ -191,10 +216,7 @@ func (a *App) Shutdown(ctx context.Context) {
 // 之所以不用「返回值」而用「事件」：阶段2 接入 LLM 后，说话会由后端流式主动发起，
 // 方向天然是 Go → 前端。这里先用同一条通路，后面接 LLM 时不必改架构。
 func (a *App) Say(text string) {
-	if a.ctx == nil {
-		return
-	}
-	runtime.EventsEmit(a.ctx, ui.EventSay, ui.SayPayload{
+	a.emit(ui.EventSay, ui.SayPayload{
 		Text: text,
 		At:   time.Now().UnixMilli(),
 	})
@@ -430,14 +452,8 @@ func (a *App) publishContextStat(s ui.ContextStat) {
 	a.lastCtxStat = s
 	a.mu.Unlock()
 
-	// win 由 Startup 建立，所以它等价于"Wails 运行时和界面都已经起来了"。
-	// 守这一道不是顺手加的：EventsEmit 拿到**不是生命周期给的那个 ctx** 会直接结束进程，
-	// 而测试里正好就是这个样子（ctx 是 context.Background()，win 是 nil）——
-	// 少了这道判断，任何调 buildMessages 的测试都会把整个测试进程带走。
-	if a.win == nil {
-		return
-	}
-	runtime.EventsEmit(a.ctx, ui.EventContextStat, s)
+	// 推事件的判断（win 为 nil 就丢弃）统一在 emit 里，见那里的说明
+	a.emit(ui.EventContextStat, s)
 }
 
 // requireStore 统一处理"存储未就绪"。
@@ -448,64 +464,99 @@ func (a *App) requireStore() error {
 	return nil
 }
 
-// stream 消费 Provider 的通道，边收边推事件。
+// maxToolRounds 是一轮对话里最多执行几轮工具调用。
+//
+// 上限的意义：模型偶尔会陷进「调工具 → 拿到结果 → 再调同一个」的循环，
+// 而每多一轮都是一次完整的模型调用（几秒 + 钱）。3 轮足够覆盖正常链路
+// （查时间后回答、搜索后抓正文再回答）。到上限后**不再给工具**，逼她用现有的东西收尾——
+// 直接掐断的话可能一个字正文都没有，那一轮就没东西可落库了。
+const maxToolRounds = 3
+
+// stream 跑完一整轮回复：可能是"她直接说完"，也可能是"她要调工具、拿到结果接着说"。
 //
 // sessionID / chunkID 决定这条回复写进哪段会话的哪一片；personaID 决定它属于哪个人格——
 // 即使用户中途切了人格、或聊开了新话题，这条回复仍然属于"当初被问的那个人、那一次对话"。
 //
 // noThinking 是这一轮的思考开关（由 Ask 在锁内读出后传入，不在这里读 a 的字段）。
+//
+// 工具循环的形状：
+//
+//	ChatStream（带 tools）→ 她吐出正文 + 可能带上 tool_calls
+//	   ├─ 没有 tool_calls → 收尾（落库 / done / 计数 / 结算）
+//	   └─ 有 → 把这一轮的 assistant 消息（含 tool_calls + 思维链）回灌
+//	          → 逐个执行工具 → 每个结果作为 tool 消息回灌 → 再 ChatStream
+//
+// **中间过程不落库**，这是有意的取舍：她调了什么、拿到什么，只活在这一次循环的 msgs 里
+// （那是局部变量）。历史表里只该有「角色 + 正文」这种能直接给人看的对话，
+// 而 tool 消息是协议 JSON——落库之后每处读历史的地方都要判「这条要不要折叠成人话」
+// （见 operation.md 的历史投影）。代价是下一轮她不记得自己查过什么，
+// 而这对于"查时间"这类一次性信息没有损失：结论已经写在她那句话里了。
 func (a *App) stream(ctx context.Context, id, sessionID, chunkID, personaID string, msgs []llm.Message, noThinking bool, rec recallResult) {
-	ch, err := a.provider.ChatStream(ctx, msgs, llm.ChatOptions{DisableThinking: noThinking})
-	if err != nil {
-		// 走到这里说明请求还没发出去（缺 Key、网络不通、4xx）。历史里保留用户这句，方便重试。
-		runtime.EventsEmit(a.ctx, ui.EventChatError, ui.ChatErrorPayload{ID: id, Message: err.Error()})
-		return
-	}
+	var answer strings.Builder // 各轮正文拼起来，就是她这一轮说的话
 
-	var full strings.Builder    // 她的完整输出，含可能出现在末尾的 [[used:…]]
-	var pending strings.Builder // 还没判定"能不能推给前端"的尾巴
-	for chunk := range ch {     // 必须读到底：提前 return 会让生产端 goroutine 永久阻塞
-		if chunk.Err != nil {
-			if errors.Is(chunk.Err, context.Canceled) {
-				// 用户点了停止、发了新问题、或切了人格——这不是错误，安静收场。
-				// 已收到的半截内容照样进历史，但标成 canceled：菜单要能把它和正常回复区分开。
-				body, _ := stripRecallUsage(full.String())
+	for round := 0; ; round++ {
+		// 到上限就不再带工具（见 maxToolRounds）
+		opts := llm.ChatOptions{DisableThinking: noThinking}
+		if round < maxToolRounds {
+			opts.Tools = a.toolSpecs()
+		}
+
+		content, calls, reasoning, canceled, err := a.streamRound(ctx, id, msgs, opts)
+		if err != nil {
+			// 走到这里说明请求还没发出去（缺 Key、网络不通、4xx）。
+			// 历史里保留用户这句，方便重试
+			a.emit(ui.EventChatError, ui.ChatErrorPayload{ID: id, Message: err.Error()})
+			return
+		}
+		if canceled {
+			// 用户点了停止、发了新问题、或切了人格——这不是错误，安静收场。
+			// 已收到的半截内容照样进历史，但标成 canceled：菜单要能把它和正常回复区分开。
+			body, _ := stripRecallUsage(answer.String() + content)
+			a.appendAssistant(sessionID, chunkID, personaID, body, ui.StatusCanceled)
+			return
+		}
+
+		// 轮次之间补一个换行：她先说「我看一眼」、再接着说结论，两句话不该黏成一句。
+		// 这里补的那一个字符也要推给前端，否则界面里看到的东西与落库的不一致
+		if answer.Len() > 0 && content != "" {
+			answer.WriteString("\n")
+			a.emit(ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: "\n"})
+		}
+		answer.WriteString(content)
+
+		if len(calls) == 0 {
+			break // 她说完了，没有要调的工具
+		}
+
+		// 她要调工具：先把她这一轮说的话（含 tool_calls 与思维链）原样回灌。
+		//
+		// ReasoningContent 必须带上：官方硬规则是"assistant 做过工具调用的那一轮，
+		// 两个 user 消息之间要回传思维链"，不回传会直接报错。她没开思考模式时它是空串，
+		// 而 omitempty 会让这个字段根本不出现——两种情况都对。
+		msgs = append(msgs, llm.Message{
+			Role:             llm.RoleAssistant,
+			Content:          content,
+			ToolCalls:        calls,
+			ReasoningContent: reasoning,
+		})
+		for _, tc := range calls {
+			out := a.callTool(ctx, tc)
+			if ctx.Err() != nil {
+				// 执行期间用户点了停止：把已吐出的内容按"被打断"收尾
+				body, _ := stripRecallUsage(answer.String())
 				a.appendAssistant(sessionID, chunkID, personaID, body, ui.StatusCanceled)
 				return
 			}
-			runtime.EventsEmit(a.ctx, ui.EventChatError, ui.ChatErrorPayload{ID: id, Message: chunk.Err.Error()})
-			return
+			msgs = append(msgs, llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, Content: out})
 		}
-		if chunk.Content == "" {
-			continue
-		}
-		full.WriteString(chunk.Content)
-		pending.WriteString(chunk.Content)
-
-		// 只推"确定不是标记开头"的那一段：标记在最末尾，而一个块可能正好把 "[[used:" 切开，
-		// 这一块里认不出来。尾巴留着，等下一块拼齐再决定——否则它会在界面上闪一下。
-		if s := pending.String(); true {
-			if n := safePrefixLen(s); n > 0 {
-				runtime.EventsEmit(a.ctx, ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: s[:n]})
-				pending.Reset()
-				pending.WriteString(s[n:])
-			}
-		}
+		// ⚠️ 这里没有"正在查…"的前端提示：查时间是零延迟的，加了反而闪一下。
+		// 接联网搜索（几百毫秒到几秒）时必须补一个事件，否则界面看着像卡住了。
 	}
 
-	// 收尾。pending 里可能还扣着几个字符（正好是标记开头的前缀，或者标记本身）——
-	// 到这一步已经能精确判断，属于正文的补推出去，标记及其之后丢弃。
-	if s := pending.String(); s != "" {
-		if i := strings.Index(s, recallUsageOpen); i < 0 {
-			runtime.EventsEmit(a.ctx, ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: s})
-		} else if i > 0 {
-			runtime.EventsEmit(a.ctx, ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: s[:i]})
-		}
-	}
-
-	body, used := stripRecallUsage(full.String())
+	// 收尾。正文里可能还扣着 [[used:…]] 标记——落库前剥掉（它只是给她自己看的账）
+	body, used := stripRecallUsage(answer.String())
 	a.appendAssistant(sessionID, chunkID, personaID, body, ui.StatusOK)
-	runtime.EventsEmit(a.ctx, ui.EventChatDone, ui.ChatDonePayload{ID: id})
+	a.emit(ui.EventChatDone, ui.ChatDonePayload{ID: id})
 
 	// 计数归口：只给她**真的用到了**的那些 +1（见 markUsed）。
 	// 放在这里而不是 recall 里，是因为只有读完整段回复才知道她到底用到了哪几条。
@@ -519,6 +570,91 @@ func (a *App) stream(ctx context.Context, id, sessionID, chunkID, personaID stri
 	// 摘要还没进库，检索必然是空的——正好错过最需要它的那一刻。
 	// 放在这里，它就能在用户读回复、打字的那几秒里结算完。
 	go a.settlePending()
+}
+
+// streamRound 跑一轮流式输出：把正文增量推给前端，返回这一轮的完整结果。
+//
+// 推流时的**尾部缓冲**（pending + safePrefixLen）在这里：它防的是 [[used:…]] 标记
+// 在界面上闪一下——标记在最末尾，而一个块可能正好把它切开。
+// **每轮独立缓冲**：标记只可能出现在整段回复的最末尾（最后一轮），
+// 中间那些轮次的结尾不可能正好是标记的前缀，所以轮末直接 flush 是安全的。
+//
+// 返回值里的 canceled 表示"这一轮被用户中止"（不是错误，半截内容照样有用）；
+// err 只在**请求还没发出去**时非 nil。
+func (a *App) streamRound(ctx context.Context, id string, msgs []llm.Message, opts llm.ChatOptions) (
+	content string, calls []llm.ToolCall, reasoning string, canceled bool, err error) {
+
+	ch, err := a.provider.ChatStream(ctx, msgs, opts)
+	if err != nil {
+		return "", nil, "", false, err
+	}
+
+	var full strings.Builder    // 这一轮的完整输出，含可能出现在末尾的 [[used:…]]
+	var pending strings.Builder // 还没判定"能不能推给前端"的尾巴
+	for chunk := range ch {     // 必须读到底：提前 return 会让生产端 goroutine 永久阻塞
+		if chunk.Err != nil {
+			if errors.Is(chunk.Err, context.Canceled) || errors.Is(chunk.Err, context.DeadlineExceeded) {
+				return full.String(), nil, "", true, nil
+			}
+			return "", nil, "", false, chunk.Err
+		}
+		if chunk.Done {
+			// 工具调用与思维链挂在收尾那一帧上（见 llm.Chunk 的说明）
+			return full.String(), chunk.ToolCalls, chunk.Reasoning, false, nil
+		}
+		if chunk.Content == "" {
+			continue
+		}
+		full.WriteString(chunk.Content)
+		pending.WriteString(chunk.Content)
+
+		// 只推"确定不是标记开头"的那一段：标记在最末尾，而一个块可能正好把 "[[used:" 切开，
+		// 这一块里认不出来。尾巴留着，等下一块拼齐再决定——否则它会在界面上闪一下。
+		if s := pending.String(); true {
+			if n := safePrefixLen(s); n > 0 {
+				a.emit(ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: s[:n]})
+				pending.Reset()
+				pending.WriteString(s[n:])
+			}
+		}
+	}
+
+	// 通道关闭却没等到收尾帧（provider 约定会发，这里是防御）：按"她说完了"处理，
+	// 不带 tool_calls——万一是被截断的，拼出来的参数也不是合法的调用
+	if s := pending.String(); s != "" {
+		if i := strings.Index(s, recallUsageOpen); i < 0 {
+			a.emit(ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: s})
+		} else if i > 0 {
+			a.emit(ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: s[:i]})
+		}
+	}
+	return full.String(), nil, "", false, nil
+}
+
+// toolSpecs 返回给模型的工具声明（空表 → 请求里不带 tools 字段）。
+func (a *App) toolSpecs() []llm.Tool {
+	if a.tools == nil {
+		return nil
+	}
+	return a.tools.Specs()
+}
+
+// callTool 执行一次工具调用，**永远返回一段可以给模型看的文本**。
+//
+// 为什么错误也变成文本、而不是往外抛：这是 function calling 的标准姿态——
+// 模型拿到「这个工具失败了」能自己决定怎么办（换个说法、或者老实说查不到），
+// 而我们抛错只会让整轮对话断在半截。参数坏掉、工具名编错，都属于这一类。
+func (a *App) callTool(ctx context.Context, tc llm.ToolCall) string {
+	if a.tools == nil {
+		return "当前没有可用的工具"
+	}
+	out, err := a.tools.Call(ctx, tc.Function.Name, tc.Function.Arguments)
+	if err != nil {
+		log.Printf("[tool] %s 调用失败: %v", tc.Function.Name, err)
+		return "调用失败：" + err.Error()
+	}
+	log.Printf("[tool] 调用了 %s，返回 %d 字", tc.Function.Name, utf8.RuneCountInString(out))
+	return out
 }
 
 // appendAssistant 把这一轮的回复写进**它所属的那一片**。

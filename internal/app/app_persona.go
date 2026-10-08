@@ -110,7 +110,7 @@ func (a *App) handleDirective(userText string) {
 		summary += "（当前是内置人格，已为你复制一份可编辑的）"
 	}
 	log.Printf("[persona] %s", summary)
-	runtime.EventsEmit(a.ctx, ui.EventPersonaChanged, ui.PersonaChangedPayload{
+	a.emit(ui.EventPersonaChanged, ui.PersonaChangedPayload{
 		PersonaID: personaID,
 		Action:    persona.ActionUpdate,
 		Slot:      d.Slot,
@@ -662,10 +662,7 @@ func personaFileName(name string) string {
 // notifyPersonaChanged 通知前端"人格数据变了"：菜单与设置浮层据此刷新，并用 summary 弹一条回执。
 func (a *App) notifyPersonaChanged(personaID, action, summary string) {
 	log.Printf("[persona] %s", summary)
-	if a.ctx == nil {
-		return
-	}
-	runtime.EventsEmit(a.ctx, ui.EventPersonaChanged, ui.PersonaChangedPayload{
+	a.emit(ui.EventPersonaChanged, ui.PersonaChangedPayload{
 		PersonaID: personaID,
 		Action:    action,
 		Summary:   summary,

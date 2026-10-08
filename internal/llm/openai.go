@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 )
 
@@ -60,6 +61,10 @@ type chatRequest struct {
 	// 只在调用方明确要求关思考时才带：对不认识它的服务端，多带一个未知字段会直接 400。
 	// 走手写 HTTP 时它就是**顶层字段**（用官方 SDK 才需要塞进 extra_body）。
 	Thinking *thinkingSpec `json:"thinking,omitempty"`
+	// Tools 是工具声明（function calling）。同 Thinking：不需要时不带，
+	// 免得给不支持它的服务端塞一个未知字段。tool_choice 用服务端默认（auto）——
+	// 我们不做"强制它必须调某个工具"这种需求。
+	Tools []Tool `json:"tools,omitempty"`
 }
 
 // thinkingSpec 对应 DeepSeek 的思考模式开关。
@@ -94,9 +99,26 @@ type streamResponse struct {
 		// Delta 是本帧的增量（区别于非流式的 message，后者是整段回答）
 		Delta struct {
 			Content string `json:"content"`
+			// ReasoningContent 是思考模式的思维链增量（DeepSeek 扩展字段）。
+			// 它不显示给用户，但工具循环里必须原样回传（见 Message.ReasoningContent）。
+			ReasoningContent string `json:"reasoning_content"`
+			// ToolCalls 是**分片**的工具调用：一次调用会被切成好几帧，
+			// id / name / arguments 各自可能只到一半，要靠 index 认领并拼接。
+			//
+			// 注意 index 是协议里唯一可靠的认领依据：id 与 name 只出现在第一片上，
+			// 后面几片只有 arguments 的续写。
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"delta"`
 		// FinishReason 目前不参与判断（本轮结束以 [DONE] 哨兵为准）。
-		// 保留它是为将来区分"正常说完"与"被 max_tokens 截断"（值为 "length"）留个口子。
+		// 保留它是为将来区分"正常说完"与"被 max_tokens 截断"（值为 "length"）留个口子，
+		// 以及"这一轮是工具调用"（值为 "tool_calls"）——但那个也可以从是否收到 tool_calls 看出来。
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 }
@@ -122,6 +144,7 @@ func (p *OpenAIProvider) newRequest(c context.Context, messages []Message, strea
 		Stream:         stream,
 		ResponseFormat: rf,
 		Thinking:       th,
+		Tools:          opts.Tools,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("序列化请求失败: %w", err)
@@ -208,7 +231,11 @@ func (p *OpenAIProvider) ChatStream(c context.Context, messages []Message, opts 
 	}
 	// 流式路径只认 DisableThinking：JSON 模式要求一次性给出完整对象，与逐帧流出天然矛盾，
 	// 这里显式丢掉，免得"流式 + json_object"这种无意义组合被静默发出去。
-	resp, err := p.send(c, messages, true, ChatOptions{DisableThinking: opts.DisableThinking})
+	// tools 照常传：工具调用本来就是流式的（她把话说完、再要求调工具）。
+	resp, err := p.send(c, messages, true, ChatOptions{
+		DisableThinking: opts.DisableThinking,
+		Tools:           opts.Tools,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -232,6 +259,13 @@ func (p *OpenAIProvider) ChatStream(c context.Context, messages []Message, opts 
 //	data: {"choices":[{"delta":{"content":"你"},"finish_reason":null}]}
 //	: keep-alive                     ← 冒号开头的是注释/心跳，用于保活，不是内容
 //	data: [DONE]                     ← 结束哨兵，注意它不是合法 JSON
+//
+// 两类 delta 要**攒到流结束**才交出去（挂在最后那个 Chunk 上）：
+//   - tool_calls：按 index 分片，arguments 是一片一片拼出来的 JSON 字符串；
+//   - reasoning_content：思考模式的思维链，工具循环里要原样回传。
+//
+// 为什么不边收边透传分片：拼接与认领是协议细节（见 Chunk 的注释），
+// 上层只该看到"她想调什么、参数是什么"这一件事，而不是"第 3 帧里 arguments 又多了两个字"。
 func (p *OpenAIProvider) pump(c context.Context, r io.Reader, ch chan<- Chunk) {
 	scanner := bufio.NewScanner(r)
 
@@ -239,12 +273,23 @@ func (p *OpenAIProvider) pump(c context.Context, r io.Reader, ch chan<- Chunk) {
 	// 一帧增量通常只有几个字，但首帧可能带上很长的 role / 元信息，留 1MB 余量更稳。
 	scanner.Buffer(make([]byte, 0, 64<<10), 1<<20)
 
+	// toolAcc 按协议里的 index 认领分片。用 map 而不是切片：index 理论上可能跳号，
+	// 而 map + 收尾排序比"先分配一个大切片再判越界"更不容易出错。
+	toolAcc := map[int]*ToolCall{}
+	var reasoning strings.Builder
+
+	// done 是三个收尾出口的公共部分：把攒好的东西挂上，然后结束这一轮。
+	done := func() {
+		ch <- Chunk{Done: true, ToolCalls: toolCalls(toolAcc), Reasoning: reasoning.String()}
+	}
+
 	for scanner.Scan() {
 		// 每读一行查一次取消状态。粒度是"行"：若正卡在上一行的 ch <- 上，
 		// 要等消费端取走才会走到这里（消费端按约定读到底，所以不会真的卡死）。
 		select {
 		case <-c.Done():
-			// 把取消当成一种"结束原因"交给上层，由上层决定这算错误还是正常收场
+			// 把取消当成一种"结束原因"交给上层，由上层决定这算错误还是正常收场。
+			// 不带 tool_calls：半截的 arguments 拼出来也不是合法的调用
 			ch <- Chunk{Err: c.Err()}
 			return
 		default:
@@ -265,7 +310,7 @@ func (p *OpenAIProvider) pump(c context.Context, r io.Reader, ch chan<- Chunk) {
 
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
-			ch <- Chunk{Done: true} // 收尾出口之一：正常结束
+			done() // 收尾出口之一：正常结束
 			return
 		}
 		var sr streamResponse
@@ -278,8 +323,27 @@ func (p *OpenAIProvider) pump(c context.Context, r io.Reader, ch chan<- Chunk) {
 		if len(sr.Choices) == 0 {
 			continue
 		}
-		if delta := sr.Choices[0].Delta.Content; delta != "" {
-			ch <- Chunk{Content: delta}
+		d := sr.Choices[0].Delta
+		if d.ReasoningContent != "" {
+			reasoning.WriteString(d.ReasoningContent)
+		}
+		for _, tc := range d.ToolCalls {
+			acc, ok := toolAcc[tc.Index]
+			if !ok {
+				acc = &ToolCall{Type: "function"}
+				toolAcc[tc.Index] = acc
+			}
+			// id 与 name 只在第一片出现，所以这里是"有就覆盖、没有就留着"
+			if tc.ID != "" {
+				acc.ID = tc.ID
+			}
+			if tc.Function.Name != "" {
+				acc.Function.Name = tc.Function.Name
+			}
+			acc.Function.Arguments += tc.Function.Arguments
+		}
+		if d.Content != "" {
+			ch <- Chunk{Content: d.Content}
 		}
 	}
 
@@ -290,5 +354,25 @@ func (p *OpenAIProvider) pump(c context.Context, r io.Reader, ch chan<- Chunk) {
 	}
 	// 收尾出口之三：连接正常读完但始终没收到 [DONE]（部分服务端如此），按正常完成处理。
 	// 走到这里说明上面的 [DONE] 分支没命中，所以不存在重复发 Done 的问题。
-	ch <- Chunk{Done: true}
+	done()
+}
+
+// toolCalls 把攒好的分片按 index 收成有序切片（index 小的在前，与服务端给的调用顺序一致）。
+//
+// 为什么收成切片而不是直接把 map 交出去：调用方要按顺序执行、按顺序回结果，
+// 而 map 的遍历顺序在 Go 里是随机的——那会让"工具执行顺序"变成不可复现的行为。
+func toolCalls(acc map[int]*ToolCall) []ToolCall {
+	if len(acc) == 0 {
+		return nil
+	}
+	idx := make([]int, 0, len(acc))
+	for i := range acc {
+		idx = append(idx, i)
+	}
+	sort.Ints(idx)
+	out := make([]ToolCall, 0, len(idx))
+	for _, i := range idx {
+		out = append(out, *acc[i])
+	}
+	return out
 }
