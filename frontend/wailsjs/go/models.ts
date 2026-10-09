@@ -2,6 +2,8 @@ export namespace app {
 	
 	export class AppSettings {
 	    thinkingDisabled: boolean;
+	    searchDisabled: boolean;
+	    searchUrl: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new AppSettings(source);
@@ -10,6 +12,8 @@ export namespace app {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.thinkingDisabled = source["thinkingDisabled"];
+	        this.searchDisabled = source["searchDisabled"];
+	        this.searchUrl = source["searchUrl"];
 	    }
 	}
 

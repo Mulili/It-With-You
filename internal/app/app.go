@@ -17,6 +17,7 @@ import (
 	"agent-for-you-love/internal/persona"
 	"agent-for-you-love/internal/tool"
 	"agent-for-you-love/internal/ui"
+	"agent-for-you-love/internal/web"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -100,6 +101,17 @@ type App struct {
 	// 而写入口只有 SetThinkingDisabled 一处，所以缓存不会走样。
 	thinkingDisabled bool
 
+	// searchDisabled 是"允许她上网"的总开关（同样是应用级设置 + 内存缓存）。
+	//
+	// 关掉它时**她连搜索工具都看不见**（见 tool.Availability）：让她拿着一个被禁止的能力
+	// 反复试，比干脆不给她更糟——用户看到的是"她老说查不到"。
+	searchDisabled bool
+	// searchURL 是用户填的搜索服务地址（**原值**，可能为空）。
+	//
+	// 空 != 关闭联网：空表示"没填过"，此时用 defaultSearchURL（见 searchURLOrDefault）。
+	// 缓存原值而不是"最终地址"，是为了设置页里显示的是他真正填的东西。
+	searchURL string
+
 	// tools 是能给模型调用的工具集（阶段4.5）。
 	//
 	// 与其它字段不同，它**不是依赖注入**：工具表由 internal/tool 自己组（内置集合），
@@ -145,20 +157,51 @@ func (a *App) emit(name string, payload any) {
 func NewApp(provider llm.Provider, personas persona.Store, hist history.Store,
 	mems memory.Store, embedder llm.Embedder, trayIcon []byte) *App {
 	a := &App{provider: provider, personas: personas, history: hist,
-		memories: mems, embedder: embedder, trayIcon: trayIcon,
-		tools: tool.Builtins()}
-	// 思考开关读一次就缓存在内存：Ask 每轮都要用它，不该每次都查库。
-	// 读失败按默认（false = 跟随官方默认的"思考开启"）继续——一个设置读不到，
-	// 不该让整个应用起不来。
+		memories: mems, embedder: embedder, trayIcon: trayIcon}
+	// 应用级设置读一次就缓存在内存：Ask 每轮都要用它们，不该每次都查库。
+	// 读失败一律按默认继续——一个设置读不到，不该让整个应用起不来。
 	if personas != nil {
-		disabled, err := personas.ThinkingDisabled()
-		if err != nil {
+		if disabled, err := personas.ThinkingDisabled(); err != nil {
 			log.Printf("[app] 读取思考开关失败，按默认（开启思考）处理: %v", err)
 		} else {
 			a.thinkingDisabled = disabled
 		}
+		if disabled, err := personas.SearchDisabled(); err != nil {
+			log.Printf("[app] 读取联网开关失败，按默认（允许联网）处理: %v", err)
+		} else {
+			a.searchDisabled = disabled
+		}
+		if u, err := personas.SearchURL(); err != nil {
+			log.Printf("[app] 读取搜索服务地址失败，按默认地址处理: %v", err)
+		} else {
+			a.searchURL = u
+		}
 	}
+	// 工具集**在设置读完之后**再建：搜索工具的"可不可用"就取决于上面那两个值
+	//（地址为空用默认、开关为关就整个藏起来，见 tool.Availability）。
+	a.tools = tool.Builtins(web.NewSearcher(a.searchURLOrDefault), web.NewReader(), a.searchEnabled)
 	return a
+}
+
+// defaultSearchURL 是本机搜索服务的默认地址（OpenSERP 的默认监听端口）。
+//
+// 为什么给默认而不是"没配就不用"：本地已经跑着 OpenSERP 是最常见的用法，
+// 默认地址让这种场景开箱即用；完全没跑的用户会看到"她查不到"——
+// 这比"工具明明在、却是灰的、还要去设置里找个地址填"更好懂。
+const defaultSearchURL = "http://127.0.0.1:7000"
+
+// searchURLOrDefault 返回搜索服务地址：用户填过就用他的，没填过用默认。
+func (a *App) searchURLOrDefault() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.searchURLOrDefaultLocked()
+}
+
+// searchEnabled 是给工具用的"允许联网吗"（见 tool.WebSearch.Enabled）。
+func (a *App) searchEnabled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return !a.searchDisabled
 }
 
 // Startup 由 Wails 在应用启动时调用，此后 runtime 才可用。
@@ -540,6 +583,8 @@ func (a *App) stream(ctx context.Context, id, sessionID, chunkID, personaID stri
 			ReasoningContent: reasoning,
 		})
 		for _, tc := range calls {
+			// 耗时工具先给个"她正在…"的提示（查时间这类零延迟的不发，见 announceTool）
+			a.announceTool(id, tc.Function.Name)
 			out := a.callTool(ctx, tc)
 			if ctx.Err() != nil {
 				// 执行期间用户点了停止：把已吐出的内容按"被打断"收尾
@@ -549,8 +594,6 @@ func (a *App) stream(ctx context.Context, id, sessionID, chunkID, personaID stri
 			}
 			msgs = append(msgs, llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, Content: out})
 		}
-		// ⚠️ 这里没有"正在查…"的前端提示：查时间是零延迟的，加了反而闪一下。
-		// 接联网搜索（几百毫秒到几秒）时必须补一个事件，否则界面看着像卡住了。
 	}
 
 	// 收尾。正文里可能还扣着 [[used:…]] 标记——落库前剥掉（它只是给她自己看的账）
@@ -655,6 +698,34 @@ func (a *App) callTool(ctx context.Context, tc llm.ToolCall) string {
 	}
 	log.Printf("[tool] 调用了 %s，返回 %d 字", tc.Function.Name, utf8.RuneCountInString(out))
 	return out
+}
+
+// announceTool 给**耗时**工具推一条"她正在…"的提示。
+//
+// 为什么要按工具区分：查时间几乎瞬间返回，若也推一条提示，界面上会闪一下
+// （"正在看时间…"还没来得及显示就已经变成了答案），反而像卡顿。
+// 联网搜索要几秒、读一页更久，那才是必须提示的——见 ui.EventToolRunning。
+func (a *App) announceTool(id, name string) {
+	label := toolNotice(name)
+	if label == "" {
+		return // 零延迟的工具不提示
+	}
+	a.emit(ui.EventToolRunning, ui.ToolRunningPayload{ID: id, Tool: name, Label: label})
+}
+
+// toolNotice 把工具名翻成给人看的一句话；返回空串表示"不用提示"。
+//
+// 文案留在后端：工具名是协议里的东西（前端不该认识 web_search 这种英文标识），
+// 加新工具时也只改这一处。
+func toolNotice(name string) string {
+	switch name {
+	case "web_search":
+		return "正在上网查…"
+	case "read_page":
+		return "正在打开网页看…"
+	default:
+		return ""
+	}
 }
 
 // appendAssistant 把这一轮的回复写进**它所属的那一片**。

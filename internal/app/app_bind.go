@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"log"
+	"strings"
 
 	"agent-for-you-love/internal/history"
 	"agent-for-you-love/internal/ui"
@@ -37,13 +38,30 @@ func (a *App) ContextStat() ui.ContextStat {
 type AppSettings struct {
 	// ThinkingDisabled 为 true 表示用户关掉了思考模式；默认 false = 跟随官方默认（思考开启）
 	ThinkingDisabled bool `json:"thinkingDisabled"`
+	// SearchDisabled 为 true 表示用户关掉了联网；默认 false = 允许她上网
+	SearchDisabled bool `json:"searchDisabled"`
+	// SearchURL 是**最终生效**的搜索服务地址（已经补过默认，见 searchURLOrDefault），
+	// 设置页直接显示它、不必自己拼默认值。用户改了就存下来。
+	SearchURL string `json:"searchUrl"`
 }
 
 // GetSettings 返回全局设置。
 func (a *App) GetSettings() AppSettings {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return AppSettings{ThinkingDisabled: a.thinkingDisabled}
+	return AppSettings{
+		ThinkingDisabled: a.thinkingDisabled,
+		SearchDisabled:   a.searchDisabled,
+		SearchURL:        a.searchURLOrDefaultLocked(),
+	}
+}
+
+// searchURLOrDefaultLocked 是 searchURLOrDefault 的**加锁版**，供已在锁内的地方复用。
+func (a *App) searchURLOrDefaultLocked() string {
+	if v := strings.TrimSpace(a.searchURL); v != "" {
+		return v
+	}
+	return defaultSearchURL
 }
 
 // SetThinkingDisabled 保存思考模式开关。
@@ -70,6 +88,57 @@ func (a *App) SetThinkingDisabled(disabled bool) error {
 		state = "已关闭思考模式"
 	}
 	log.Printf("[app] %s（只影响对话，人格抽取不受影响）", state)
+	return nil
+}
+
+// SetSearchDisabled 保存联网总开关。
+//
+// 关掉它的效果不只是"不搜"：她会**连联网工具都看不见**（搜索与读网页，见 tool.Availability）——
+// 让她拿着一个被禁止的能力反复试，比干脆不给她更糟（用户看到的是"她老说查不到"）。
+//
+// 默认不关：这是用户的偏好，不替他做决定。
+func (a *App) SetSearchDisabled(disabled bool) error {
+	if err := a.requireStore(); err != nil {
+		return err
+	}
+	if err := a.personas.SetSearchDisabled(disabled); err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	a.searchDisabled = disabled
+	a.mu.Unlock()
+
+	state := "已允许她上网"
+	if disabled {
+		state = "已关闭联网（她连搜索工具都看不见）"
+	}
+	log.Printf("[app] %s", state)
+	return nil
+}
+
+// SetSearchURL 保存搜索服务地址（空串 = 清回默认，见 defaultSearchURL）。
+//
+// 存的是**原值**：清空后 GetSettings 会显示回默认地址，但库里留下的是空——
+// 于是"我从没改过"和"我改成了默认那个值"仍然分得清。
+func (a *App) SetSearchURL(url string) error {
+	if err := a.requireStore(); err != nil {
+		return err
+	}
+	url = strings.TrimSpace(url)
+	if err := a.personas.SetSearchURL(url); err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	a.searchURL = url
+	a.mu.Unlock()
+
+	if url == "" {
+		log.Printf("[app] 搜索服务地址已清回默认（%s）", defaultSearchURL)
+	} else {
+		log.Printf("[app] 搜索服务地址已设为 %s", url)
+	}
 	return nil
 }
 

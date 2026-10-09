@@ -72,6 +72,10 @@ export function SetMenuOpen(arg1:boolean):Promise<void>;
 
 export function SetRuleEnabled(arg1:string,arg2:boolean):Promise<void>;
 
+export function SetSearchDisabled(arg1:boolean):Promise<void>;
+
+export function SetSearchURL(arg1:string):Promise<void>;
+
 export function SetThinkingDisabled(arg1:boolean):Promise<void>;
 
 export function ShowWindow():Promise<void>;

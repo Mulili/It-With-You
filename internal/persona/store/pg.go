@@ -263,6 +263,78 @@ func (s *PgStore) SetThinkingDisabled(disabled bool) error {
 	return nil
 }
 
+// SearchDisabled 实现 Store：读 app_settings，没存过则为 false。
+//
+// 默认 false = 允许她上网。与思考开关同理，把"没有这个 key"当 false，
+// 于是首次启动不需要写库。
+func (s *PgStore) SearchDisabled() (bool, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	var v string
+	err := s.pool.QueryRow(ctx,
+		`SELECT value FROM app_settings WHERE key = $1`, settingSearchDisabled).Scan(&v)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("读取联网开关失败: %w", err)
+	}
+	return v == settingTrue, nil
+}
+
+// SetSearchDisabled 实现 Store。
+func (s *PgStore) SetSearchDisabled(disabled bool) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	v := settingFalse
+	if disabled {
+		v = settingTrue
+	}
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO app_settings (key, value) VALUES ($1, $2)
+		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+		settingSearchDisabled, v); err != nil {
+		return fmt.Errorf("保存联网开关失败: %w", err)
+	}
+	return nil
+}
+
+// SearchURL 实现 Store：读 app_settings，没存过则为空串（= 没配）。
+//
+// 这里**不给默认地址**：默认值在 App 侧给（见 App.searchURLOrDefault），
+// 存储层替用户猜一个 localhost 端口，只会让"我明明没配过它却在联网"变得难以理解。
+func (s *PgStore) SearchURL() (string, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	var v string
+	err := s.pool.QueryRow(ctx,
+		`SELECT value FROM app_settings WHERE key = $1`, settingSearchURL).Scan(&v)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("读取搜索服务地址失败: %w", err)
+	}
+	return v, nil
+}
+
+// SetSearchURL 实现 Store。空串表示清除配置（于是联网整体不可用）。
+func (s *PgStore) SetSearchURL(url string) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO app_settings (key, value) VALUES ($1, $2)
+		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+		settingSearchURL, strings.TrimSpace(url)); err != nil {
+		return fmt.Errorf("保存搜索服务地址失败: %w", err)
+	}
+	return nil
+}
+
 // CreatePersona 新建人格（可从内置或已有的人格复制），返回新人格 ID。
 func (s *PgStore) CreatePersona(name, copyFromID string) (string, error) {
 	ctx, cancel := s.ctx()
@@ -811,6 +883,10 @@ const (
 	// settingThinkingDisabled 是思考模式开关。**没有这个 key** 表示"从没设置过"，
 	// 语义上等于 false（跟随官方默认：思考模式开启）。
 	settingThinkingDisabled = "thinking_disabled"
+	// settingSearchDisabled 是联网总开关。同样"没有这个 key"当 false（= 允许联网）。
+	settingSearchDisabled = "search_disabled"
+	// settingSearchURL 是本机搜索服务地址。没有这个 key 当空串（= 没配，联网整体不可用）。
+	settingSearchURL = "search_url"
 )
 
 // app_settings 里布尔值的两种写法。

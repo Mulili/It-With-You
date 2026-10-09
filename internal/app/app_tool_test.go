@@ -130,6 +130,27 @@ func assistantText(t *testing.T, hist history.Store, sessionID string) string {
 	return ""
 }
 
+// toolDeclared 判断声明表里有没有某个工具。用"包含"而不是"只有它"：
+// 内置工具集里除了查时间还有联网那两个（联网是否可用取决于设置，不该钉死在测试里）。
+func toolDeclared(specs []llm.Tool, name string) bool {
+	for _, s := range specs {
+		if s.Function.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// 只有耗时工具才提示——查时间是零延迟的，给它也发提示只会让界面闪一下。
+func TestToolNoticeOnlyForSlowTools(t *testing.T) {
+	if toolNotice("get_current_time") != "" {
+		t.Error("查时间不该有提示（零延迟，提示只会闪一下）")
+	}
+	if toolNotice("web_search") == "" || toolNotice("read_page") == "" {
+		t.Error("联网搜索与读网页要提示，否则界面看着像卡住了")
+	}
+}
+
 // 工具循环的正脸：她要调工具 → 执行 → 结果回灌 → 她接着说 → 收尾。
 //
 // 这条路上有四件事必须同时成立，缺一件工具就等于没用：
@@ -151,8 +172,10 @@ func TestToolLoopFeedsResultBack(t *testing.T) {
 	if got := p.rounds(); got != 2 {
 		t.Fatalf("她要一次工具、再收尾，应当正好 2 轮，实际 %d 轮", got)
 	}
-	if specs := p.roundOptions(t, 0).Tools; len(specs) != 1 {
-		t.Fatalf("第一轮该带上工具声明，实际 %+v", specs)
+	if specs := p.roundOptions(t, 0).Tools; len(specs) == 0 {
+		t.Fatal("第一轮该带上工具声明（否则她永远不知道有哪些工具）")
+	} else if !toolDeclared(specs, "get_current_time") {
+		t.Fatalf("工具声明里该有查时间，实际 %+v", specs)
 	}
 
 	// ② 工具结果回灌
@@ -220,7 +243,7 @@ func TestToolLoopStopsAtRoundLimit(t *testing.T) {
 // 工具执行失败也要回灌**一句话**，而不是让整轮断掉。
 //
 // 这是 function calling 的常规姿态：模型拿到「这个工具失败了」能自己决定怎么办
-//（换个说法、或者老实说查不到）。我们抛错的话，用户看到的是半截回复 + 一个错误气泡。
+// （换个说法、或者老实说查不到）。我们抛错的话，用户看到的是半截回复 + 一个错误气泡。
 func TestToolFailureIsFedBackAsText(t *testing.T) {
 	p := &scriptedProvider{toolRounds: 1, toolName: "no_such_tool"}
 	app, hist, sessID, chunkID := newToolApp(t, p)

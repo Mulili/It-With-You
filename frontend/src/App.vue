@@ -9,7 +9,8 @@ import {
   SaveRule, DeleteRule, SetRuleEnabled, ArchiveRule, ReviveRule,
   PendingDowngrade, ApproveDowngrade, RefuseDowngrade,
   RuleCandidates, PromoteRuleCandidate, DeleteRuleCandidate,
-  GetSettings, SetThinkingDisabled, ExportPersonaToFile, ImportPersonaFromFile,
+  GetSettings, SetThinkingDisabled, SetSearchDisabled, SetSearchURL,
+  ExportPersonaToFile, ImportPersonaFromFile,
   ContextStat,
 } from '../wailsjs/go/app/App'
 import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime'
@@ -22,8 +23,14 @@ const EVENT_ERROR = 'chat:error'
 const EVENT_PERSONA_CHANGED = 'persona:changed'
 const EVENT_WINDOW_HIDDEN = 'window:hidden'
 const EVENT_CONTEXT = 'context:stat'
+const EVENT_TOOL_RUNNING = 'tool:running'
 
 const bubbleText = ref('')
+// toolNotice 是"她正在上网查…"这类耗时提示（后端在调用慢工具前推一条）。
+//
+// 为什么要有它：联网搜索要几秒、读一页更久，中间不提示的话界面只是停在半截回复上，
+// 用户会以为卡死了。收到第一段正文或本轮结束时清掉它（见 onChunk/onDone/onError）。
+const toolNotice = ref('')
 const draft = ref('')
 const busy = ref(false)   // 是否正在流式回复
 const streamId = ref('')  // 当前这一轮的 ID，用来过滤掉上一轮的残留片段
@@ -48,8 +55,8 @@ const activePersonaId = ref('')
 // 后端有没有连上持久化存储（PG）。false 时自建人格不会保存，界面要如实说明
 const storageReady = ref(true)
 
-// 全局设置（⑨）。思考开关是应用级的，不属于任何人格，所以不塞进人格快照里
-const settings = ref({ thinkingDisabled: false })
+// 全局设置（⑨）。思考开关与联网设置都是应用级的，不属于任何人格，所以不塞进人格快照里
+const settings = ref({ thinkingDisabled: false, searchDisabled: false, searchUrl: '' })
 // 导出哪个人格；空串 = 用当前生效的那个
 const exportId = ref('')
 
@@ -198,7 +205,12 @@ function kindLabel(kind) {
 async function loadSettings() {
   try {
     const s = await GetSettings()
-    settings.value = { thinkingDisabled: s?.thinkingDisabled ?? false }
+    settings.value = {
+      thinkingDisabled: s?.thinkingDisabled ?? false,
+      searchDisabled: s?.searchDisabled ?? false,
+      // 后端给的已经是**最终生效**的地址（没填过时补了默认），所以直接显示它
+      searchUrl: s?.searchUrl ?? '',
+    }
   } catch (e) {
     console.error('读取设置失败', e)
   }
@@ -212,6 +224,31 @@ async function toggleThinking() {
     await SetThinkingDisabled(next)
     settings.value.thinkingDisabled = next
     showToast(next ? '已关闭思考：回复更快，复杂推理会变弱' : '已开启思考：回复更稳，首字更慢')
+  } catch (e) {
+    showToast('保存失败：' + errText(e))
+  }
+}
+
+// 联网开关。要说清"关掉后她连搜索工具都看不见"：这不是"搜了会失败"，
+// 而是她根本不知道自己能上网——用户才不会以为是网络问题反复找原因。
+async function toggleSearch() {
+  const next = !settings.value.searchDisabled
+  try {
+    await SetSearchDisabled(next)
+    settings.value.searchDisabled = next
+    showToast(next ? '已关闭联网：她看不到任何联网工具' : '已允许联网：她可以上网查资料了')
+  } catch (e) {
+    showToast('保存失败：' + errText(e))
+  }
+}
+
+// 保存搜索服务地址。空串 = 清回默认（后端补默认地址，见 App.searchURLOrDefault）。
+// 保存后重新拉一次：这样输入框里显示的是后端认可的最终值，而不是用户手打的原样。
+async function saveSearchUrl() {
+  try {
+    await SetSearchURL(settings.value.searchUrl ?? '')
+    await loadSettings()
+    showToast('搜索服务地址已保存')
   } catch (e) {
     showToast('保存失败：' + errText(e))
   }
@@ -793,6 +830,7 @@ async function send() {
 
   draft.value = ''
   bubbleText.value = ''
+  toolNotice.value = ''
   busy.value = true
   focusInput()
   try {
@@ -806,6 +844,7 @@ async function send() {
 
 function stop() {
   Cancel()
+  toolNotice.value = ''
   busy.value = false
 }
 
@@ -830,18 +869,29 @@ function onPetClick() {
 // 只认当前这一轮的事件：Ask 会掐掉上一轮，但上一轮可能还有片段在路上
 function onChunk(p) {
   if (!p || p.id !== streamId.value) return
+  // 她开始说话了：那条"正在查…"的提示该让位给正文
+  toolNotice.value = ''
   bubbleText.value += p.delta
 }
 
 function onDone(p) {
   if (!p || p.id !== streamId.value) return
+  toolNotice.value = ''
   busy.value = false
 }
 
 function onError(p) {
   if (!p || p.id !== streamId.value) return
+  toolNotice.value = ''
   busy.value = false
   bubbleText.value = p.message
+}
+
+// 她在调用耗时工具（先上网查、再打开网页看）——给个提示，否则界面像卡住了。
+// 提示会在第一段正文到达时被 onChunk 清掉；若这一轮始终没有正文，则由 onDone/onError 收尾。
+function onToolRunning(p) {
+  if (!p || p.id !== streamId.value) return
+  toolNotice.value = p.label || ''
 }
 
 onMounted(async () => {
@@ -852,6 +902,7 @@ onMounted(async () => {
   EventsOn(EVENT_PERSONA_CHANGED, onPersonaChanged)
   EventsOn(EVENT_WINDOW_HIDDEN, onWindowHidden)
   EventsOn(EVENT_CONTEXT, onContextStat)
+  EventsOn(EVENT_TOOL_RUNNING, onToolRunning)
 
   // 先把存储状态问出来，再决定说什么。
   // 顺序不能反：数据库没就绪时该立刻进阻断态，而不是等用户点开菜单才知道
@@ -873,6 +924,7 @@ onUnmounted(() => {
   EventsOff(EVENT_PERSONA_CHANGED)
   EventsOff(EVENT_WINDOW_HIDDEN)
   EventsOff(EVENT_CONTEXT)
+  EventsOff(EVENT_TOOL_RUNNING)
   clearTimeout(toastTimer)
 })
 </script>
@@ -924,6 +976,9 @@ onUnmounted(() => {
     <main class="stage">
       <!-- 流式期间 duration=0，避免气泡在长回复中途自动收起 -->
       <Bubble :text="bubbleText" :duration="busy ? 0 : 8000" />
+      <!-- 耗时工具的提示（"正在上网查…"）：搜索要几秒、读一页更久，
+           不提示的话气泡一直空着，看着像卡死了 -->
+      <p v-if="toolNotice" class="toolnotice">{{ toolNotice }}</p>
       <button class="pet" title="点我：有输入就发送，没输入就打个招呼" @click="onPetClick">
         <img class = "pet__face" :src = "petImg" alt = "" draggable = "false" />
       </button>
@@ -1382,6 +1437,37 @@ onUnmounted(() => {
               只影响对话本身；「记住我的要求」那条链路仍然会用思考，它靠的是准确性。
             </p>
 
+            <div class="rules__head"><span>联网</span></div>
+            <p class="pane__note">
+              她的知识有截止日期，遇到新闻、天气、价格这类会变的事，得能上网查。
+              关掉之后她连联网工具都看不见（不是「查了会失败」），这样她不会拿着一件
+              做不到的事反复试。
+            </p>
+            <div class="ops">
+              <button class="btn btn--ghost" @click="toggleSearch">
+                {{ settings.searchDisabled ? '已关闭 · 点它开启' : '已开启 · 点它关闭' }}
+              </button>
+            </div>
+            <p class="pane__note">
+              搜索走本机的搜索服务（OpenSERP）。默认地址是 http://127.0.0.1:7000；
+              换端口或换机器时改下面这一栏，改完点保存即可生效，不必重启。
+            </p>
+            <div class="setting">
+              <label class="form__row">
+                <span class="form__label">服务地址</span>
+                <input
+                  v-model="settings.searchUrl"
+                  class="form__input"
+                  type="text"
+                  placeholder="http://127.0.0.1:7000"
+                  @keydown.enter="saveSearchUrl"
+                />
+              </label>
+            </div>
+            <div class="ops">
+              <button class="btn btn--ghost" @click="saveSearchUrl">保存地址</button>
+            </div>
+
             <div class="rules__head"><span>人格导入导出</span></div>
             <p class="pane__note">
               导出的文件可以直接分享给别人；导入遇到同名人格会新建一份副本，不会覆盖现有的。
@@ -1445,6 +1531,22 @@ onUnmounted(() => {
 .stage {
   /* 关键：长回复不能把桌宠挤出可视区 */
   min-height: 0;
+}
+
+/* 耗时工具的提示（"正在上网查…"）。做成小气泡的样子，让它"查完开口"那一刻
+   视觉上就是同一个位置换了个内容，不会有一次跳变。 */
+.toolnotice {
+  --wails-draggable: no-drag;
+
+  margin: 0;
+  max-width: 260px;
+  padding: 8px 12px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 6px 20px rgba(30, 25, 60, 0.14);
+  font-size: 12px;
+  line-height: 1.5;
+  color: #6a6a7a;
 }
 
 .composer {

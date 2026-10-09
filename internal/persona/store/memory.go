@@ -43,6 +43,11 @@ type MemoryStore struct {
 	// 内存实现下它随进程消失，与自建人格同命运。
 	thinkingDisabled bool
 
+	// searchDisabled 是"允许她上网"的总开关，同样是应用级设置。
+	searchDisabled bool
+	// searchURL 是本机搜索服务的地址；空串表示没配（联网整体不可用）。
+	searchURL string
+
 	// storageReady 表示"持久化存储是否可用"。内存实现自己恒为可用，
 	// 但它被当作 PG 连不上时的降级路径时，前端要据此提示"数据库未连接"。
 	storageReady bool
@@ -199,6 +204,36 @@ func (s *MemoryStore) SetThinkingDisabled(disabled bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.thinkingDisabled = disabled
+	return nil
+}
+
+// SearchDisabled 实现 Store。
+func (s *MemoryStore) SearchDisabled() (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.searchDisabled, nil
+}
+
+// SetSearchDisabled 实现 Store。
+func (s *MemoryStore) SetSearchDisabled(disabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.searchDisabled = disabled
+	return nil
+}
+
+// SearchURL 实现 Store。
+func (s *MemoryStore) SearchURL() (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.searchURL, nil
+}
+
+// SetSearchURL 实现 Store。
+func (s *MemoryStore) SetSearchURL(url string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.searchURL = url
 	return nil
 }
 

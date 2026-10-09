@@ -138,6 +138,14 @@ export function SetRuleEnabled(arg1, arg2) {
   return window['go']['app']['App']['SetRuleEnabled'](arg1, arg2);
 }
 
+export function SetSearchDisabled(arg1) {
+  return window['go']['app']['App']['SetSearchDisabled'](arg1);
+}
+
+export function SetSearchURL(arg1) {
+  return window['go']['app']['App']['SetSearchURL'](arg1);
+}
+
 export function SetThinkingDisabled(arg1) {
   return window['go']['app']['App']['SetThinkingDisabled'](arg1);
 }

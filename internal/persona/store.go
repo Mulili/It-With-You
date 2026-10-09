@@ -51,6 +51,26 @@ type Store interface {
 	// SetThinkingDisabled 保存思考开关（落 app_settings；PG 连不上时随内存一起丢，与人格同命运）。
 	SetThinkingDisabled(disabled bool) error
 
+	// SearchDisabled 报告用户是否关掉了联网。
+	//
+	// 默认 false = 允许她上网。关掉时她**连这个工具都看不见**（见 tool.Availability）：
+	// 让她拿着一个被禁止的能力反复试，比干脆不给她更糟——用户看到的是"她老说查不到"。
+	SearchDisabled() (bool, error)
+	// SetSearchDisabled 保存联网开关（与思考开关同一套落库方式）。
+	SetSearchDisabled(disabled bool) error
+
+	// SearchURL 是本机搜索服务的地址；空串表示**用户从没设过**（不是"关闭联网"）。
+	//
+	// 空与关闭是两回事，刻意分开：
+	//   - 关不关联网是 SearchDisabled 的事（一个显式的勾）；
+	//   - 地址为空只是"没填过"，由 App 补一个默认地址（见 App.searchURLOrDefault）。
+	//
+	// 它是个**应用级**设置：换台机器、换端口都只改这一处，与人格无关。
+	// 默认值在 App 侧给——存储层不该替用户猜地址。
+	SearchURL() (string, error)
+	// SetSearchURL 保存搜索服务地址（空串 = 清回默认）。
+	SetSearchURL(url string) error
+
 	CreatePersona(name, copyFromID string) (string, error)
 	RenamePersona(id, name string) error
 	DeletePersona(id string) error

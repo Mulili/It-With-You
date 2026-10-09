@@ -26,6 +26,13 @@ const (
 	// 为什么需要它：隐藏可能由**托盘**发起（Go 侧直接调 Hide），而"菜单开没开"的状态在前端。
 	// 不通知的话前端会以为菜单还开着——下次显示窗口时，「加高后的尺寸 + 打开的面板」一起回来。
 	EventWindowHidden = "window:hidden"
+
+	// EventToolRunning 在她**开始执行一个耗时工具**时发出（负载 ui.ToolRunningPayload）。
+	//
+	// 为什么需要它：查时间几乎瞬间返回，但联网搜索要几秒、读一页更久。中间没有提示，
+	// 界面就只是停在半截回复上——用户会以为卡死了，然后去点停止。
+	// 零延迟的工具**不发**这个事件（见 app.announceTool）：发了只会让提示闪一下。
+	EventToolRunning = "tool:running"
 )
 
 // SayPayload 是 EventSay 事件的负载。
@@ -65,4 +72,17 @@ type PersonaChangedPayload struct {
 	Slot    string `json:"slot"`
 	Value   string `json:"value"`
 	Summary string `json:"summary"`
+}
+
+// ToolRunningPayload 是一次耗时工具调用开始执行的通知。
+//
+// Label 是给人看的那句话（"正在上网查…"），由**后端**组装：让"哪个工具叫什么提示"
+// 只有一处真相，前端不必认识 web_search 这种英文标识。
+type ToolRunningPayload struct {
+	// ID 是本轮回复的轮次 ID，前端据此把提示挂到正确的那条消息上。
+	ID string `json:"id"`
+	// Tool 是工具名（web_search / read_page），留给调试与将来做更细的图标。
+	Tool string `json:"tool"`
+	// Label 是直接显示的中文提示。
+	Label string `json:"label"`
 }

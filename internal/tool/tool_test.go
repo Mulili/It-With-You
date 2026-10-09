@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"agent-for-you-love/internal/web"
 )
 
 // 查时间这个工具要真的给出**当前**时间，而不是一个固定的样例值。
@@ -45,12 +47,15 @@ func TestClockSpec(t *testing.T) {
 }
 
 // 注册表要把"给模型看的声明"与"按名字执行"这两件事对起来。
+//
+// 传 nil 的搜索/读页依赖：它们会因"不可用"被 Specs 过滤掉（见 TestBuiltinsHidesUnavailable），
+// 于是这里看到的内置工具只剩查时间。
 func TestRegistrySpecsAndCall(t *testing.T) {
-	r := Builtins()
+	r := Builtins(nil, nil, nil)
 
 	specs := r.Specs()
 	if len(specs) != 1 || specs[0].Function.Name != "get_current_time" {
-		t.Fatalf("内置工具集应当只有查时间，实际 %+v", specs)
+		t.Fatalf("没有外部依赖时内置工具集应当只有查时间，实际 %+v", specs)
 	}
 	if r.Empty() {
 		t.Error("内置工具集不该是空的")
@@ -68,12 +73,58 @@ func TestRegistrySpecsAndCall(t *testing.T) {
 // 模型编一个不存在的工具名时，返回的是**错误**而不是 panic——调用方会把它翻成
 // 一句给模型看的话，她自己就纠正了（这是 function calling 的常规姿态）。
 func TestRegistryCallUnknownTool(t *testing.T) {
-	r := Builtins()
+	r := Builtins(nil, nil, nil)
 
 	if _, err := r.Call(context.Background(), "no_such_tool", "{}"); err == nil {
 		t.Fatal("未知工具应当报错")
 	} else if !strings.Contains(err.Error(), "get_current_time") {
 		t.Errorf("错误里该列出可用的工具名（模型据此纠正）：%v", err)
+	}
+}
+
+// 不可用的工具**不该出现在给模型的清单里**——否则她会拿一个必然失败的工具反复试。
+//
+// 这里用 nil 的 Searcher/Reader 模拟"没配搜索服务 / 解析器起不来"。
+func TestBuiltinsHidesUnavailable(t *testing.T) {
+	r := Builtins(nil, nil, nil)
+	for _, s := range r.Specs() {
+		if s.Function.Name == "web_search" || s.Function.Name == "read_page" {
+			t.Errorf("依赖不可用时不该把 %s 给模型看", s.Function.Name)
+		}
+	}
+	// 反过来：即使模型自行编出这个名字，Call 也要拦住（它可能照上一轮的清单来调）
+	if _, err := r.Call(context.Background(), "web_search", `{"query":"x"}`); err == nil {
+		t.Error("不可用的工具被调用时应当报错")
+	}
+}
+
+// 联网开关为关时，搜索工具要消失（与"没配服务"同一条通路）。
+func TestWebSearchAvailableFollowsToggle(t *testing.T) {
+	on := true
+	s := web.NewSearcher(func() string { return "http://127.0.0.1:7000" })
+	w := WebSearch{Searcher: s, Enabled: func() bool { return on }}
+	if !w.Available() {
+		t.Fatal("配了地址且开关开着时应当可用")
+	}
+	on = false
+	if w.Available() {
+		t.Error("开关关掉后不该可用（这样她才看不见这个工具）")
+	}
+}
+
+// 读网页与搜索共用同一个联网开关：关掉联网时不该还剩一个能打开外部网页的工具。
+func TestReadPageAvailableFollowsToggle(t *testing.T) {
+	on := true
+	p := ReadPage{Reader: &web.Reader{}, Enabled: func() bool { return on }}
+	if !p.Available() {
+		t.Fatal("解析器就绪且开关开着时应当可用")
+	}
+	on = false
+	if p.Available() {
+		t.Error("关掉联网后不该可用")
+	}
+	if (ReadPage{}).Available() {
+		t.Error("没有解析器时不该可用")
 	}
 }
 
