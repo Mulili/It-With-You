@@ -45,8 +45,10 @@ type MemoryStore struct {
 
 	// searchDisabled 是"允许她上网"的总开关，同样是应用级设置。
 	searchDisabled bool
-	// searchURL 是本机搜索服务的地址；空串表示没配（联网整体不可用）。
+	// searchURL 是用户填的搜索服务地址（原值）；空串表示"没填过"，由 App 补默认地址。
 	searchURL string
+	// searchExe 是搜索服务程序的位置；空串表示按默认位置找（见 App.searchExePath）。
+	searchExe string
 
 	// storageReady 表示"持久化存储是否可用"。内存实现自己恒为可用，
 	// 但它被当作 PG 连不上时的降级路径时，前端要据此提示"数据库未连接"。
@@ -234,6 +236,21 @@ func (s *MemoryStore) SetSearchURL(url string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.searchURL = url
+	return nil
+}
+
+// SearchExe 实现 Store。
+func (s *MemoryStore) SearchExe() (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.searchExe, nil
+}
+
+// SetSearchExe 实现 Store。
+func (s *MemoryStore) SetSearchExe(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.searchExe = path
 	return nil
 }
 

@@ -71,6 +71,15 @@ type Store interface {
 	// SetSearchURL 保存搜索服务地址（空串 = 清回默认）。
 	SetSearchURL(url string) error
 
+	// SearchExe 是搜索服务的可执行文件路径；空串表示**用户没指定**，
+	// 由 App 按默认位置找（设置 → 应用同目录 → PATH，见 App.searchExePath）。
+	//
+	// 为什么要能指定：应用要**自己拉起**这个服务（见 web.Service），
+	// 而"程序装在哪"只有用户知道；默认位置找不到时就靠这一栏。
+	SearchExe() (string, error)
+	// SetSearchExe 保存搜索服务程序路径（空串 = 回到默认查找）。
+	SetSearchExe(path string) error
+
 	CreatePersona(name, copyFromID string) (string, error)
 	RenamePersona(id, name string) error
 	DeletePersona(id string) error

@@ -321,7 +321,7 @@ func (s *PgStore) SearchURL() (string, error) {
 	return v, nil
 }
 
-// SetSearchURL 实现 Store。空串表示清除配置（于是联网整体不可用）。
+// SetSearchURL 实现 Store。空串 = 清回默认地址（见 App.searchURLOrDefault）。
 func (s *PgStore) SetSearchURL(url string) error {
 	ctx, cancel := s.ctx()
 	defer cancel()
@@ -331,6 +331,37 @@ func (s *PgStore) SetSearchURL(url string) error {
 		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 		settingSearchURL, strings.TrimSpace(url)); err != nil {
 		return fmt.Errorf("保存搜索服务地址失败: %w", err)
+	}
+	return nil
+}
+
+// SearchExe 实现 Store：读 app_settings，没存过则为空串（= 按默认位置找）。
+func (s *PgStore) SearchExe() (string, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	var v string
+	err := s.pool.QueryRow(ctx,
+		`SELECT value FROM app_settings WHERE key = $1`, settingSearchExe).Scan(&v)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("读取搜索服务程序路径失败: %w", err)
+	}
+	return v, nil
+}
+
+// SetSearchExe 实现 Store。空串 = 回到默认查找（见 App.searchExePath）。
+func (s *PgStore) SetSearchExe(path string) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO app_settings (key, value) VALUES ($1, $2)
+		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+		settingSearchExe, strings.TrimSpace(path)); err != nil {
+		return fmt.Errorf("保存搜索服务程序路径失败: %w", err)
 	}
 	return nil
 }
@@ -885,8 +916,10 @@ const (
 	settingThinkingDisabled = "thinking_disabled"
 	// settingSearchDisabled 是联网总开关。同样"没有这个 key"当 false（= 允许联网）。
 	settingSearchDisabled = "search_disabled"
-	// settingSearchURL 是本机搜索服务地址。没有这个 key 当空串（= 没配，联网整体不可用）。
+	// settingSearchURL 是本机搜索服务地址。没有这个 key 当空串（= 用 App 的默认地址）。
 	settingSearchURL = "search_url"
+	// settingSearchExe 是搜索服务程序的位置。没有这个 key 当空串（= 按默认位置找）。
+	settingSearchExe = "search_exe"
 )
 
 // app_settings 里布尔值的两种写法。

@@ -101,7 +101,7 @@ func TestBuiltinsHidesUnavailable(t *testing.T) {
 // 联网开关为关时，搜索工具要消失（与"没配服务"同一条通路）。
 func TestWebSearchAvailableFollowsToggle(t *testing.T) {
 	on := true
-	s := web.NewSearcher(func() string { return "http://127.0.0.1:7000" })
+	s := web.NewSearcher(func() string { return "http://127.0.0.1:7000" }, nil)
 	w := WebSearch{Searcher: s, Enabled: func() bool { return on }}
 	if !w.Available() {
 		t.Fatal("配了地址且开关开着时应当可用")

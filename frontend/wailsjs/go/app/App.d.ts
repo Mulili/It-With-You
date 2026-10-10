@@ -74,6 +74,8 @@ export function SetRuleEnabled(arg1:string,arg2:boolean):Promise<void>;
 
 export function SetSearchDisabled(arg1:boolean):Promise<void>;
 
+export function SetSearchExe(arg1:string):Promise<void>;
+
 export function SetSearchURL(arg1:string):Promise<void>;
 
 export function SetThinkingDisabled(arg1:boolean):Promise<void>;

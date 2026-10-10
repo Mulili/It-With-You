@@ -9,7 +9,7 @@ import {
   SaveRule, DeleteRule, SetRuleEnabled, ArchiveRule, ReviveRule,
   PendingDowngrade, ApproveDowngrade, RefuseDowngrade,
   RuleCandidates, PromoteRuleCandidate, DeleteRuleCandidate,
-  GetSettings, SetThinkingDisabled, SetSearchDisabled, SetSearchURL,
+  GetSettings, SetThinkingDisabled, SetSearchDisabled, SetSearchURL, SetSearchExe,
   ExportPersonaToFile, ImportPersonaFromFile,
   ContextStat,
 } from '../wailsjs/go/app/App'
@@ -56,7 +56,14 @@ const activePersonaId = ref('')
 const storageReady = ref(true)
 
 // 全局设置（⑨）。思考开关与联网设置都是应用级的，不属于任何人格，所以不塞进人格快照里
-const settings = ref({ thinkingDisabled: false, searchDisabled: false, searchUrl: '' })
+const settings = ref({
+  thinkingDisabled: false,
+  searchDisabled: false,
+  searchUrl: '',
+  searchExe: '',
+  // 搜索服务此刻的状况（后端给的快照，见 Go 侧 web.State）
+  searchService: { running: false, managed: false, exePath: '', message: '未启动' },
+})
 // 导出哪个人格；空串 = 用当前生效的那个
 const exportId = ref('')
 
@@ -210,6 +217,10 @@ async function loadSettings() {
       searchDisabled: s?.searchDisabled ?? false,
       // 后端给的已经是**最终生效**的地址（没填过时补了默认），所以直接显示它
       searchUrl: s?.searchUrl ?? '',
+      searchExe: s?.searchExe ?? '',
+      searchService: s?.searchService ?? {
+        running: false, managed: false, exePath: '', message: '未启动',
+      },
     }
   } catch (e) {
     console.error('读取设置失败', e)
@@ -243,15 +254,36 @@ async function toggleSearch() {
 }
 
 // 保存搜索服务地址。空串 = 清回默认（后端补默认地址，见 App.searchURLOrDefault）。
-// 保存后重新拉一次：这样输入框里显示的是后端认可的最终值，而不是用户手打的原样。
+// 保存后重新拉一次：这样输入框里显示的是后端认可的最终值，而不是用户手打的原样；
+// 顺便把"服务有没有起来"的新结论一起拿回来（后端在改完设置后会立刻尝试拉起一次）。
 async function saveSearchUrl() {
   try {
     await SetSearchURL(settings.value.searchUrl ?? '')
     await loadSettings()
-    showToast('搜索服务地址已保存')
+    showToast('地址已保存 · ' + settings.value.searchService.message)
   } catch (e) {
     showToast('保存失败：' + errText(e))
   }
+}
+
+// 保存搜索服务的**程序路径**（空串 = 按默认位置找：应用同目录 → 系统 PATH）。
+//
+// 后端在这个调用里会**同步尝试拉起一次**（通常 ~2 秒），所以保存后状态行就是真实结论——
+// 不必再让用户点一次"重试"。
+async function saveSearchExe() {
+  try {
+    await SetSearchExe(settings.value.searchExe ?? '')
+    await loadSettings()
+    showToast('已保存 · ' + settings.value.searchService.message)
+  } catch (e) {
+    showToast('保存失败：' + errText(e))
+  }
+}
+
+// 状态行的那句话是给人看的，颜色要跟着"好 / 坏"走：
+// 运行中=绿，没起来=黄（不是错误，是"你还得配一下"）。
+function searchServiceClass() {
+  return settings.value.searchService?.running ? 'statusline--ok' : 'statusline--warn'
 }
 
 // 导出选中的那个人格（没选就是当前人格）。
@@ -1448,9 +1480,10 @@ onUnmounted(() => {
                 {{ settings.searchDisabled ? '已关闭 · 点它开启' : '已开启 · 点它关闭' }}
               </button>
             </div>
+
             <p class="pane__note">
-              搜索走本机的搜索服务（OpenSERP）。默认地址是 http://127.0.0.1:7000；
-              换端口或换机器时改下面这一栏，改完点保存即可生效，不必重启。
+              搜索本身要一个外部程序（OpenSERP），应用会自己把它拉起来，退出时再关掉。
+              只对地址是本机的服务这么做；地址指向别的机器时，那一头得你自己保证它在跑。
             </p>
             <div class="setting">
               <label class="form__row">
@@ -1467,6 +1500,32 @@ onUnmounted(() => {
             <div class="ops">
               <button class="btn btn--ghost" @click="saveSearchUrl">保存地址</button>
             </div>
+
+            <p class="pane__note">
+              程序路径留空就按默认位置找：先看应用目录下有没有 openserp.exe，再看系统 PATH。
+              都不在就填下面这一栏（点保存会立刻试着启一次）。
+            </p>
+            <div class="setting">
+              <label class="form__row">
+                <span class="form__label">程序路径</span>
+                <input
+                  v-model="settings.searchExe"
+                  class="form__input"
+                  type="text"
+                  placeholder="（留空 = 自动查找）"
+                  @keydown.enter="saveSearchExe"
+                />
+              </label>
+            </div>
+            <div class="ops">
+              <button class="btn btn--ghost" @click="saveSearchExe">保存并启动</button>
+            </div>
+            <p class="statusline" :class="searchServiceClass()">
+              搜索服务：{{ settings.searchService.message }}
+              <span v-if="settings.searchService.exePath" class="statusline__path">
+                （{{ settings.searchService.exePath }}）
+              </span>
+            </p>
 
             <div class="rules__head"><span>人格导入导出</span></div>
             <p class="pane__note">
@@ -2151,6 +2210,33 @@ onUnmounted(() => {
   font-size: 11px;
   line-height: 1.5;
   color: #9a9aa8;
+}
+
+/* 搜索服务的那一行状态：运行中=绿，没起来=黄（不是错误，是"还得配一下"）。
+   有这一行，失败才看得见——否则症状只有"她老说查不到"。 */
+.statusline {
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.statusline--ok {
+  background: rgba(52, 168, 110, 0.12);
+  color: #2c8f5c;
+}
+
+.statusline--warn {
+  background: rgba(230, 160, 40, 0.14);
+  color: #a06a10;
+}
+
+/* 路径可能很长，把它压小一号：状态本身比路径重要 */
+.statusline__path {
+  opacity: 0.7;
+  font-size: 10px;
 }
 
 /* 候选的依据（原话）：比取值更小更淡——它是"她为什么这么想"，不是内容本身 */

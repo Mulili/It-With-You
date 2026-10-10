@@ -77,12 +77,19 @@ type Searcher struct {
 	// 而缓存一个字符串会让"改了没反应"变成很难查的现象。
 	baseURL func() string
 	client  *http.Client
+	// ensure 在每次搜索**之前**调一次，用来保证服务在跑（见 Service.Ensure）。
+	//
+	// 挂在客户端上而不是让上层记得先调：唯一会"忘记"的地方就是这里，
+	// 而忘了的症状是"她偶尔查不到"——那种错最难查。nil = 不托管进程。
+	ensure func(ctx context.Context) error
 }
 
 // NewSearcher 建一个客户端。baseURL 为 nil 或返回空串时，可用性由 Available 报出去。
-func NewSearcher(baseURL func() string) *Searcher {
+// ensure 为 nil 表示不托管服务进程（纯客户端，例如测试）。
+func NewSearcher(baseURL func() string, ensure func(ctx context.Context) error) *Searcher {
 	return &Searcher{
 		baseURL: baseURL,
+		ensure:  ensure,
 		// 超时交给每次调用的 ctx（SearchTimeout），这里不再设一遍——
 		// 两处超时只会在排查"到底是哪个超时"时让人困惑。
 		client: &http.Client{},
@@ -109,6 +116,13 @@ func (s *Searcher) Search(ctx context.Context, query string) ([]Result, error) {
 	base := strings.TrimRight(strings.TrimSpace(s.baseURL()), "/")
 	if base == "" {
 		return nil, ErrNotConfigured
+	}
+	// 先保证服务在跑。放在超时**之前**：拉起一个进程要几秒，不该从"搜索"那 10 秒里扣。
+	// 它幂等——已经在跑就直接返回（一次 2 秒上限的探活），所以正常路径几乎没有代价。
+	if s.ensure != nil {
+		if err := s.ensure(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, SearchTimeout)

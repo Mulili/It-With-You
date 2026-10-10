@@ -142,6 +142,10 @@ export function SetSearchDisabled(arg1) {
   return window['go']['app']['App']['SetSearchDisabled'](arg1);
 }
 
+export function SetSearchExe(arg1) {
+  return window['go']['app']['App']['SetSearchExe'](arg1);
+}
+
 export function SetSearchURL(arg1) {
   return window['go']['app']['App']['SetSearchURL'](arg1);
 }

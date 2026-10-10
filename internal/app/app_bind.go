@@ -1,12 +1,15 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"agent-for-you-love/internal/history"
 	"agent-for-you-love/internal/ui"
+	"agent-for-you-love/internal/web"
 )
 
 // 这个文件装「给界面的数据绑定」：历史、记忆、应用级设置。
@@ -43,16 +46,27 @@ type AppSettings struct {
 	// SearchURL 是**最终生效**的搜索服务地址（已经补过默认，见 searchURLOrDefault），
 	// 设置页直接显示它、不必自己拼默认值。用户改了就存下来。
 	SearchURL string `json:"searchUrl"`
+	// SearchExe 是用户填的搜索服务程序路径；空串 = 按默认位置找（见 searchExePath）。
+	SearchExe string `json:"searchExe"`
+	// SearchService 是搜索服务此刻的状况（不探测，见 web.State）。
+	// 设置页靠它显示"运行中 / 没找到程序 / 地址不是本机"，让失败**看得见**。
+	SearchService web.State `json:"searchService"`
 }
 
 // GetSettings 返回全局设置。
 func (a *App) GetSettings() AppSettings {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	st := web.State{Message: "未启动"}
+	if a.searchService != nil {
+		st = a.searchService.Status()
+	}
 	return AppSettings{
 		ThinkingDisabled: a.thinkingDisabled,
 		SearchDisabled:   a.searchDisabled,
 		SearchURL:        a.searchURLOrDefaultLocked(),
+		SearchExe:        a.searchExe,
+		SearchService:    st,
 	}
 }
 
@@ -112,6 +126,14 @@ func (a *App) SetSearchDisabled(disabled bool) error {
 	state := "已允许她上网"
 	if disabled {
 		state = "已关闭联网（她连搜索工具都看不见）"
+		// 关掉联网就把它拉起的那个进程也收走：没有理由让它继续在后台跑着占内存。
+		// 用户自己起的那个不碰（见 web.Service.Stop）。
+		if a.searchService != nil {
+			a.searchService.Stop()
+		}
+	} else {
+		// 重新打开就顺手拉起来，免得她下一次要搜时才现起（那要等 1~2 秒）
+		a.ensureSearchServiceAfterSettingChange()
 	}
 	log.Printf("[app] %s", state)
 	return nil
@@ -139,7 +161,48 @@ func (a *App) SetSearchURL(url string) error {
 	} else {
 		log.Printf("[app] 搜索服务地址已设为 %s", url)
 	}
+	// 换了地址就要让"新地址那头"有人：用户改了端口，正是想让服务起在那个端口上
+	a.ensureSearchServiceAfterSettingChange()
 	return nil
+}
+
+// SetSearchExe 保存搜索服务程序路径（空串 = 回到默认查找）。
+//
+// 存完**顺手（同步）尝试拉起一次**：用户填完路径就是要它工作，让他再去点一下"重试"
+// 是没道理的。通常 ~2 秒；路径不对会立刻失败（exec 起不来），不会卡满超时。
+func (a *App) SetSearchExe(path string) error {
+	if err := a.requireStore(); err != nil {
+		return err
+	}
+	path = strings.TrimSpace(path)
+	if err := a.personas.SetSearchExe(path); err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	a.searchExe = path
+	a.mu.Unlock()
+
+	if path == "" {
+		log.Printf("[app] 搜索服务程序路径已清空（按默认位置查找）")
+	} else {
+		log.Printf("[app] 搜索服务程序路径已设为 %s", path)
+	}
+	a.ensureSearchServiceAfterSettingChange()
+	return nil
+}
+
+// ensureSearchServiceAfterSettingChange 在**用户改完联网设置之后**同步尝试拉起一次。
+//
+// 为什么同步、以及为什么给 12 秒：调用方是设置页上的一个按钮，它 await 这个返回值。
+// 同步才能让紧接着的那次 GetSettings 显示**真实**的新状态（而不是"改完还是旧结论"）。
+// 12 秒是上限：正常 ~2 秒，路径写错会立刻失败，只有"进程起来了却始终不就绪"才会撞到它。
+func (a *App) ensureSearchServiceAfterSettingChange() {
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	if err := a.ensureSearchService(ctx); err != nil {
+		log.Printf("[app] 改了联网设置，但搜索服务仍不可用：%v", err)
+	}
 }
 
 // ---------- 历史与记忆（第 5 步的界面数据）----------

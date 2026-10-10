@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -111,6 +114,13 @@ type App struct {
 	// 空 != 关闭联网：空表示"没填过"，此时用 defaultSearchURL（见 searchURLOrDefault）。
 	// 缓存原值而不是"最终地址"，是为了设置页里显示的是他真正填的东西。
 	searchURL string
+	// searchExe 是用户填的搜索服务程序路径（**原值**，可能为空 = 按默认位置找）。
+	searchExe string
+	// searchService 托管本机搜索服务这个**外部程序**的生死（探活 / 拉起 / 关闭）。
+	//
+	// 它不是依赖注入，而是"让 searchURL 那个地址真的有人在那儿"的那一半。
+	// 详见 web.Service 上那段：服务没起来时用户看到的只有"她老说查不到"。
+	searchService *web.Service
 
 	// tools 是能给模型调用的工具集（阶段4.5）。
 	//
@@ -176,10 +186,16 @@ func NewApp(provider llm.Provider, personas persona.Store, hist history.Store,
 		} else {
 			a.searchURL = u
 		}
+		if exe, err := personas.SearchExe(); err != nil {
+			log.Printf("[app] 读取搜索服务程序路径失败，按默认位置查找: %v", err)
+		} else {
+			a.searchExe = exe
+		}
 	}
-	// 工具集**在设置读完之后**再建：搜索工具的"可不可用"就取决于上面那两个值
-	//（地址为空用默认、开关为关就整个藏起来，见 tool.Availability）。
-	a.tools = tool.Builtins(web.NewSearcher(a.searchURLOrDefault), web.NewReader(), a.searchEnabled)
+	// 搜索服务这一对：Service 管"地址那头有没有人"，Searcher 是往那个地址发请求的客户端。
+	// 把 ensure 挂在 Searcher 上（而不是让上层记得先调），见 Searcher.ensure 的说明。
+	a.searchService = web.NewService(a.searchExePath, a.searchURLOrDefault)
+	a.tools = tool.Builtins(web.NewSearcher(a.searchURLOrDefault, a.ensureSearchService), web.NewReader(), a.searchEnabled)
 	return a
 }
 
@@ -202,6 +218,76 @@ func (a *App) searchEnabled() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return !a.searchDisabled
+}
+
+// searchExePath 按优先级找搜索服务的可执行文件：
+//  1. 设置里填的路径（用户明确指定，最优先）
+//  2. 应用可执行文件**同目录**（把 openserp.exe 放在应用旁边就能用；
+//     build/bin 已被 gitignore，所以放那儿不会进版本库）
+//  3. 系统 PATH 里的 openserp
+//
+// 都找不到返回空串——那表示"不托管进程"。上层会**如实说出来**（见 warmSearchService），
+// 而不是让它退化成"她老说查不到"。
+func (a *App) searchExePath() string {
+	a.mu.Lock()
+	custom := strings.TrimSpace(a.searchExe)
+	a.mu.Unlock()
+	if custom != "" {
+		return custom
+	}
+
+	// 两个名字都试：Windows 上是 .exe，其余平台没有后缀。
+	// 不去 import runtime 判平台——那个名字在本文件里已经被 wails 的 runtime 占了，
+	// 而且"多试一个名字"本来就没有代价。
+	names := []string{"openserp.exe", "openserp"}
+
+	exe, err := os.Executable()
+	if err == nil {
+		dir := filepath.Dir(exe)
+		for _, name := range names {
+			p := filepath.Join(dir, name)
+			if st, err := os.Stat(p); err == nil && !st.IsDir() {
+				return p
+			}
+		}
+	}
+	for _, name := range names {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// ensureSearchService 保证搜索服务在跑（幂等）。两处调它：
+// 启动时后台调一次（让她随时能搜），以及**每次搜索之前**（服务中途挂了也能自己起来）。
+func (a *App) ensureSearchService(ctx context.Context) error {
+	if !a.searchEnabled() {
+		return errors.New("联网已被关掉")
+	}
+	if a.searchService == nil {
+		return errors.New("搜索服务未初始化")
+	}
+	return a.searchService.Ensure(ctx)
+}
+
+// warmSearchService 是启动时的后台预热：把外部服务拉起来，不拖慢启动。
+//
+// 起不来时**说出来**（气泡 + 日志）：这正是这个功能存在的意义——
+// 不然用户看到的只有"她老说查不到"，既不知道原因，也不知道去哪儿改。
+func (a *App) warmSearchService() {
+	if !a.searchEnabled() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if err := a.ensureSearchService(ctx); err != nil {
+		log.Printf("[app] 搜索服务不可用：%v", err)
+		a.Say("联网搜索服务没起来，搜索会用不了（设置 → 联网 里可以指定程序位置）")
+		return
+	}
+	log.Printf("[app] 搜索服务就绪：%s", a.searchService.Status().Message)
 }
 
 // Startup 由 Wails 在应用启动时调用，此后 runtime 才可用。
@@ -232,11 +318,20 @@ func (a *App) Startup(ctx context.Context) {
 	// 再顺手核对一遍归档规则的索引：兜住"应用关着的时候改了库"，以及上次嵌入时服务不可用。
 	// 归档层"不注入、但可被检索回来"——索引没建好，它就等于被删了。
 	go a.indexArchivedRules()
+
+	// 把搜索服务拉起来（外部程序，见 web.Service）。也放后台：
+	// 它要等一个进程就绪（1~2 秒），而"能不能开始聊"不依赖它。
+	go a.warmSearchService()
 }
 
 // Shutdown 由 Wails 在应用退出时调用（导出理由同 Startup）。
 func (a *App) Shutdown(ctx context.Context) {
 	ui.StopTray()
+	// 关掉**我们拉起的**搜索服务：我们起了它，就该在退出时收走，
+	// 否则每启动一次留一个孤儿进程。用户自己起的（或探测到已在跑的）它不会碰。
+	if a.searchService != nil {
+		a.searchService.Stop()
+	}
 	// 存储若持有资源（PG 连接池），在这里释放。两个 store 都实现了 io.Closer，
 	// 但真正关池的只有 persona：池是全应用共用的那一个，history 的 Close 是空操作——
 	// 若它也去关，先被调到的那个就会把池关掉、另一个立刻失效。
@@ -720,9 +815,9 @@ func (a *App) announceTool(id, name string) {
 func toolNotice(name string) string {
 	switch name {
 	case "web_search":
-		return "正在上网查…"
+		return "正在线上对线…"
 	case "read_page":
-		return "正在打开网页看…"
+		return "正在成为孙吧黄牌…"
 	default:
 		return ""
 	}

@@ -95,10 +95,10 @@ func TestSearcherAvailableOnlyChecksConfig(t *testing.T) {
 	if nilS.Available() {
 		t.Error("nil Searcher 不该报可用")
 	}
-	if NewSearcher(func() string { return "   " }).Available() {
+	if NewSearcher(func() string { return "   " }, nil).Available() {
 		t.Error("空白地址不该报可用")
 	}
-	if !NewSearcher(func() string { return "http://127.0.0.1:7000" }).Available() {
+	if !NewSearcher(func() string { return "http://127.0.0.1:7000" }, nil).Available() {
 		t.Error("有地址时该报可用")
 	}
 }

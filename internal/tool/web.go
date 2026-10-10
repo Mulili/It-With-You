@@ -30,7 +30,7 @@ type WebSearch struct {
 
 // Spec 实现 Tool。
 //
-// Description 里刻意写了"什么时候**别**用"：function calling 里模型靠描述决定调不调，
+// Description 里刻意写了"什么时候别用"：function calling 里模型靠描述决定调不调，
 // 只写"可以联网搜索"它会每轮都搜一下（那是真机上很容易被用户看出来的毛病）。
 func (WebSearch) Spec() llm.Tool {
 	return llm.Tool{
@@ -40,7 +40,8 @@ func (WebSearch) Spec() llm.Tool {
 			Description: "上网搜索最新的信息。当用户问到现实世界里会变化的东西——" +
 				"新闻、天气、价格、赛事、某个人或产品最近怎么样了、你不确定或可能过时的事实时用它。" +
 				"凭你自己的知识就能回答的（常识、聊天、算数、写东西）不要用。" +
-				"查到的只是资料，可能有错，要挑真正相关的说。",
+				"查到的只是资料，可能有错，要挑真正相关的说。" +
+				"或者在用户期待你可以接上他的梗或想法时，用俏皮的语气去搜索后返回",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
