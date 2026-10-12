@@ -222,7 +222,7 @@ func (e *OpenAIEmbedder) embedOpenAI(ctx context.Context, texts []string) ([][]f
 	for i, d := range out.Data {
 		vectors[i] = d.Embedding
 	}
-	return e.validateVectors(vectors, len(texts))
+	return validateVectors(vectors, len(texts), e.cfg.Dim, "嵌入服务")
 }
 
 func (e *OpenAIEmbedder) embedOllama(ctx context.Context, texts []string) ([][]float32, error) {
@@ -236,7 +236,7 @@ func (e *OpenAIEmbedder) embedOllama(ctx context.Context, texts []string) ([][]f
 	if err := json.Unmarshal(data, &out); err != nil {
 		return nil, fmt.Errorf("解析嵌入响应失败: %w", err)
 	}
-	return e.validateVectors(out.Embeddings, len(texts))
+	return validateVectors(out.Embeddings, len(texts), e.cfg.Dim, "嵌入服务")
 }
 
 // postJSON 发一次 JSON POST，返回限流读取后的响应体。
@@ -273,20 +273,23 @@ func (e *OpenAIEmbedder) postJSON(ctx context.Context, url string, payload any) 
 	return io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 }
 
-// validateVectors 检查条数一一对应、以及每条维度与配置一致。
+// validateVectors 检查条数一一对应、以及每条维度与 dim 一致。
+//
+// 两条实现（本机 ONNX 与 HTTP 服务）**共用这一份**：它是最容易出现静默错误的一处
+// （见下面注释），分成两份实现就等于允许两边慢慢漂移。
 //
 // 两处都必须报错而不是照收：
 //   - 条数对不上 = 静默丢文本，下游表现为"有些记忆就是存不进去"，极难查；
 //   - 维度不对 = 要等存进 pgvector 时才炸，而报错来自数据库（expected 1024 dimensions），
 //     看着与嵌入毫无关系。
-func (e *OpenAIEmbedder) validateVectors(vectors [][]float32, want int) ([][]float32, error) {
+func validateVectors(vectors [][]float32, want, dim int, source string) ([][]float32, error) {
 	if len(vectors) != want {
-		return nil, fmt.Errorf("嵌入服务返回 %d 条向量，请求了 %d 条（必须一一对应）", len(vectors), want)
+		return nil, fmt.Errorf("%s 返回 %d 条向量，请求了 %d 条（必须一一对应）", source, len(vectors), want)
 	}
 	for _, v := range vectors {
-		if len(v) != e.cfg.Dim {
-			return nil, fmt.Errorf("嵌入维度不匹配：配置 %d 维，服务返回 %d 维（model=%s）。改维度要同时改表和 COMPANION_EMBED_DIM，并重算所有历史向量",
-				e.cfg.Dim, len(v), e.cfg.Model)
+		if len(v) != dim {
+			return nil, fmt.Errorf("嵌入维度不匹配：期望 %d 维，%s 返回 %d 维。改维度要同时改表和 DefaultEmbedDim，并重算所有历史向量",
+				dim, source, len(v))
 		}
 	}
 	return vectors, nil

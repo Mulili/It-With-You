@@ -7,7 +7,9 @@ require (
 	github.com/free-llms-foundation/retrieval-go v0.0.0-20260916210821-e2897ee5bfcf
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/rivo/uniseg v0.4.7
 	github.com/wailsapp/wails/v2 v2.16.0
+	github.com/yalue/onnxruntime_go v1.36.0
 )
 
 require (
@@ -47,7 +49,6 @@ require (
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/quic-go v0.57.1 // indirect
 	github.com/refraction-networking/utls v1.8.1 // indirect
-	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/samber/lo v1.49.1 // indirect
 	github.com/temoto/robotstxt v1.1.2 // indirect
 	github.com/tkrajina/go-reflector v0.5.8 // indirect
