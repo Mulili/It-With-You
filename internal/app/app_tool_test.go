@@ -97,7 +97,7 @@ func (p *scriptedProvider) rounds() int {
 func newToolApp(t *testing.T, p llm.Provider) (*App, history.Store, string, string) {
 	t.Helper()
 	hist := historystore.NewMemoryStore()
-	app := NewApp(p, nil, hist, nil, nil, nil)
+	app := NewApp(p, nil, hist, nil, nil, llm.EmbedStatus{}, nil)
 	// ctx 非 nil 才能跑 stream（它要拿它做取消）；win 仍为 nil，
 	// 于是所有推事件都会被 emit 丢掉——见 emit 上那段说明
 	app.ctx = context.Background()

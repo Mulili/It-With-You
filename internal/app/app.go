@@ -59,10 +59,17 @@ type App struct {
 	// 它与 history 共用同一个连接池，但**不是同一份数据**：history 存原文、按会话取；
 	// memories 存提炼出来的东西、按语义取。
 	memories memory.Store
-	// embedder 为 nil 表示嵌入服务不可用。此时**记忆功能整体停用**：
-	// 不结算、不抽取、不写索引、**也不检索**，对话照常——抽了却嵌不出向量，等于白花一次调用。
-	// 这与"数据库连不上"的处理姿态不同：嵌入只服务记忆，而对话根本不经过它。
+	// embedder 是嵌入后端（默认进程内 ONNX，见 internal/llm）。
+	//
+	// ⚠️ 它**没有"nil = 降级"这一档了**：嵌入不可用等于记忆失效，而用户明确要求过
+	// "不希望用户聊完了没记忆"，所以那种情况下前端会进**阻断态**（见 embedStatus）。
+	// 这里保留判空只是防御——真为 nil 时 recall / 结算那条路会直接返回。
 	embedder llm.Embedder
+	// embedStatus 是嵌入后端的状态（是否就绪 + 原因），给设置页与启动拦截用。
+	//
+	// 由 main 在组装之前探测出来注入：自检（加载模型 + 跑一次嵌入）必须早于第一帧，
+	// 因为"能不能开始聊"要在界面上立刻说清楚，而不是等用户聊完一轮才发现没记忆。
+	embedStatus llm.EmbedStatus
 
 	mu sync.Mutex
 	// judgeMu 串行化「话题边界」判断。
@@ -95,8 +102,6 @@ type App struct {
 	//
 	// 注意只记"输出不可用"，网络与嵌入的失败**不记**——那些是瞬时的，值得下一轮再试。
 	settleBad map[string]bool
-	// warmMu 保证同一时刻最多一个嵌入预热在跑（见 warmEmbedder）。
-	warmMu sync.Mutex
 
 	// thinkingDisabled 是用户的思考模式开关（应用级设置，缓存在内存里）。
 	//
@@ -161,13 +166,13 @@ func (a *App) emit(name string, payload any) {
 
 // NewApp 组装应用。
 //
-// embedder 传 nil 表示嵌入服务不可用，此时记忆功能整体停用（不结算、不抽取），
-// 对话与人格不受影响——见 App.embedder 的注释。
+// embedder / embedStatus 是 main 探测出来的嵌入后端：能用就给出实现，不能用就给出**原因**
+// （embedStatus.Ready=false）——那时前端会进阻断态，见 App.embedStatus 的注释。
 // trayIcon 是托盘图标字节，见 App.trayIcon 的注释（为什么是传进来而不是 embed）。
 func NewApp(provider llm.Provider, personas persona.Store, hist history.Store,
-	mems memory.Store, embedder llm.Embedder, trayIcon []byte) *App {
+	mems memory.Store, embedder llm.Embedder, embedStatus llm.EmbedStatus, trayIcon []byte) *App {
 	a := &App{provider: provider, personas: personas, history: hist,
-		memories: mems, embedder: embedder, trayIcon: trayIcon}
+		memories: mems, embedder: embedder, embedStatus: embedStatus, trayIcon: trayIcon}
 	// 应用级设置读一次就缓存在内存：Ask 每轮都要用它们，不该每次都查库。
 	// 读失败一律按默认继续——一个设置读不到，不该让整个应用起不来。
 	if personas != nil {
@@ -343,6 +348,13 @@ func (a *App) Shutdown(ctx context.Context) {
 	if c, ok := a.history.(io.Closer); ok {
 		if err := c.Close(); err != nil {
 			log.Printf("[history] 关闭存储失败: %v", err)
+		}
+	}
+	// 嵌入器持有 ONNX 会话，退出时释放它。**不去销毁 ONNX Runtime 的全局环境**：
+	// 那是进程级的东西，销毁时机必须晚于所有会话，交给进程退出更安全（见 ONNXEmbedder.Close）。
+	if c, ok := a.embedder.(io.Closer); ok {
+		if err := c.Close(); err != nil {
+			log.Printf("[embed] 关闭嵌入器失败: %v", err)
 		}
 	}
 	log.Println("[app] 已退出")

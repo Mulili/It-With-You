@@ -1,14 +1,20 @@
-// 本文件是阶段4 的嵌入接入：把文本转成向量，供记忆检索用（默认 BGE-M3 @ 本机 Ollama）。
+// 本文件是阶段4 的嵌入接入：把文本转成向量，供记忆检索用。
 //
 // 为什么不塞进 Provider（对话那个接口）：对话与嵌入**大概率是两个服务**——
-// 本项目就是 DeepSeek 管聊天、Ollama 管嵌入，base_url 与 key 各不相同。
+// 本项目就是 DeepSeek 管聊天、嵌入另有来源，base_url 与 key 各不相同。
 // 硬塞进同一个接口，等于逼用户把两者配到同一个地址上，是把架构按"最省事"的方式扭曲。
 //
-// 协议上以 OpenAI 兼容的 /embeddings 为基准：Ollama、TEI、Xinference、百炼、OpenAI
-// 全都提供这个形状，一份实现覆盖所有部署方式，差别只在 base_url 与 model。
+// 两条实现，由配置选后端（默认是进程内 ONNX，见 embed_onnx.go）：
+//   - ONNXEmbedder：进程内跑本机 ONNX 模型，**不依赖任何常驻服务**（推荐）；
+//   - OpenAIEmbedder：走 OpenAI 兼容的 /embeddings，覆盖 TEI / Xinference / 百炼 / OpenAI
+//     这类远程或自建服务，差别只在 base_url 与 model。
 //
-// 唯一的例外是**保活**：只有 Ollama 的原生端点认 keep_alive，而"模型别被卸载"这件事
-// 对体验影响不小，所以对 Ollama 单独走一趟原生端点——见 nativeOllama 与 embedKeepAlive。
+// 两条都遵守 Embedder 的约定；**哪条不可用都是启动拦截的理由**，不是"降级成没有记忆"
+// （用户明确要求过：不允许出现聊完了没记忆）。
+//
+// ⚠️ 这里**已经没有 Ollama 的原生端点与保活了**：`keep_alive`、`/api/version` 探测、
+// "空闲 5 分钟被卸载"那一整套，只在"嵌入靠外部 Ollama"时才存在。换成进程内实现之后
+// 没有冷启动，于是整块删掉——见 operation.md 的「嵌入运行时替换」。
 package llm
 
 import (
@@ -31,32 +37,59 @@ import (
 // 所有历史向量。所以它既是一个配置项，也是启动时要校验的对象。
 const DefaultEmbedDim = 1024
 
-// EmbedTimeout 是单次嵌入请求的总超时。
+// EmbedTimeout 是单次嵌入请求的总超时（只对 HTTP 那条实现有意义）。
 //
 // 与对话不同，这里可以设死超时：嵌入没有流式，响应小且快。留 30s 是为了覆盖
-// "Ollama 首次把模型加载进内存"那一两秒。
+// 对端首次加载模型那一两秒。
 const EmbedTimeout = 30 * time.Second
-
-// embedKeepAlive 是每次嵌入请求附带"模型在显存里留多久"，-1 = 不卸载。
-//
-// 为什么值得让 380MB 显存常驻：
-//   - Ollama 默认**空闲 5 分钟就卸载模型**，而冷启动实测要 2.2 秒（热 0.05 秒）；
-//   - 那 2.2 秒落在**关键路径**上（recall 在拼上下文之前），也就是用户按完回车干等着；
-//   - 而且本项目的目标是"分发给不喜欢折腾的人"——指望每个用户自己去配
-//     `OLLAMA_KEEP_ALIVE` 环境变量是不现实的（连开发者自己都要试两次才发现它生效）。
-//
-// ⚠️ 这个参数**只有 Ollama 的原生端点 /api/embed 认**。OpenAI 兼容的 /v1/embeddings
-// 会**静默忽略**它（实测：传 600 或 "10m" 都无效，`/api/ps` 的 expires_at 仍旧是 5 分钟后）。
-// 所以本文件对 Ollama 走原生端点、对其余服务走兼容端点——见 OpenAIEmbedder.nativeOllama。
-const embedKeepAlive = -1
 
 // 嵌入相关的环境变量。与对话那组（COMPANION_LLM_*）刻意分开：它们是两个服务。
 const (
+	// envEmbedBackend 选实现：onnx（默认，进程内）或 http（兼容端点）。
+	envEmbedBackend = "COMPANION_EMBED_BACKEND"
 	envEmbedBaseURL = "COMPANION_EMBED_BASE_URL"
 	envEmbedAPIKey  = "COMPANION_EMBED_API_KEY"
 	envEmbedModel   = "COMPANION_EMBED_MODEL"
 	envEmbedDim     = "COMPANION_EMBED_DIM"
+	// envEmbedModelDir / envEmbedRuntime 覆盖 ONNX 三件套的位置。
+	// 不填就按 exe 同目录 → 用户缓存目录找（见 LocateONNXFiles）。
+	envEmbedModelDir = "COMPANION_EMBED_MODEL_DIR"
+	envEmbedRuntime  = "COMPANION_ONNXRUNTIME_DLL"
 )
+
+// EmbedBackendONNX / EmbedBackendHTTP 是 envEmbedBackend 的两个取值。
+const (
+	EmbedBackendONNX = "onnx"
+	EmbedBackendHTTP = "http"
+)
+
+// EmbedBackendFromEnv 返回选定的后端，默认进程内 ONNX。
+//
+// 认不出来的值也回落到 ONNX（而不是报错）：错一个字符串就让应用起不来，
+// 代价远大于"他其实想选 http"。
+func EmbedBackendFromEnv() string {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(envEmbedBackend)))
+	switch v {
+	case EmbedBackendHTTP, "openai", "remote":
+		return EmbedBackendHTTP
+	default:
+		return EmbedBackendONNX
+	}
+}
+
+// EmbedStatus 是嵌入后端对外的**状态**：给设置页显示、给启动拦截判断。
+//
+// 它必须能回答"到底哪儿不对"：嵌入不可用等于记忆整体失效，而用户能做的只有
+// "把缺的东西补上"——只说一句"嵌入不可用"帮不上任何忙。
+type EmbedStatus struct {
+	// Backend 是生效的后端："onnx" 或 "http"
+	Backend string `json:"backend"`
+	// Ready 为 false 时上层**必须拦住启动**（见 App 里的拦截），embedder 也会是 nil
+	Ready bool `json:"ready"`
+	Dim   int  `json:"dim"`
+	// Detail 就绪时是"模型路径 / 端点地址"，失败时是**失败原因**（含试过的位置）
+	Detail string `json:"detail"`
+}
 
 // EmbedConfig 是嵌入服务的配置。
 type EmbedConfig struct {
@@ -102,16 +135,10 @@ type Embedder interface {
 	Dim() int
 }
 
-// OpenAIEmbedder 是 Embedder 的实现，覆盖 Ollama / TEI / Xinference / 百炼 / OpenAI。
+// OpenAIEmbedder 是 Embedder 的实现，覆盖任何提供 OpenAI 兼容 /embeddings 的服务。
 type OpenAIEmbedder struct {
 	cfg    EmbedConfig
 	client *http.Client
-	// nativeOllama 表示 base_url 背后是 Ollama，于是可以走它的原生端点。
-	//
-	// 它由 Verify 探测后写入：构造时不能发网络请求，而"发请求"这件事
-	// 本该发生在启动探测那一刻。⚠️ 因此 **Verify 必须在任何 Embed 之前调用一次**
-	// （实际调用点是 main 的 probeEmbedder），之后这个字段只读、不再变。
-	nativeOllama bool
 }
 
 // NewOpenAIEmbedder 只做组装，不做网络校验——可用性由调用方用 Verify 探测。
@@ -121,13 +148,6 @@ func NewOpenAIEmbedder(cfg EmbedConfig) *OpenAIEmbedder {
 
 // Dim 实现 Embedder。
 func (e *OpenAIEmbedder) Dim() int { return e.cfg.Dim }
-
-// NativeOllama 报告是否探测到了 Ollama 的原生端点，也就是**保活是否生效**。
-//
-// 给启动日志用：它决定"模型会不会因为空闲 5 分钟被卸载"，而这件事从任何其它日志里
-// 都看不出来——只有把模型读回来时那 2.2 秒会提醒你，但那已经晚了（用户正等着回复）。
-// ⚠️ 必须在 Verify 之后调用才有意义。
-func (e *OpenAIEmbedder) NativeOllama() bool { return e.nativeOllama }
 
 // ---------- 兼容端点（OpenAI 形状）----------
 
@@ -147,61 +167,12 @@ type embedResponse struct {
 	} `json:"data"`
 }
 
-// ---------- Ollama 原生端点 ----------
-
-// ollamaEmbedRequest 是 /api/embed 的请求体。
-//
-// 与兼容端点的差别只有 keep_alive——但正是这一个字段决定了模型会不会被卸载，
-// 所以对 Ollama 值得单独走这条路。
-type ollamaEmbedRequest struct {
-	Model     string   `json:"model"`
-	Input     []string `json:"input"`
-	KeepAlive int      `json:"keep_alive"`
-}
-
-// ollamaEmbedResponse 是 /api/embed 的响应体：向量直接在 embeddings 里（二维数组），
-// 不像 OpenAI 那样包一层 data[].embedding。
-type ollamaEmbedResponse struct {
-	Embeddings [][]float32 `json:"embeddings"`
-}
-
-// nativeBase 从兼容端点的 base_url 推出 Ollama 原生端点的前缀。
-//
-// 兼容端点的约定是以 /v1 结尾（OpenAI 风格），而原生端点挂在同一个 host 的 /api/... 上，
-// 所以去掉结尾的 /v1 就够了。用户若把 base_url 写成不带 /v1 的形式，这里也不会出错。
-func nativeBase(baseURL string) string {
-	return strings.TrimSuffix(strings.TrimRight(baseURL, "/"), "/v1")
-}
-
-// probeOllama 判断 base_url 背后是不是 Ollama（决定 Embed 走哪个端点）。
-//
-// 依据是原生端点 /api/version：兼容端点 /v1/embeddings 是"大家都有的形状"，认不出是谁；
-// 而 /api/version 只有 Ollama 提供。探不到（超时、404、别的服务）就**当作不是**——
-// 退回兼容端点是最安全的判断，因为它覆盖的服务最多。
-func (e *OpenAIEmbedder) probeOllama(ctx context.Context) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nativeBase(e.cfg.BaseURL)+"/api/version", nil)
-	if err != nil {
-		return false
-	}
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	// 送掉一点 body 让连接能被复用；内容本身不看，只认状态码
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
-	return resp.StatusCode == http.StatusOK
-}
-
 // ---------- 主流程 ----------
 
 // Embed 实现 Embedder。
 func (e *OpenAIEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
-	}
-	if e.nativeOllama {
-		return e.embedOllama(ctx, texts)
 	}
 	return e.embedOpenAI(ctx, texts)
 }
@@ -225,25 +196,10 @@ func (e *OpenAIEmbedder) embedOpenAI(ctx context.Context, texts []string) ([][]f
 	return validateVectors(vectors, len(texts), e.cfg.Dim, "嵌入服务")
 }
 
-func (e *OpenAIEmbedder) embedOllama(ctx context.Context, texts []string) ([][]float32, error) {
-	data, err := e.postJSON(ctx, nativeBase(e.cfg.BaseURL)+"/api/embed",
-		ollamaEmbedRequest{Model: e.cfg.Model, Input: texts, KeepAlive: embedKeepAlive})
-	if err != nil {
-		return nil, err
-	}
-
-	var out ollamaEmbedResponse
-	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, fmt.Errorf("解析嵌入响应失败: %w", err)
-	}
-	return validateVectors(out.Embeddings, len(texts), e.cfg.Dim, "嵌入服务")
-}
-
 // postJSON 发一次 JSON POST，返回限流读取后的响应体。
 //
-// 两个端点只有 URL、请求体、响应体形状不同，传输这一段完全一样。抽出来是因为
-// "状态码检查 + 只读 4KB 错误体 + 32MB 响应上限"这几处一旦分叉，
-// 症状就是"某一个端点偶尔把整页 HTML 当向量解析"。
+// 抽出来的理由：嵌入请求只有这一个出口，而"状态码检查 + 只读 4KB 错误体 + 32MB 响应上限"
+// 这几处一旦在别处再抄一遍，很容易漏掉某一项——症状是"偶尔把整页 HTML 当向量解析"。
 func (e *OpenAIEmbedder) postJSON(ctx context.Context, url string, payload any) ([]byte, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -295,17 +251,15 @@ func validateVectors(vectors [][]float32, want, dim int, source string) ([][]flo
 	return vectors, nil
 }
 
-// Verify 发一次最小请求，确认服务可用、**实际维度与配置一致**，并顺手探测端点类型。
+// Verify 发一次最小请求，确认服务可用、**实际维度与配置一致**。
 //
 // 为什么值得在启动时花这一次往返：维度不匹配的后果会拖到用户第一次写记忆时才出现，
 // 而且报错来自 pgvector（"expected 1024 dimensions"），看着跟嵌入毫无关系。
 // 把它提前到启动日志里说清楚，排查成本差一个数量级。
 //
-// 它还有第二个职责：**决定 Embed 走哪个端点**（见 nativeOllama）。放在这里而不是构造函数里，
-// 是因为构造不该发网络请求，而这里本来就要发一次。
+// ⚠️ 它还是"这条后端能不能用"的唯一判据：失败就意味着上层要**拦住启动**
+//（见 EmbedStatus），而不是降级成"没有记忆"。
 func (e *OpenAIEmbedder) Verify(ctx context.Context) error {
-	// 探测结果决定后面走原生还是兼容端点，所以必须在第一次 Embed 之前定下来
-	e.nativeOllama = e.probeOllama(ctx)
 	_, err := e.Embed(ctx, []string{"ping"})
 	return err
 }

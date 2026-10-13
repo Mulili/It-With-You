@@ -11,6 +11,7 @@ import (
 	"agent-for-you-love/internal/persona/store"
 	"context"
 	"embed"
+	"fmt"
 	"log"
 	"time"
 
@@ -51,18 +52,19 @@ func main() {
 	// 历史存储：与人格共用同一个连接池（同一个库，三块数据都在上面）
 	historyStore := historystore.Open(pool)
 
-	// 记忆存储：同样共用这个连接池。注意"存储可用"与"嵌入可用"是两件事——
-	// 后者不可用时，上层根本不会走到这里（记忆功能整体停用）
+	// 记忆存储：同样共用这个连接池。"存储可用"与"嵌入可用"是两件事：
+	// 前者连不上只是数据不落盘，后者不可用则整个应用会被拦住（见 openEmbedder）。
 	memoryStore := memorystore.Open(pool)
 
-	// 嵌入服务（阶段4 的记忆检索用）。与对话分开配，因为它们通常是两个服务。
-	// 探测失败返回 nil：记忆功能整体停用，对话照常，且启动不被打断。
-	embedder := probeEmbedder()
+	// 嵌入后端（记忆检索用）。默认是**进程内 ONNX**，不再依赖任何常驻服务。
+	// 自检失败**不阻止进程启动**，但会让界面进阻断态——嵌入不可用等于记忆失效，
+	// 而用户明确要求过不允许出现"聊完了没记忆"（见 llm.EmbedStatus 的注释）。
+	embedder, embedStatus := openEmbedder()
 
 	// 变量名刻意避开包名：下面还要用 app.NewApp 这个包限定符，
 	// 叫 app 的话变量会把包名遮蔽掉（编译得过，但之后再也用不了那个包）。
 	application := app.NewApp(llm.NewOpenAIProvider(llmCfg), personaStore, historyStore,
-		memoryStore, embedder, trayIcon)
+		memoryStore, embedder, embedStatus, trayIcon)
 
 	err := wails.Run(&options.App{
 		Title:         "常驻助手",
@@ -145,40 +147,74 @@ func openDB() *pgxpool.Pool {
 	return pool
 }
 
-// probeEmbedder 在启动时确认嵌入服务可用，并返回可用的嵌入器（不可用则返回 nil）。
+// embedSelfCheckTimeout 是嵌入后端自检的上限。
 //
-// 这里**不返回错误、也不阻止启动**：嵌入只是记忆功能的前提，对话并不依赖它。
-// 探测的意义是把"服务没起""维度不匹配"这类问题在启动日志里说清楚，而不是留到
-// 用户第一次写记忆时，由 pgvector 报一个与嵌入看不出关系的错（expected 1024 dimensions）。
-//
-// 返回 nil 而不是返回"一个不可用的嵌入器"，是为了让上层只需要判空：
-// 否则每个调用点都得自己记得"先探测再用"。
-//
-// 同步探测是刻意的：本机 Ollama 没启动时，连接被拒是瞬时的，不会拖慢启动；
-// 只有把 base_url 指到不可达的远程地址，才会真的等满这 5 秒。
-func probeEmbedder() llm.Embedder {
-	cfg := llm.EmbedConfigFromEnv()
-	e := llm.NewOpenAIEmbedder(cfg)
+// ONNX 那条路要**加载 543MB 的模型**（实测约 2 秒）再跑一次前向，所以不能给太短；
+// HTTP 那条路要等一次往返（对端可能正好在加载模型）。30 秒是"正常够用、异常不干等"的折中。
+const embedSelfCheckTimeout = 30 * time.Second
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// openEmbedder 准备嵌入后端并做一次自检，返回实现与**状态**。
+//
+// 与之前那条 HTTP 路径的姿态不同：那时探测失败只是"记忆功能停用、对话照常"；
+// 现在嵌入不可用会成为前端的**阻断条件**——因为"她其实记不住"这件事，
+// 不能等用户聊完一轮才发现（用户的原话是"不希望用户聊完了没记忆"）。
+//
+// 返回的 embedder 在不可用时是 nil，但 **EmbedStatus.Detail 一定说得清原因**：
+// 这个字符串会直接显示在阻断页上，所以"找不到模型"这类错要带上试过的位置。
+func openEmbedder() (llm.Embedder, llm.EmbedStatus) {
+	ctx, cancel := context.WithTimeout(context.Background(), embedSelfCheckTimeout)
 	defer cancel()
 
+	backend := llm.EmbedBackendFromEnv()
+	if backend == llm.EmbedBackendHTTP {
+		cfg := llm.EmbedConfigFromEnv()
+		e := llm.NewOpenAIEmbedder(cfg)
+		if err := e.Verify(ctx); err != nil {
+			log.Printf("[embed] 兼容端点不可用（%s @ %s）: %v", cfg.Model, cfg.BaseURL, err)
+			return nil, llm.EmbedStatus{
+				Backend: backend,
+				Detail:  fmt.Sprintf("兼容端点 %s 不可用：%v", cfg.BaseURL, err),
+			}
+		}
+		log.Printf("[embed] 就绪：兼容端点 %s（model=%s，%d 维）", cfg.BaseURL, cfg.Model, e.Dim())
+		return e, llm.EmbedStatus{
+			Backend: backend,
+			Ready:   true,
+			Dim:     e.Dim(),
+			Detail:  fmt.Sprintf("%s @ %s", cfg.Model, cfg.BaseURL),
+		}
+	}
+
+	// 默认：进程内 ONNX
+	files, err := llm.LocateONNXFilesFromEnv()
+	if err != nil {
+		log.Printf("[embed] %v", err)
+		return nil, llm.EmbedStatus{Backend: backend, Detail: err.Error()}
+	}
+	e, err := llm.NewONNXEmbedder(llm.ONNXEmbedConfig{
+		RuntimePath:   files.Runtime,
+		ModelPath:     files.Model,
+		TokenizerPath: files.Tokenizer,
+	})
+	if err != nil {
+		log.Printf("[embed] 进程内嵌入初始化失败: %v", err)
+		return nil, llm.EmbedStatus{Backend: backend, Detail: err.Error()}
+	}
 	if err := e.Verify(ctx); err != nil {
-		log.Printf("[embed] 嵌入服务不可用（%s @ %s）: %v", cfg.Model, cfg.BaseURL, err)
-		log.Printf("[embed] 记忆功能将停用（不抽取、不写索引），对话与人格不受影响；" +
-			"本机装 Ollama 后 `ollama pull bge-m3` 可恢复")
-		return nil
+		_ = e.Close()
+		log.Printf("[embed] 进程内嵌入自检失败: %v", err)
+		return nil, llm.EmbedStatus{Backend: backend, Detail: fmt.Sprintf("模型自检失败：%v", err)}
 	}
-	log.Printf("[embed] 嵌入服务就绪：%s @ %s（%d 维）", cfg.Model, cfg.BaseURL, cfg.Dim)
-	if e.NativeOllama() {
-		// 这句话值得打：保活是否生效只取决于"探测到的端点"，而它带来的差别
-		// （隔夜后第一句话快 2.2 秒、还是慢 2.2 秒）从其它日志里完全看不出来。
-		log.Printf("[embed] 已启用模型保活：走 Ollama 原生端点，空闲不会被卸载")
-	} else {
-		log.Printf("[embed] 未探测到 Ollama 原生端点，走兼容端点：模型可能在空闲 5 分钟后被卸载" +
-			"（下一次嵌入要多花约 2 秒）")
+	// 这两行值得打：它们把"到底用的哪个模型文件、哪个版本的 runtime"钉在日志里，
+	// 而"记忆召回不准"排查到最后往往就是这两个东西和预期不一致。
+	log.Printf("[embed] 就绪：进程内 ONNX（onnxruntime %s，%d 维）", llm.ONNXRuntimeVersion(), e.Dim())
+	log.Printf("[embed] 模型 %s", files.Model)
+	return e, llm.EmbedStatus{
+		Backend: backend,
+		Ready:   true,
+		Dim:     e.Dim(),
+		Detail:  fmt.Sprintf("进程内 ONNX（onnxruntime %s），模型 %s", llm.ONNXRuntimeVersion(), files.Model),
 	}
-	return e
 }
 
 // loadBuiltinPersonas 读取内置人格；失败只记日志，不让应用起不来。

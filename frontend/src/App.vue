@@ -63,6 +63,9 @@ const settings = ref({
   searchExe: '',
   // 搜索服务此刻的状况（后端给的快照，见 Go 侧 web.State）
   searchService: { running: false, managed: false, exePath: '', message: '未启动' },
+  // 嵌入后端的状态（见 Go 侧 llm.EmbedStatus）。
+  // ready 为 false 时进阻断态：嵌入不可用等于记忆整体失效，不能让他先聊起来。
+  embed: { backend: '', ready: true, dim: 0, detail: '' },
 })
 // 导出哪个人格；空串 = 用当前生效的那个
 const exportId = ref('')
@@ -221,6 +224,8 @@ async function loadSettings() {
       searchService: s?.searchService ?? {
         running: false, managed: false, exePath: '', message: '未启动',
       },
+      // 默认按"就绪"算：后端没答话时不该先闪一下阻断页
+      embed: s?.embed ?? { backend: '', ready: true, dim: 0, detail: '' },
     }
   } catch (e) {
     console.error('读取设置失败', e)
@@ -286,6 +291,12 @@ function searchServiceClass() {
   return settings.value.searchService?.running ? 'statusline--ok' : 'statusline--warn'
 }
 
+// 嵌入状态行同理：就绪=绿，不可用=黄（不是"出错"，是"你还得配一下"）。
+// 它比搜索服务更要紧——不可用时整个界面会被阻断页盖住，所以这里也把原因原样显示出来。
+function embedClass() {
+  return settings.value.embed?.ready ? 'statusline--ok' : 'statusline--warn'
+}
+
 // 导出选中的那个人格（没选就是当前人格）。
 // 内置人格也允许导出——那正是"产出自己的人格"的通道：在应用里调好再导出来。
 async function exportPersona() {
@@ -322,6 +333,13 @@ async function importPersona() {
 
 // dbReady 为 false 时整个界面进入阻断态
 const dbReady = computed(() => storageReady.value !== false)
+
+// 嵌入后端没就绪**也要阻断**：嵌入不可用等于记忆整体失效，而"她其实记不住"这件事
+// 不能等用户聊完一轮才发现（用户明确要求过"不希望用户聊完了没记忆"）。
+// 默认按就绪算（true）——后端还没答话时不该先闪一下阻断页。
+const embedReady = computed(() => settings.value.embed?.ready !== false)
+// blocked 是两者之一：数据库更靠前（它是所有数据的落脚点），两个都不行时先说它
+const blocked = computed(() => !dbReady.value || !embedReady.value)
 
 // 能命令代劳的两步。装 PostgreSQL 本身没法代劳，只在文案里指路（README 有完整步骤）。
 const setupCmd = [
@@ -858,7 +876,7 @@ watch(busy, (running) => {
 async function send() {
   const text = draft.value.trim()
   // dbReady 这一道是防御：阻断层已经盖住了输入区，但回车键仍可能走到这里
-  if (!text || busy.value || !dbReady.value) return
+  if (!text || busy.value || blocked.value) return
 
   draft.value = ''
   bubbleText.value = ''
@@ -940,9 +958,13 @@ onMounted(async () => {
   // 顺序不能反：数据库没就绪时该立刻进阻断态，而不是等用户点开菜单才知道
   // （那时他已经开始打字了，白写一段话）。
   // 上下文占用与存储无关（它只是这一轮发了多少字），所以并行拉、不串在这条链上。
-  await Promise.all([loadPersona(), loadContextStat()])
+  await Promise.all([loadPersona(), loadContextStat(), loadSettings()])
   if (storageReady.value === false) {
     say('数据库未连接')
+    return
+  }
+  if (embedReady.value === false) {
+    say('嵌入模型未就绪，先看阻断页')
     return
   }
   say('数据库已连接desu')
@@ -979,7 +1001,7 @@ onUnmounted(() => {
     <!-- 上下文占用：**这一轮真正发出去的那一包**（人格 + 当前片历史 + 本轮回忆 + 我这句话）。
          看两件事：① 离满还有多远（空着的那截）；② 回忆是**注进来的**（紫色）还是本来就在历史里。
          宽度按占容量的比例，所以它同时是个进度条 -->
-    <div v-if="dbReady" class="ctxbar" title="这一轮真正发给模型的上下文（按字符数）">
+    <div v-if="!blocked" class="ctxbar" title="这一轮真正发给模型的上下文（按字符数）">
       <div class="ctxbar__track">
         <span
           v-for="seg in ctxSegments"
@@ -1527,6 +1549,15 @@ onUnmounted(() => {
               </span>
             </p>
 
+            <!-- 嵌入后端的状态。它比搜索服务更要紧：搜索不可用只是"少一个能力"，
+                 嵌入不可用等于**记忆整体失效**——那时整个界面会被阻断页盖住，
+                 所以这里必须把"到底缺什么"原样显示出来。 -->
+            <p class="statusline" :class="embedClass()">
+              嵌入模型：{{ settings.embed?.ready ? '就绪' : '不可用' }}
+              <span v-if="settings.embed?.dim" class="statusline__path">（{{ settings.embed.dim }} 维）</span>
+              <span class="statusline__path">— {{ settings.embed?.detail || '—' }}</span>
+            </p>
+
             <div class="rules__head"><span>人格导入导出</span></div>
             <p class="pane__note">
               导出的文件可以直接分享给别人；导入遇到同名人格会新建一份副本，不会覆盖现有的。
@@ -1549,20 +1580,37 @@ onUnmounted(() => {
       </section>
     </Transition>
 
-    <!-- 数据库未就绪：挡住 stage 与输入区，只留出拖拽区（否则窗口都没法拖走） -->
-    <section v-if="!dbReady" class="blocker">
-      <p class="blocker__title">需要数据库才能开始</p>
-      <p class="blocker__desc">
-        人格与记忆要存在 PostgreSQL 里。
-      </p>
-      <p class="blocker__steps">
-        ① 装 PostgreSQL 18 + pgvector 扩展<br />
-        ② 建库并启用扩展（下面两条命令）<br />
-        ③ 在 .env 里填 COMPANION_PG_DSN，然后重启
-      </p>
-      <textarea class="blocker__cmd" rows="3" readonly :value="setupCmd"></textarea>
-      <button class="btn btn--ghost blocker__copy" @click="copySetupCmd">复制命令</button>
-      <p class="blocker__hint">完整步骤（含 pgvector 安装）见项目 README 的「运行依赖」一节</p>
+    <!-- 存储或嵌入不可用：挡住 stage 与输入区，只留出拖拽区（否则窗口都没法拖走） -->
+    <section v-if="blocked" class="blocker">
+      <template v-if="!dbReady">
+        <p class="blocker__title">需要数据库才能开始</p>
+        <p class="blocker__desc">
+          人格与记忆要存在 PostgreSQL 里。
+        </p>
+        <p class="blocker__steps">
+          ① 装 PostgreSQL 18 + pgvector 扩展<br />
+          ② 建库并启用扩展（下面两条命令）<br />
+          ③ 在 .env 里填 COMPANION_PG_DSN，然后重启
+        </p>
+        <textarea class="blocker__cmd" rows="3" readonly :value="setupCmd"></textarea>
+        <button class="btn btn--ghost blocker__copy" @click="copySetupCmd">复制命令</button>
+        <p class="blocker__hint">完整步骤（含 pgvector 安装）见项目 README 的「运行依赖」一节</p>
+      </template>
+
+      <!-- 嵌入没就绪：**不能让他先聊起来**。记忆是这款应用的核心，
+           "聊完一整段才发现她什么都没记住"比一开始就说明白糟得多。 -->
+      <template v-else>
+        <p class="blocker__title">需要嵌入模型才能开始</p>
+        <p class="blocker__desc">
+          她靠嵌入模型把记住的东西变成向量。模型不在，就一条也记不住——所以这里先不让你进去聊。
+        </p>
+        <p class="blocker__steps">
+          ① 把模型目录整个放到 exe 旁边：<code>models/bge-m3-onnx-int8/</code><br />
+          ② 把 <code>onnxruntime.dll</code> 放到 exe 同目录<br />
+          ③ 或用 <code>.env</code> 里的 COMPANION_EMBED_MODEL_DIR / COMPANION_ONNXRUNTIME_DLL 指定位置
+        </p>
+        <p class="blocker__hint">到底缺什么：{{ settings.embed?.detail || '（后端没给出原因）' }}</p>
+      </template>
     </section>
 
     <!-- 人格回执：独立短提示，避免覆盖正在流式输出的气泡 -->

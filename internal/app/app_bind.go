@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"agent-for-you-love/internal/history"
+	"agent-for-you-love/internal/llm"
 	"agent-for-you-love/internal/ui"
 	"agent-for-you-love/internal/web"
 )
@@ -51,6 +52,11 @@ type AppSettings struct {
 	// SearchService 是搜索服务此刻的状况（不探测，见 web.State）。
 	// 设置页靠它显示"运行中 / 没找到程序 / 地址不是本机"，让失败**看得见**。
 	SearchService web.State `json:"searchService"`
+	// Embed 是嵌入后端的状态（是否就绪 + 模型路径 / 失败原因）。
+	//
+	// 它比搜索服务更要紧：搜索不可用只是"少一个能力"，嵌入不可用等于**记忆整体失效**，
+	// 而记忆是这款应用的核心。所以它同时驱动**启动拦截**（Ready=false 时前端进阻断态）。
+	Embed llm.EmbedStatus `json:"embed"`
 }
 
 // GetSettings 返回全局设置。
@@ -67,6 +73,7 @@ func (a *App) GetSettings() AppSettings {
 		SearchURL:        a.searchURLOrDefaultLocked(),
 		SearchExe:        a.searchExe,
 		SearchService:    st,
+		Embed:            a.embedStatus,
 	}
 }
 

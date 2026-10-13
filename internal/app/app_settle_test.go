@@ -130,7 +130,7 @@ func newSettleApp(t *testing.T, outs ...string) (*App, *fakeProvider, *fakeEmbed
 	emb := &fakeEmbedder{}
 
 	// 人格传 nil：这一组不关心人格，而 NewApp 对它是判空之后才用的
-	app := NewApp(prov, nil, hist, mems, emb, nil)
+	app := NewApp(prov, nil, hist, mems, emb, llm.EmbedStatus{}, nil)
 	// 真运行时由 Wails 注入；settlePending 会判空，所以这里必须给一个
 	app.ctx = context.Background()
 
@@ -292,7 +292,7 @@ func TestSettleDisabledWithoutEmbedder(t *testing.T) {
 	mems := &recordingStore{Store: memorystore.NewMemoryStore()}
 	prov := &fakeProvider{outs: []string{settleGoodJSON}}
 
-	app := NewApp(prov, nil, hist, mems, nil, nil) // embedder = nil
+	app := NewApp(prov, nil, hist, mems, nil, llm.EmbedStatus{}, nil) // embedder = nil
 	app.ctx = context.Background()
 
 	sess, err := hist.EnsureSession(testSettlePersona)

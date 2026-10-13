@@ -26,7 +26,7 @@ func newRecallApp(t *testing.T) (*App, *memorystore.MemoryStore, string) {
 	t.Helper()
 	personas := store.NewMemoryStore(testBuiltins(), true)
 	mems := memorystore.NewMemoryStore()
-	app := NewApp(nil, personas, historystore.NewMemoryStore(), mems, &fakeEmbedder{}, nil)
+	app := NewApp(nil, personas, historystore.NewMemoryStore(), mems, &fakeEmbedder{}, llm.EmbedStatus{}, nil)
 	app.ctx = context.Background() // 真运行时由 Wails 注入；recall 要用它做超时
 	return app, mems, personas.Snapshot().ActiveID
 }
@@ -221,7 +221,7 @@ func TestRecallReturnsEmptyWhenNothingPasses(t *testing.T) {
 
 // 嵌入服务不可用时记忆功能整体停用：不报错、不注入，对话照常。
 func TestRecallDisabledWithoutEmbedder(t *testing.T) {
-	app := NewApp(nil, nil, historystore.NewMemoryStore(), memorystore.NewMemoryStore(), nil, nil)
+	app := NewApp(nil, nil, historystore.NewMemoryStore(), memorystore.NewMemoryStore(), nil, llm.EmbedStatus{}, nil)
 	app.ctx = context.Background()
 
 	if got := app.recallText("00000000-0000-0000-0000-000000000001", "",

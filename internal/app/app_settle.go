@@ -345,8 +345,8 @@ func (a *App) indexArchivedRules() {
 		for _, r := range pending {
 			texts = append(texts, ruleIndexText(r))
 		}
-		// 用预热那一档超时：这不在关键路径上（写操作之后的维护），宁可慢也别失败
-		ctx, cancel := context.WithTimeout(a.ctx, EmbedWarmTimeout)
+		// 用"不在关键路径上"那一档超时：这是写操作之后的维护，宁可慢也别失败
+		ctx, cancel := context.WithTimeout(a.ctx, EmbedOffPathTimeout)
 		vecs, err := a.embedder.Embed(ctx, texts)
 		cancel()
 		if err != nil {

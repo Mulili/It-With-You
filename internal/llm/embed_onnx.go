@@ -19,8 +19,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 
 	"agent-for-you-love/internal/llm/tokenizer"
@@ -118,6 +120,118 @@ func ONNXRuntimeVersion() string {
 		return ""
 	}
 	return ort.GetVersion()
+}
+
+// ---------- 三件套的定位 ----------
+
+// 模型与动态库的文件名 / 目录名。模型目录名跟的是上游仓库名：
+// 将来换模型时，改这里一处即可（候选目录是 models/<这个名字>）。
+const (
+	onnxModelFileName     = "model_quantized.onnx"
+	onnxTokenizerFileName = "tokenizer.json"
+	modelsDirName         = "models"
+	modelDirName          = "bge-m3-onnx-int8"
+	appCacheDirName       = "It-With-You"
+)
+
+// onnxRuntimeFileName 返回动态库在本平台的名字。
+func onnxRuntimeFileName() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "onnxruntime.dll"
+	case "darwin":
+		return "libonnxruntime.dylib"
+	default:
+		return "libonnxruntime.so"
+	}
+}
+
+// ONNXFiles 是进程内嵌入需要的三个文件（绝对路径）。
+type ONNXFiles struct {
+	Runtime   string
+	Model     string
+	Tokenizer string
+}
+
+// LocateONNXFiles 按优先级找齐三件套：
+//
+//  1. 显式给的覆盖路径（环境变量，用户明确指定，最优先）
+//  2. 应用可执行文件**同目录**的 models/<模型目录名>/ ——**随包分发就放这儿**
+//  3. 用户缓存目录（Windows 上是 %LOCALAPPDATA%\It-With-You\models\...）
+//
+// 返回的错误会把**试过的每一个位置**都列出来：这个错最终是给用户看的，
+// 而"找不到模型"这四个字帮不上任何忙。
+//
+// ⚠️ 找不到**不返回 nil 让上层降级**：模型不在就是嵌入不在，而嵌入不在等于记忆失效。
+// 用户明确要求过不允许出现那个状态，所以上层拿这个错误去**拦住启动**。
+func LocateONNXFiles(dirOverride, runtimeOverride string) (ONNXFiles, error) {
+	exeDir := ""
+	if exe, err := os.Executable(); err == nil {
+		exeDir = filepath.Dir(exe)
+	}
+
+	var dirs []string
+	if d := strings.TrimSpace(dirOverride); d != "" {
+		dirs = append(dirs, d)
+	}
+	if exeDir != "" {
+		dirs = append(dirs, filepath.Join(exeDir, modelsDirName, modelDirName))
+	}
+	if cache, err := os.UserCacheDir(); err == nil {
+		dirs = append(dirs, filepath.Join(cache, appCacheDirName, modelsDirName, modelDirName))
+	}
+
+	tried := make([]string, 0, len(dirs))
+	for _, dir := range dirs {
+		model := filepath.Join(dir, onnxModelFileName)
+		tok := filepath.Join(dir, onnxTokenizerFileName)
+		if !fileExists(model) || !fileExists(tok) {
+			tried = append(tried, dir)
+			continue
+		}
+		// 动态库的三个候选：显式覆盖 → 模型同目录 → exe 同目录。
+		// 放"模型同目录"是为了让"整个 models/<名字>/ 一起拷过去"这种做法也能用。
+		runtimePath := ""
+		for _, c := range []string{
+			strings.TrimSpace(runtimeOverride),
+			filepath.Join(dir, onnxRuntimeFileName()),
+			filepath.Join(exeDir, onnxRuntimeFileName()),
+		} {
+			if c != "" && fileExists(c) {
+				runtimePath = c
+				break
+			}
+		}
+		if runtimePath == "" {
+			return ONNXFiles{}, fmt.Errorf("找到了模型（%s），但没找到 %s。把它放到 exe 同目录，或用 %s 指定完整路径",
+				model, onnxRuntimeFileName(), envEmbedRuntime)
+		}
+		return ONNXFiles{Runtime: runtimePath, Model: model, Tokenizer: tok}, nil
+	}
+
+	if len(tried) == 0 {
+		return ONNXFiles{}, fmt.Errorf("找不到嵌入模型：没有可试的位置（拿不到 exe 所在目录与用户缓存目录）。可用 %s 指定",
+			envEmbedModelDir)
+	}
+	return ONNXFiles{}, fmt.Errorf("找不到嵌入模型（需要 %s 与 %s 两个文件）。试过：%s。可用 %s 指定模型目录",
+		onnxModelFileName, onnxTokenizerFileName, strings.Join(tried, "；"), envEmbedModelDir)
+}
+
+// fileExists 只关心"是不是一个存在的文件"，不关心权限之类的差别。
+func fileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
+}
+
+// LocateONNXFilesFromEnv 用两条环境变量当覆盖，其余按默认位置找。
+//
+// 单独提供这一层，是为了让调用方（main 与测试）不必知道那两个变量名——
+// 名字属于这个包，改起来只改一处。
+func LocateONNXFilesFromEnv() (ONNXFiles, error) {
+	return LocateONNXFiles(os.Getenv(envEmbedModelDir), os.Getenv(envEmbedRuntime))
 }
 
 // ---------- 构造 ----------

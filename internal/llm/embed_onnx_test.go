@@ -11,49 +11,22 @@ import (
 )
 
 // ---------- 测试用的资源查找 ----------
+
+// testEmbedConfig 用**产品代码里的定位逻辑**（LocateONNXFiles）找三件套，找不到就 Skip。
 //
-// ⚠️ 这一段是**测试脚手架**：只在跑测试时找文件，找不到就 Skip。
-// App 侧的正式解析（设置项 → exe 同目录 → 用户缓存目录 → 缺了就拦截）在接线那一步做，
-// 不放在这里——测试不该替应用决定"模型该放哪"。
-
-const (
-	envONNXRuntimePath = "COMPANION_ONNXRUNTIME_DLL"
-	envEmbedModelDir   = "COMPANION_EMBED_MODEL_DIR"
-)
-
-func testModelDir() string {
-	if d := os.Getenv(envEmbedModelDir); d != "" {
-		return d
-	}
-	if d := os.Getenv("LOCALAPPDATA"); d != "" {
-		return filepath.Join(d, "It-With-You", "models", "bge-m3-onnx-int8")
-	}
-	return ""
-}
-
-// testEmbedConfig 组装测试用的配置；缺任何一件就 Skip。
-//
-// 两件资源都需要显式给（模型目录 + dll 路径）：
-// 模型是 543MB 的外部文件、dll 跟 binding 版本绑死，都不该让仓库替用户假定位置。
+// 刻意不在这里另写一套路径拼装：直接用它，就等于"测试跑得起来"本身也证明了
+// "按约定放的三件套能被找到"。两个覆盖入口仍是那两条环境变量（见 embed.go）。
 func testEmbedConfig(t *testing.T) ONNXEmbedConfig {
 	t.Helper()
-	dll := os.Getenv(envONNXRuntimePath)
-	dir := testModelDir()
-	if dll == "" || dir == "" {
-		t.Skipf("跳过：需要 %s（onnxruntime 动态库路径）与 %s（含 tokenizer.json 的模型目录）",
-			envONNXRuntimePath, envEmbedModelDir)
+	files, err := LocateONNXFiles(os.Getenv(envEmbedModelDir), os.Getenv(envEmbedRuntime))
+	if err != nil {
+		t.Skipf("跳过：%v", err)
 	}
-	cfg := ONNXEmbedConfig{
-		RuntimePath:   dll,
-		ModelPath:     filepath.Join(dir, "model_quantized.onnx"),
-		TokenizerPath: filepath.Join(dir, "tokenizer.json"),
+	return ONNXEmbedConfig{
+		RuntimePath:   files.Runtime,
+		ModelPath:     files.Model,
+		TokenizerPath: files.Tokenizer,
 	}
-	for _, p := range []string{cfg.RuntimePath, cfg.ModelPath, cfg.TokenizerPath} {
-		if _, err := os.Stat(p); err != nil {
-			t.Skipf("跳过：找不到 %s", p)
-		}
-	}
-	return cfg
 }
 
 // ---------- 基准 ----------

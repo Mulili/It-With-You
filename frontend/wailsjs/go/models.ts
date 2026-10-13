@@ -6,6 +6,7 @@ export namespace app {
 	    searchUrl: string;
 	    searchExe: string;
 	    searchService: web.State;
+	    embed: llm.EmbedStatus;
 	
 	    static createFrom(source: any = {}) {
 	        return new AppSettings(source);
@@ -18,6 +19,7 @@ export namespace app {
 	        this.searchUrl = source["searchUrl"];
 	        this.searchExe = source["searchExe"];
 	        this.searchService = this.convertValues(source["searchService"], web.State);
+	        this.embed = this.convertValues(source["embed"], llm.EmbedStatus);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -37,6 +39,29 @@ export namespace app {
 		    }
 		    return a;
 		}
+	}
+
+}
+
+export namespace llm {
+	
+	export class EmbedStatus {
+	    backend: string;
+	    ready: boolean;
+	    dim: number;
+	    detail: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new EmbedStatus(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.backend = source["backend"];
+	        this.ready = source["ready"];
+	        this.dim = source["dim"];
+	        this.detail = source["detail"];
+	    }
 	}
 
 }

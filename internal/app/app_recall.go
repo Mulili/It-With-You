@@ -22,14 +22,14 @@ const (
 	// RecallTimeout 是检索这一段的超时。
 	//
 	// 它跑在**关键路径**上（拼上下文之前），所以给得比嵌入器自己的默认超时短得多。
-	// 这个 3 秒是掐着实测数字定的：Ollama 空闲 5 分钟会卸载模型，下一次嵌入要先把它读回来
-	// （实测冷 2.23s / 热 0.05s，`ollama ps` 的 UNTIL 列就是那个 5 分钟）。
-	// 也就是说冷启动本身就要 2.2 秒——这一档刚够单发、不够并发，所以失败必须有人兜底：
-	// 见 recall 里失败后的 warmEmbedder（宁可这一轮不回忆，也不把 2 秒加在用户按回车之后）。
+	// 换成进程内 ONNX 之后这一档的含义变了：**没有冷启动**（模型在启动时一次性加载，
+	// 之后一次嵌入是毫秒级），所以 3 秒不再是"掐着冷启动"的紧箍咒，
+	// 而是"某个环节卡住时别让用户干等"的兜底。
+	// ⚠️ 重校 `recallMinScore` 时如果发现长文本嵌入会顶到它，该调的是这里（见 operation.md）。
 	RecallTimeout = 3 * time.Second
-	// EmbedWarmTimeout 是后台预热的上限。它**不在关键路径上**，所以给得宽松：
-	// 这一档要装下"模型冷启动 + 一次完整嵌入"，宁可慢也不能失败。
-	EmbedWarmTimeout = 30 * time.Second
+	// EmbedOffPathTimeout 是**不在关键路径上**的嵌入调用上限：
+	// 结算之后的索引维护那类（写操作之后的收尾），宁可慢也别失败。
+	EmbedOffPathTimeout = 30 * time.Second
 	// recallQueryMessages 是拼查询用的最近消息条数。
 	// 只用最后一句的话，"嗯""在吗"这种短句会检出噪声；多带几句上下文，话题信号强得多。
 	recallQueryMessages = 4
@@ -127,11 +127,12 @@ func (a *App) recall(personaID, sessionID string, msgs []llm.Message) recallResu
 	defer cancel()
 	vecs, err := a.embedder.Embed(ctx, []string{query})
 	if err != nil {
+		// 这一轮不等：嵌入在关键路径上（拼上下文之前），等下去就是把等待加在用户按回车之后。
+		//
+		// 进程内实现没有"冷启动"，所以这里不再是"模型被卸载了、下次预热就好"那种可自愈的失败
+		// ——真出错是模型或 dll 的问题，下一次调用照样会失败。启动自检（Verify）会先把它拦下来，
+		// 也就是说走到这里通常只剩瞬时故障（内存不足之类）。
 		log.Printf("[recall] 查询嵌入失败，本轮不回忆: %v", err)
-		// 失败最可能的原因是"Ollama 空闲把模型卸了"（默认 5 分钟），下一次嵌入要先加载它。
-		// 这一轮不等（等下去就是把 2 秒加在用户按回车之后），改成后台补一次：
-		// 那次不赶时间，把模型加载起来之后，后面几轮就都是几十毫秒。
-		go a.warmEmbedder()
 		return recallResult{}
 	}
 
@@ -236,29 +237,6 @@ func (a *App) recall(personaID, sessionID string, msgs []llm.Message) recallResu
 	// 用户的原话是："按照采取次数累加，llm 认为这个记忆应该采取时才累加。"
 	text, refs := formatRecall(mems, chunks, rules, sessionID)
 	return recallResult{Text: text, Refs: refs, Facts: len(mems), Chunks: len(chunks), Rules: len(rules)}
-}
-
-// warmEmbedder 在后台补一次嵌入，目的只是让 Ollama 把模型重新读进显存。
-//
-// 为什么需要它：Ollama 默认**空闲 5 分钟就卸载模型**（`ollama ps` 的 UNTIL 列能看到），
-// 而下一次嵌入要先把它加载回来（实测冷 2.23s / 热 0.05s）。这 2 秒落在关键路径上
-// 就是把等待加在用户按回车之后，所以 recall 宁可这一轮不回忆，由这里把模型烘热。
-//
-// 抢不到锁就跳过：说明已经有一次预热在跑，重复发只会让 Ollama 排队。
-// 这也让它天然不会堆积——无论失败多少次，同一时刻最多一个预热。
-func (a *App) warmEmbedder() {
-	if a.embedder == nil || !a.warmMu.TryLock() {
-		return
-	}
-	defer a.warmMu.Unlock()
-
-	ctx, cancel := context.WithTimeout(a.ctx, EmbedWarmTimeout)
-	defer cancel()
-	if _, err := a.embedder.Embed(ctx, []string{"预热"}); err != nil {
-		log.Printf("[recall] 后台预热嵌入失败: %v", err)
-		return
-	}
-	log.Printf("[recall] 嵌入模型已预热，后面几轮可以正常回忆")
 }
 
 // recallQuery 把最近几句拼成检索用的查询文本。
