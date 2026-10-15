@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -525,9 +526,148 @@ func runStoreContract(t *testing.T, s memory.Store, chunk testChunk) {
 
 func TestMemoryStoreContract(t *testing.T) {
 	// 内存实现没有外键，片 id 随便给一组 uuid 就行
-	runStoreContract(t, NewMemoryStore(), testChunk{ChunkID: uuid.NewString(), SessionID: uuid.NewString()})
+	chunk := testChunk{ChunkID: uuid.NewString(), SessionID: uuid.NewString()}
+	runStoreContract(t, NewMemoryStore(), chunk)
 	// 规则索引同理：内存实现没有 persona_rules 可挂
-	runRuleIndexContract(t, NewMemoryStore(), testRule{RuleID: uuid.NewString(), PersonaID: testPersonaA})
+	rule := testRule{RuleID: uuid.NewString(), PersonaID: testPersonaA}
+	runRuleIndexContract(t, NewMemoryStore(), rule)
+	// ⚠️ 重建索引放最后：它会把所有行的向量改成同一个方向（见 runReembedContract 的说明）
+	runReembedContract(t, NewMemoryStore(), chunk, rule)
+}
+
+// runReembedContract 是**重建索引**的契约：换了嵌入模型之后，三张表的向量能被重算一遍，
+// 而且**只动向量**。
+//
+// 这条契约值得存在的理由：它是"换模型之后记忆还能用"的唯一保障。做错了不会报错，
+// 只会让召回分数整体漂移——症状是"记忆有时召回有时不召回"，从界面上完全看不出根因。
+//
+// 断言方式：不去读实现内部的向量（PG 那边得写 SQL），而是**换一个检索方向**——
+// 重建前用新方向搜应当几乎不相关，重建后用同一个方向搜应当几乎完全相关。
+// 这是两种实现都有的观察面，也正是这个功能的用途。
+func runReembedContract(t *testing.T, s memory.Store, chunk testChunk, rule testRule) {
+	t.Helper()
+	now := time.Now().UnixMilli()
+
+	// 旧方向 / 新方向：两个正交的单分量方向（见 makeVec 的说明）
+	oldDir, newDir := 30, 31
+	memText := testContentPrefix + "重建索引用的记忆"
+	chunkText := testContentPrefix + "重建索引用的摘要"
+	ruleText := testContentPrefix + "重建索引用的规则"
+
+	if _, err := s.Save(memory.Memory{
+		Content: memText, Kind: memory.KindFact, PersonaID: testPersonaA, CreatedAt: now,
+	}, makeVec(oldDir, 1), 0.99); err != nil {
+		t.Fatalf("准备记忆失败: %v", err)
+	}
+	if err := s.IndexChunk(memory.ChunkIndex{
+		ChunkID: chunk.ChunkID, SessionID: chunk.SessionID, PersonaID: testPersonaA,
+		Summary: chunkText, CreatedAt: now,
+	}, makeVec(oldDir, 1)); err != nil {
+		t.Fatalf("准备片索引失败: %v", err)
+	}
+	if err := s.IndexRule(memory.RuleIndex{
+		RuleID: rule.RuleID, PersonaID: testPersonaA, Content: ruleText, CreatedAt: now,
+	}, makeVec(oldDir, 1)); err != nil {
+		t.Fatalf("准备规则索引失败: %v", err)
+	}
+
+	// 重建前：沿着**新**方向搜，两条线都应当搜不到它（正交 → 余弦 0）
+	if hits, err := s.Search(testPersonaA, makeVec(newDir, 1), 50); err != nil {
+		t.Fatalf("重建前检索记忆失败: %v", err)
+	} else if sc, ok := scoreOf(hits, memText); !ok || sc > 0.5 {
+		t.Fatalf("重建前不该能按新方向搜到它（score=%v 找到=%v）——测试数据没摆对", sc, ok)
+	}
+	if hits, err := s.SearchRules(testPersonaA, makeVec(newDir, 1), 50); err != nil {
+		t.Fatalf("重建前检索规则失败: %v", err)
+	} else if sc, ok := ruleScoreOf(hits, ruleText); !ok || sc > 0.5 {
+		// 注意：检索**不按阈值过滤**（它返回 Top-N 全部候选），所以"找得到"是必然的，
+		// 这里要断言的是**分数低**——写成"找不到"会得到一个永远失败的断言。
+		t.Fatalf("重建前不该能按新方向搜到它（score=%v 找到=%v）——测试数据没摆对", sc, ok)
+	}
+
+	// 重建：所有文本都嵌到新方向，并记下到底嵌了哪些文本
+	var seen []string
+	seenText := func(text string) bool {
+		for _, s := range seen {
+			if s == text {
+				return true
+			}
+		}
+		return false
+	}
+	res, err := s.ReembedAll(func(texts []string) ([][]float32, error) {
+		seen = append(seen, texts...)
+		vecs := make([][]float32, len(texts))
+		for i := range texts {
+			vecs[i] = makeVec(newDir, 1)
+		}
+		return vecs, nil
+	})
+	if err != nil {
+		t.Fatalf("重建失败: %v", err)
+	}
+	if res.Memories == 0 || res.Chunks == 0 || res.Rules == 0 {
+		t.Fatalf("三张表都该有行被重算，实际 %+v", res)
+	}
+
+	// **源文本取对了**：三张表各自被嵌入的那份文本必须都出现过。
+	// 这一条是核心——取错列（比如嵌了 evidence 而不是 content）不会报错，只会让分数整体偏低。
+	for _, want := range []string{memText, chunkText, ruleText} {
+		if !seenText(want) {
+			t.Errorf("重建时没有把 %q 交给嵌入函数（取错列了？）", want)
+		}
+	}
+
+	// 重建后：同一个新方向应当几乎完全相关
+	hit, err := s.Search(testPersonaA, makeVec(newDir, 1), 50)
+	if err != nil {
+		t.Fatalf("重建后检索记忆失败: %v", err)
+	}
+	sc, ok := scoreOf(hit, memText)
+	if !ok {
+		t.Fatal("重建后按新方向搜不到那条记忆——向量没被换掉")
+	}
+	if sc < 0.99 {
+		t.Errorf("重建后相似度应当接近 1，实际 %.3f", sc)
+	}
+	// **只动向量**：其他字段一律保留（重建不是"重新索引一遍"）
+	for _, h := range hit {
+		if h.Memory.Content == memText && h.Memory.CreatedAt != now {
+			t.Errorf("重建不该改 created_at：期望 %d，实际 %d", now, h.Memory.CreatedAt)
+		}
+	}
+	if hits, err := s.SearchRules(testPersonaA, makeVec(newDir, 1), 50); err != nil {
+		t.Fatalf("重建后检索规则失败: %v", err)
+	} else if sc, ok := ruleScoreOf(hits, ruleText); !ok || sc < 0.99 {
+		t.Errorf("重建后规则索引应当能按新方向搜到且接近 1（score=%v 找到=%v）", sc, ok)
+	}
+
+	// 条数对不上必须报错：照收会让两条共用一个向量，而检索只表现为"偶尔串味"
+	if _, err := s.ReembedAll(func(texts []string) ([][]float32, error) {
+		return make([][]float32, len(texts)+1), nil
+	}); err == nil {
+		t.Error("嵌入返回的条数与请求不一致，应当报错")
+	}
+}
+
+// scoreOf 在记忆命中里按内容找一条，返回它的分数。
+func scoreOf(hits []memory.MemoryHit, content string) (float64, bool) {
+	for _, h := range hits {
+		if h.Memory.Content == content {
+			return h.Score, true
+		}
+	}
+	return 0, false
+}
+
+// ruleScoreOf 同上，用于归档规则那条线。
+func ruleScoreOf(hits []memory.RuleHit, content string) (float64, bool) {
+	for _, h := range hits {
+		if h.Rule.Content == content {
+			return h.Score, true
+		}
+	}
+	return 0, false
 }
 
 // testRule 是规则索引测试要用的那一行。
@@ -701,7 +841,58 @@ func TestPgStoreContract(t *testing.T) {
 	chunk := createTestChunk(t, pool, testPersonaA)
 	runStoreContract(t, st, chunk)
 	// rule_index 同理工挂在 persona_rules 上
-	runRuleIndexContract(t, st, createTestRule(t, pool, testPersonaA))
+	rule := createTestRule(t, pool, testPersonaA)
+	runRuleIndexContract(t, st, rule)
+	// ⚠️ 重建索引**必须放最后**：它会把表里**所有**行的向量都改成同一个方向，
+	// 前面那些断言靠向量方向区分数据，跑在它之后就没意义了
+	//
+	// ⚠️⚠️ 而且它作用在**整张表**上——这份库是开发库、里面有真实记忆与片索引。
+	// 所以先备份三张表的向量、跑完原样写回：不备份的话，跑一次测试就把真实数据的
+	// 向量毁掉了，而且**不报错**，只是召回从此不准（正是这个功能要防的那种静默故障）。
+	restore := snapshotEmbeddings(t, pool)
+	defer restore()
+	runReembedContract(t, st, chunk, rule)
+}
+
+// snapshotEmbeddings 备份三张表的向量，返回"原样写回并清理"的函数。
+//
+// 用一张**临时名的普通表**而不是 TEMP 表：store 走的是连接池，TEMP 表只在建它的那条
+// 连接上可见，而写回时会换一条连接——那时它"不存在"，于是备份悄悄失效。
+func snapshotEmbeddings(t *testing.T, pool *pgxpool.Pool) func() {
+	t.Helper()
+	ctx := context.Background()
+	tables := []struct{ name, key string }{
+		{"memories", "id"},
+		{"chunk_index", "chunk_id"},
+		{"rule_index", "rule_id"},
+	}
+	backup := "_reembed_bak_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+
+	if _, err := pool.Exec(ctx, fmt.Sprintf(
+		`CREATE TABLE %s (tbl text, row_key text, emb text)`, backup)); err != nil {
+		t.Fatalf("建向量备份表失败: %v", err)
+	}
+	for _, tb := range tables {
+		if _, err := pool.Exec(ctx, fmt.Sprintf(
+			`INSERT INTO %s SELECT '%s', %s::text, embedding::text FROM %s`,
+			backup, tb.name, tb.key, tb.name)); err != nil {
+			t.Fatalf("备份 %s 的向量失败: %v", tb.name, err)
+		}
+	}
+
+	return func() {
+		for _, tb := range tables {
+			if _, err := pool.Exec(ctx, fmt.Sprintf(
+				`UPDATE %s t SET embedding = b.emb::vector FROM %s b
+				  WHERE b.tbl = '%s' AND t.%s::text = b.row_key`,
+				tb.name, backup, tb.name, tb.key)); err != nil {
+				t.Errorf("写回 %s 的向量失败（库里那些行的向量现在是错的）: %v", tb.name, err)
+			}
+		}
+		if _, err := pool.Exec(ctx, fmt.Sprintf(`DROP TABLE %s`, backup)); err != nil {
+			t.Errorf("清理备份表失败: %v", err)
+		}
+	}
 }
 
 // createTestRule 造一行最小的人格规则：rule_index 的外键要求它真实存在。

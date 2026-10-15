@@ -10,6 +10,7 @@ import {
   PendingDowngrade, ApproveDowngrade, RefuseDowngrade,
   RuleCandidates, PromoteRuleCandidate, DeleteRuleCandidate,
   GetSettings, SetThinkingDisabled, SetSearchDisabled, SetSearchURL, SetSearchExe,
+  ReindexEmbeddings,
   ExportPersonaToFile, ImportPersonaFromFile,
   ContextStat,
 } from '../wailsjs/go/app/App'
@@ -295,6 +296,23 @@ function searchServiceClass() {
 // 它比搜索服务更要紧——不可用时整个界面会被阻断页盖住，所以这里也把原因原样显示出来。
 function embedClass() {
   return settings.value.embed?.ready ? 'statusline--ok' : 'statusline--warn'
+}
+
+// 重建记忆索引：换了嵌入模型之后必须点一次，否则旧向量与新模型不在同一个坐标系，
+// 混着用会让召回**静默**变差（分数整体漂移，界面上看不出来）。
+const reindexing = ref(false)
+
+async function reindexEmbeddings() {
+  if (reindexing.value) return
+  reindexing.value = true
+  try {
+    const r = await ReindexEmbeddings()
+    showToast(`已重建索引：${r.memories} 条事实 · ${r.chunks} 片往事 · ${r.rules} 条规则`)
+  } catch (e) {
+    showToast('重建失败：' + errText(e))
+  } finally {
+    reindexing.value = false
+  }
 }
 
 // 导出选中的那个人格（没选就是当前人格）。
@@ -1556,6 +1574,19 @@ onUnmounted(() => {
               嵌入模型：{{ settings.embed?.ready ? '就绪' : '不可用' }}
               <span v-if="settings.embed?.dim" class="statusline__path">（{{ settings.embed.dim }} 维）</span>
               <span class="statusline__path">— {{ settings.embed?.detail || '—' }}</span>
+            </p>
+            <div class="ops">
+              <button
+                class="btn btn--ghost"
+                :disabled="reindexing || !settings.embed?.ready"
+                @click="reindexEmbeddings"
+              >
+                {{ reindexing ? '重建中…' : '重建记忆索引' }}
+              </button>
+            </div>
+            <p class="pane__note">
+              换了嵌入模型之后点一次：旧向量与新模型不在同一个坐标系，混着用会让召回静默变差
+              （分数整体漂移，界面上看不出来）。只重算向量，记忆内容与时间都不动。
             </p>
 
             <div class="rules__head"><span>人格导入导出</span></div>

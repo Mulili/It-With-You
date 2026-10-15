@@ -9,6 +9,7 @@ import (
 
 	"agent-for-you-love/internal/history"
 	"agent-for-you-love/internal/llm"
+	"agent-for-you-love/internal/memory"
 	"agent-for-you-love/internal/ui"
 	"agent-for-you-love/internal/web"
 )
@@ -210,6 +211,53 @@ func (a *App) ensureSearchServiceAfterSettingChange() {
 	if err := a.ensureSearchService(ctx); err != nil {
 		log.Printf("[app] 改了联网设置，但搜索服务仍不可用：%v", err)
 	}
+}
+
+// ---------- 记忆索引重建 ----------
+
+// ReindexTimeout 是一次重建索引的上限。
+//
+// 它由界面上的按钮 await，所以不能给无限长；但库大时确实要跑一会儿
+//（现在几十条是秒级，几千条也就几分钟）。给 3 分钟：正常的库够用，
+// 真超了说明出了问题，不该让按钮一直转下去。
+const ReindexTimeout = 3 * time.Minute
+
+// ReindexEmbeddings 把三张表的向量按**当前**嵌入后端重算一遍。
+//
+// 什么时候需要（用户要求过"不允许出现聊完了没记忆"，而这条正会让它**静默**变差）：
+// 换了嵌入模型或实现之后。同一段文本在新旧模型下算出的向量不在同一个坐标系，
+// 混在一张表里检索会让分数整体漂移——症状只是"记忆有时召回有时不召回"，
+// 从界面上完全看不出根因。
+//
+// 为什么做成**手动入口**而不是启动时自动检测：自动检测得先存一份"模型指纹"再比对，
+// 而维度、文件名这些都不足以区分（本项目换的这次，维度就是一样的 1024）。
+// 多存一份状态就多一处会走样的地方；而界面上的状态行已经把当前模型显示出来了，
+// 配合这个按钮，用户能看出该不该点。
+//
+// 只重算向量：记忆内容、创建时间、已提过几次，一律不动（见 memory.Store.ReembedAll）。
+func (a *App) ReindexEmbeddings() (memory.ReembedResult, error) {
+	if a.memories == nil {
+		return memory.ReembedResult{}, fmt.Errorf("记忆存储未就绪")
+	}
+	if a.embedder == nil {
+		return memory.ReembedResult{}, fmt.Errorf("嵌入后端未就绪，无法重建索引")
+	}
+	base := a.ctx
+	if base == nil {
+		base = context.Background() // 测试里 ctx 可能没注入
+	}
+	ctx, cancel := context.WithTimeout(base, ReindexTimeout)
+	defer cancel()
+
+	res, err := a.memories.ReembedAll(func(texts []string) ([][]float32, error) {
+		return a.embedder.Embed(ctx, texts)
+	})
+	if err != nil {
+		return res, fmt.Errorf("重建索引失败: %w", err)
+	}
+	log.Printf("[embed] 已重建记忆索引：%d 条事实 + %d 片往事 + %d 条归档规则",
+		res.Memories, res.Chunks, res.Rules)
+	return res, nil
 }
 
 // ---------- 历史与记忆（第 5 步的界面数据）----------

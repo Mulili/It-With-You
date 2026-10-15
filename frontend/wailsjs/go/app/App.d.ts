@@ -3,6 +3,7 @@
 import {ui} from '../models';
 import {persona} from '../models';
 import {app} from '../models';
+import {memory} from '../models';
 
 export function ApproveDowngrade(arg1:string):Promise<void>;
 
@@ -51,6 +52,8 @@ export function PromoteRuleCandidate(arg1:persona.Candidate):Promise<void>;
 export function Quit():Promise<void>;
 
 export function RefuseDowngrade(arg1:string):Promise<void>;
+
+export function ReindexEmbeddings():Promise<memory.ReembedResult>;
 
 export function RenamePersona(arg1:string,arg2:string):Promise<void>;
 

@@ -66,6 +66,27 @@ export namespace llm {
 
 }
 
+export namespace memory {
+	
+	export class ReembedResult {
+	    Memories: number;
+	    Chunks: number;
+	    Rules: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new ReembedResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.Memories = source["Memories"];
+	        this.Chunks = source["Chunks"];
+	        this.Rules = source["Rules"];
+	    }
+	}
+
+}
+
 export namespace persona {
 	
 	export class Candidate {

@@ -98,6 +98,10 @@ export function RefuseDowngrade(arg1) {
   return window['go']['app']['App']['RefuseDowngrade'](arg1);
 }
 
+export function ReindexEmbeddings() {
+  return window['go']['app']['App']['ReindexEmbeddings']();
+}
+
 export function RenamePersona(arg1, arg2) {
   return window['go']['app']['App']['RenamePersona'](arg1, arg2);
 }

@@ -262,7 +262,32 @@ type Store interface {
 	//
 	// 公共记忆（PersonaID 为空）保留：人格没了，但"用户养了猫"这类事实不该跟着消失。
 	DeletePersona(personaID string) error
+
+	// ReembedAll 把三张表里所有向量的**源文本**重新嵌入一遍。
+	//
+	// 什么时候需要：**换了嵌入模型或实现之后**。同一段文本在新旧模型下算出的向量
+	// 不在同一个坐标系，混在一张表里检索会让分数整体漂移——而症状只是"记忆有时召回
+	// 有时不召回"，从界面上完全看不出根因（用户明确要求过"不允许出现聊完了没记忆"，
+	// 这条正会让它**静默**变差，所以必须有一个明确的重建入口）。
+	//
+	// 三张表都存着自己被嵌入的那份文本（memories.content / chunk_index.summary /
+	// rule_index.content），所以重建不需要原文。⚠️ 它**只动向量那一列**：
+	// created_at、recalled 状态、来源版本一律保留——这是"换个坐标系"，不是"重新索引一遍"。
+	//
+	// embed 由实现按批调用，返回的条数必须与入参一一对应；对不上就报错而不是照收
+	//（对不上就是静默丢文本，与 validateVectors 同一条理由）。
+	ReembedAll(embed func(texts []string) ([][]float32, error)) (ReembedResult, error)
 }
+
+// ReembedResult 是一次重建的结果：各表重算了多少行。
+type ReembedResult struct {
+	Memories int
+	Chunks   int
+	Rules    int
+}
+
+// Total 返回一共重算了多少行。
+func (r ReembedResult) Total() int { return r.Memories + r.Chunks + r.Rules }
 
 // NormalizeMemory 补全一条记忆的缺省值：创建时间、更新时间、重要性。
 //
