@@ -13,6 +13,8 @@ export function Ask(arg1:string):Promise<string>;
 
 export function Cancel():Promise<void>;
 
+export function ChooseEmbedModelDir():Promise<string>;
+
 export function ContextStat():Promise<ui.ContextStat>;
 
 export function CreatePersona(arg1:string,arg2:string):Promise<string>;
@@ -70,6 +72,8 @@ export function Say(arg1:string):Promise<void>;
 export function SessionMessages(arg1:string):Promise<Array<ui.HistoryItem>>;
 
 export function SetActivePersona(arg1:string):Promise<void>;
+
+export function SetEmbedModelDir(arg1:string):Promise<void>;
 
 export function SetMenuOpen(arg1:boolean):Promise<void>;
 

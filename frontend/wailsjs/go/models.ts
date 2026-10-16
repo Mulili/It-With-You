@@ -7,6 +7,7 @@ export namespace app {
 	    searchExe: string;
 	    searchService: web.State;
 	    embed: llm.EmbedStatus;
+	    embedModelDir: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new AppSettings(source);
@@ -20,6 +21,7 @@ export namespace app {
 	        this.searchExe = source["searchExe"];
 	        this.searchService = this.convertValues(source["searchService"], web.State);
 	        this.embed = this.convertValues(source["embed"], llm.EmbedStatus);
+	        this.embedModelDir = source["embedModelDir"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

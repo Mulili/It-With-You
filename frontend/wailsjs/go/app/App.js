@@ -18,6 +18,10 @@ export function Cancel() {
   return window['go']['app']['App']['Cancel']();
 }
 
+export function ChooseEmbedModelDir() {
+  return window['go']['app']['App']['ChooseEmbedModelDir']();
+}
+
 export function ContextStat() {
   return window['go']['app']['App']['ContextStat']();
 }
@@ -132,6 +136,10 @@ export function SessionMessages(arg1) {
 
 export function SetActivePersona(arg1) {
   return window['go']['app']['App']['SetActivePersona'](arg1);
+}
+
+export function SetEmbedModelDir(arg1) {
+  return window['go']['app']['App']['SetEmbedModelDir'](arg1);
 }
 
 export function SetMenuOpen(arg1) {

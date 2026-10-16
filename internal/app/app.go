@@ -121,6 +121,13 @@ type App struct {
 	searchURL string
 	// searchExe 是用户填的搜索服务程序路径（**原值**，可能为空 = 按默认位置找）。
 	searchExe string
+	// embedModelDir 是用户选的嵌入模型目录（**原值**，可能为空 = 按默认位置找）。
+	//
+	// ⚠️ 它**只在下次启动时生效**：嵌入器由 main 在组装之前建好（要真加载几百 MB 并自检，
+	// 不能等界面起来再做），所以这里的改动只影响下一次启动。见 SetEmbedModelDir。
+	//
+	// 只在 ONNX 后端下有意义（HTTP 后端由端点那头决定模型）。
+	embedModelDir string
 	// searchService 托管本机搜索服务这个**外部程序**的生死（探活 / 拉起 / 关闭）。
 	//
 	// 它不是依赖注入，而是"让 searchURL 那个地址真的有人在那儿"的那一半。
@@ -195,6 +202,12 @@ func NewApp(provider llm.Provider, personas persona.Store, hist history.Store,
 			log.Printf("[app] 读取搜索服务程序路径失败，按默认位置查找: %v", err)
 		} else {
 			a.searchExe = exe
+		}
+		if dir, err := personas.EmbedModelDir(); err != nil {
+			// 只是"读不到设置"，按默认位置找即可；真正的定位失败由 main 的自检报出来。
+			log.Printf("[app] 读取嵌入模型目录失败，按默认位置查找: %v", err)
+		} else {
+			a.embedModelDir = dir
 		}
 	}
 	// 搜索服务这一对：Service 管"地址那头有没有人"，Searcher 是往那个地址发请求的客户端。

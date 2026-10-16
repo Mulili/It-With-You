@@ -320,3 +320,158 @@ func TestONNXEmbedderHonoursCanceledContext(t *testing.T) {
 		t.Fatal("ctx 已取消，居然还跑了推理")
 	}
 }
+
+// ---------- 自定义模型目录的定位与校验 ----------
+
+// writeTempFile 在测试目录里造一个占位文件（内容无关，只求"存在"）。
+func writeTempFile(t *testing.T, dir, name string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+		t.Fatalf("造 %s 失败: %v", name, err)
+	}
+}
+
+// findModelFile 是"用户给了模型目录"这条路上最容易出错的一环：
+// 挑错文件不会报错，只会让召回莫名其妙不准。所以把每个分支都钉住。
+func TestFindModelFile(t *testing.T) {
+	cases := []struct {
+		name     string
+		files    []string
+		want     string // 期望挑中的文件名；空串 = 应当失败
+		wantSkip bool   // 期望给出 skip 原因
+	}{
+		{"空目录", nil, "", true},
+		{"只有分词器", []string{onnxTokenizerFileName}, "", true},
+		{"优先量化版", []string{onnxModelFileName, onnxModelFileNameAlt}, onnxModelFileName, false},
+		{"退到 model.onnx", []string{onnxModelFileNameAlt}, onnxModelFileNameAlt, false},
+		{"唯一候选可以用任意名字", []string{"my-bge-m3.onnx"}, "my-bge-m3.onnx", false},
+		{"多个候选且没有已知名 → 不猜", []string{"a.onnx", "b.onnx"}, "", true},
+		{"多个候选但有已知名 → 用已知名", []string{"a.onnx", "b.onnx", onnxModelFileName}, onnxModelFileName, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range c.files {
+				writeTempFile(t, dir, f)
+			}
+			got, skip := findModelFile(dir)
+			if c.wantSkip && skip == "" {
+				t.Fatalf("应当给出 skip 原因，实际挑中了 %q", got)
+			}
+			if !c.wantSkip && skip != "" {
+				t.Fatalf("不应当失败，实际 skip=%q", skip)
+			}
+			if c.want != "" && filepath.Base(got) != c.want {
+				t.Errorf("应当挑中 %s，实际 %s", c.want, got)
+			}
+		})
+	}
+}
+
+// locateInDir 必须**只认那一个目录**：LocateONNXFiles 会在多个候选之间回退，
+// 而校验用户选的目录时若也回退，就会拿随包那份模型验过、然后告诉他"没问题"。
+func TestLocateInDirDoesNotFallBack(t *testing.T) {
+	dir := t.TempDir()
+	writeTempFile(t, dir, onnxTokenizerFileName) // 只有分词器，没有模型
+
+	if _, skip := locateInDir(dir, ""); skip == "" {
+		t.Fatal("这个目录缺模型，必须报 skip，而不是去别的目录找一份凑上")
+	}
+}
+
+// 备齐"模型 + 分词器"但目录里没有动态库时，原因必须指明是缺 dll——
+// 否则用户看到的是"这个目录不合格"，会去翻模型文件，而真正缺的是另一个东西。
+func TestLocateInDirReportsMissingRuntime(t *testing.T) {
+	dir := t.TempDir()
+	writeTempFile(t, dir, onnxModelFileName)
+	writeTempFile(t, dir, onnxTokenizerFileName)
+
+	// 显式给一个不存在的动态库路径，把"退到 exe 同目录"那条路也堵死，
+	// 这样结果与"机器上确实没有 dll"一致。
+	_, skip := locateInDir(dir, filepath.Join(dir, "no-such-runtime"))
+	if !strings.Contains(skip, onnxRuntimeFileName()) {
+		t.Fatalf("原因里该提到 %s，实际是 %q", onnxRuntimeFileName(), skip)
+	}
+}
+
+// 产品代码在启动时走的是 LocateONNXFilesForApp：设置里的目录 > 环境变量 > 默认位置。
+// 这条优先级是**用户看得见的行为**（他点过按钮就该生效），所以逐条钉住。
+func TestLocateONNXFilesForApp(t *testing.T) {
+	// 造一个"看起来齐了"的目录。这一层只负责定位、不负责加载，所以占位文件够用。
+	makeDir := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		writeTempFile(t, dir, onnxModelFileName)
+		writeTempFile(t, dir, onnxTokenizerFileName)
+		writeTempFile(t, dir, onnxRuntimeFileName())
+		return dir
+	}
+
+	t.Run("设置里的目录生效", func(t *testing.T) {
+		dir := makeDir(t)
+		t.Setenv(envEmbedRuntime, "")
+		t.Setenv(envEmbedModelDir, "")
+
+		files, err := LocateONNXFilesForApp(dir)
+		if err != nil {
+			t.Fatalf("应当找到: %v", err)
+		}
+		if want := filepath.Join(dir, onnxModelFileName); files.Model != want {
+			t.Errorf("应当用 %s，实际 %s", want, files.Model)
+		}
+	})
+
+	t.Run("没设置时环境变量兜底", func(t *testing.T) {
+		dir := makeDir(t)
+		t.Setenv(envEmbedRuntime, "")
+		t.Setenv(envEmbedModelDir, dir)
+
+		files, err := LocateONNXFilesForApp("")
+		if err != nil {
+			t.Fatalf("应当找到: %v", err)
+		}
+		if want := filepath.Join(dir, onnxModelFileName); files.Model != want {
+			t.Errorf("应当用 %s，实际 %s", want, files.Model)
+		}
+	})
+
+	// 这一条是本项目**与 config.Get 反向**的那处约定：设置在界面上是"用户点出来的"，
+	// 压过部署用的环境变量，否则"点了按钮却没生效"没法解释。
+	t.Run("设置压过环境变量", func(t *testing.T) {
+		fromSetting, fromEnv := makeDir(t), makeDir(t)
+		t.Setenv(envEmbedRuntime, "")
+		t.Setenv(envEmbedModelDir, fromEnv)
+
+		files, err := LocateONNXFilesForApp(fromSetting)
+		if err != nil {
+			t.Fatalf("应当找到: %v", err)
+		}
+		if want := filepath.Join(fromSetting, onnxModelFileName); files.Model != want {
+			t.Errorf("设置里的目录该赢，期望 %s，实际 %s", want, files.Model)
+		}
+	})
+}
+
+// ProbeONNXModel 的职责是"保存前先真装一次"，所以它必须：
+//  1. 目录不合格时**报错**（而不是回退到随包模型）；
+//  2. 合格时真加载并给出用的是哪个文件。
+func TestProbeONNXModel(t *testing.T) {
+	t.Run("目录不合格就报错", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, err := ProbeONNXModel(context.Background(), dir); err == nil {
+			t.Fatal("空目录应当报错")
+		}
+	})
+
+	t.Run("指向真模型时能装起来", func(t *testing.T) {
+		// 用产品代码的定位逻辑拿到三件套所在目录；拿不到就跳过（与其它用例同姿态）。
+		cfg := testEmbedConfig(t)
+		files, err := ProbeONNXModel(context.Background(), filepath.Dir(cfg.ModelPath))
+		if err != nil {
+			t.Fatalf("校验真模型失败: %v", err)
+		}
+		if filepath.Base(files.Model) != filepath.Base(cfg.ModelPath) {
+			t.Errorf("应当用 %s，实际用了 %s", cfg.ModelPath, files.Model)
+		}
+	})
+}

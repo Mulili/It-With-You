@@ -126,13 +126,47 @@ func ONNXRuntimeVersion() string {
 
 // 模型与动态库的文件名 / 目录名。模型目录名跟的是上游仓库名：
 // 将来换模型时，改这里一处即可（候选目录是 models/<这个名字>）。
+//
+// ⚠️ 模型文件名**只是"优先试的名字"，不是硬要求**：用户可以在设置里换成自己的
+// 模型目录，而别人的导出叫什么名字不由我们决定。所以真正选文件的是 findModelFile
+// （先试这两个众所周知的名字，再退到目录里唯一的那个 .onnx）。
+// 分词器名则写死：`tokenizer.json` 是 HuggingFace 的固定约定，换名字反而是异常。
 const (
-	onnxModelFileName     = "model_quantized.onnx"
+	onnxModelFileName     = "model_quantized.onnx" // 本项目默认模型（int8 量化）
+	onnxModelFileNameAlt  = "model.onnx"           // 最常见的导出名
 	onnxTokenizerFileName = "tokenizer.json"
 	modelsDirName         = "models"
 	modelDirName          = "bge-m3-onnx-int8"
 	appCacheDirName       = "It-With-You"
 )
+
+// findModelFile 在一个目录里挑出要用哪个 .onnx。
+//
+// 返回的 skip 非空表示"这个目录不合格"，内容是**原因**（会进最终的错误信息，
+// 让用户知道该改动什么：是补文件，还是把多余的 .onnx 收走）。
+//
+// 为什么多个候选时**不猜**：猜错的表现是"记忆召回莫名其妙不准"，而那时没人会想到
+// 是这里挑错了文件。把候选列出来、让用户自己决定，是唯一能一眼看懂的做法。
+func findModelFile(dir string) (path, skip string) {
+	for _, name := range []string{onnxModelFileName, onnxModelFileNameAlt} {
+		if p := filepath.Join(dir, name); fileExists(p) {
+			return p, ""
+		}
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, "*.onnx"))
+	if err != nil || len(matches) == 0 {
+		return "", "没有 .onnx 模型文件"
+	}
+	if len(matches) == 1 {
+		return matches[0], ""
+	}
+	names := make([]string, 0, len(matches))
+	for _, m := range matches {
+		names = append(names, filepath.Base(m))
+	}
+	sort.Strings(names)
+	return "", fmt.Sprintf("有 %d 个 .onnx（%s），无法确定用哪个", len(matches), strings.Join(names, "、"))
+}
 
 // onnxRuntimeFileName 返回动态库在本平台的名字。
 func onnxRuntimeFileName() string {
@@ -155,20 +189,17 @@ type ONNXFiles struct {
 
 // LocateONNXFiles 按优先级找齐三件套：
 //
-//  1. 显式给的覆盖路径（环境变量，用户明确指定，最优先）
+//  1. 显式给的覆盖目录（设置里选的，或环境变量指定，最优先）
 //  2. 应用可执行文件**同目录**的 models/<模型目录名>/ ——**随包分发就放这儿**
 //  3. 用户缓存目录（Windows 上是 %LOCALAPPDATA%\It-With-You\models\...）
 //
-// 返回的错误会把**试过的每一个位置**都列出来：这个错最终是给用户看的，
-// 而"找不到模型"这四个字帮不上任何忙。
+// 返回的错误会把**试过的每一个位置**都列出来，每个还带上"为什么不行"：这个错最终是给
+// 用户看的，而"找不到模型"这四个字帮不上任何忙——他需要知道是补文件还是收走多余的文件。
 //
 // ⚠️ 找不到**不返回 nil 让上层降级**：模型不在就是嵌入不在，而嵌入不在等于记忆失效。
 // 用户明确要求过不允许出现那个状态，所以上层拿这个错误去**拦住启动**。
 func LocateONNXFiles(dirOverride, runtimeOverride string) (ONNXFiles, error) {
-	exeDir := ""
-	if exe, err := os.Executable(); err == nil {
-		exeDir = filepath.Dir(exe)
-	}
+	exeDir := exeDirOrEmpty()
 
 	var dirs []string
 	if d := strings.TrimSpace(dirOverride); d != "" {
@@ -183,38 +214,62 @@ func LocateONNXFiles(dirOverride, runtimeOverride string) (ONNXFiles, error) {
 
 	tried := make([]string, 0, len(dirs))
 	for _, dir := range dirs {
-		model := filepath.Join(dir, onnxModelFileName)
-		tok := filepath.Join(dir, onnxTokenizerFileName)
-		if !fileExists(model) || !fileExists(tok) {
-			tried = append(tried, dir)
+		files, skip := locateInDir(dir, runtimeOverride)
+		if skip != "" {
+			tried = append(tried, dir+"（"+skip+"）")
 			continue
 		}
-		// 动态库的三个候选：显式覆盖 → 模型同目录 → exe 同目录。
-		// 放"模型同目录"是为了让"整个 models/<名字>/ 一起拷过去"这种做法也能用。
-		runtimePath := ""
-		for _, c := range []string{
-			strings.TrimSpace(runtimeOverride),
-			filepath.Join(dir, onnxRuntimeFileName()),
-			filepath.Join(exeDir, onnxRuntimeFileName()),
-		} {
-			if c != "" && fileExists(c) {
-				runtimePath = c
-				break
-			}
-		}
-		if runtimePath == "" {
-			return ONNXFiles{}, fmt.Errorf("找到了模型（%s），但没找到 %s。把它放到 exe 同目录，或用 %s 指定完整路径",
-				model, onnxRuntimeFileName(), envEmbedRuntime)
-		}
-		return ONNXFiles{Runtime: runtimePath, Model: model, Tokenizer: tok}, nil
+		return files, nil
 	}
 
 	if len(tried) == 0 {
-		return ONNXFiles{}, fmt.Errorf("找不到嵌入模型：没有可试的位置（拿不到 exe 所在目录与用户缓存目录）。可用 %s 指定",
+		return ONNXFiles{}, fmt.Errorf("找不到嵌入模型：没有可试的位置（拿不到 exe 所在目录与用户缓存目录）。可在设置里指定模型目录，或用 %s",
 			envEmbedModelDir)
 	}
-	return ONNXFiles{}, fmt.Errorf("找不到嵌入模型（需要 %s 与 %s 两个文件）。试过：%s。可用 %s 指定模型目录",
-		onnxModelFileName, onnxTokenizerFileName, strings.Join(tried, "；"), envEmbedModelDir)
+	return ONNXFiles{}, fmt.Errorf("找不到嵌入模型。试过：%s。可在设置里指定模型目录（目录里要有 .onnx 与 %s），或用 %s",
+		strings.Join(tried, "；"), onnxTokenizerFileName, envEmbedModelDir)
+}
+
+// locateInDir **只在一个目录里**找模型与分词器（动态库允许退到 exe 同目录）。
+//
+// 抽出来是为了让"校验用户选的目录"能够只认那一个目录：LocateONNXFiles 会在多个候选
+// 之间回退，而校验时**绝不能回退**——否则用户指了一个坏目录，我们却拿随包那份模型
+// 验过了，然后告诉他"没问题"，下一条生效的却是错的模型。
+//
+// 返回的 skip 非空表示"这个目录不合格"，内容是原因。
+func locateInDir(dir, runtimeOverride string) (files ONNXFiles, skip string) {
+	model, skip := findModelFile(dir)
+	if skip != "" {
+		return ONNXFiles{}, skip
+	}
+	tok := filepath.Join(dir, onnxTokenizerFileName)
+	if !fileExists(tok) {
+		return ONNXFiles{}, "缺少 " + onnxTokenizerFileName
+	}
+
+	// 动态库的三个候选：显式覆盖 → 模型同目录 → exe 同目录。
+	// 放"模型同目录"是为了让"整个 models/<名字>/ 一起拷过去"这种做法也能用。
+	exeDir := exeDirOrEmpty()
+	for _, c := range []string{
+		strings.TrimSpace(runtimeOverride),
+		filepath.Join(dir, onnxRuntimeFileName()),
+		filepath.Join(exeDir, onnxRuntimeFileName()),
+	} {
+		if c != "" && fileExists(c) {
+			return ONNXFiles{Runtime: c, Model: model, Tokenizer: tok}, ""
+		}
+	}
+	// 模型找齐了、只差动态库：这一条**不能只算"这个目录不合格"**——用户看到
+	// "试过：…（缺少 onnxruntime.dll）"才知道该补的是 dll 而不是模型。
+	return ONNXFiles{}, "找到了模型，但缺少 " + onnxRuntimeFileName() + "（放到 exe 同目录，或用 " + envEmbedRuntime + " 指定）"
+}
+
+// exeDirOrEmpty 返回可执行文件所在目录；拿不到时返回空串（不猜、不报错）。
+func exeDirOrEmpty() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Dir(exe)
+	}
+	return ""
 }
 
 // fileExists 只关心"是不是一个存在的文件"，不关心权限之类的差别。
@@ -226,12 +281,52 @@ func fileExists(path string) bool {
 	return err == nil && !st.IsDir()
 }
 
-// LocateONNXFilesFromEnv 用两条环境变量当覆盖，其余按默认位置找。
+// LocateONNXFilesForApp 在 LocateONNXFiles 之上叠一层「**用户设置**里的目录」。
 //
-// 单独提供这一层，是为了让调用方（main 与测试）不必知道那两个变量名——
-// 名字属于这个包，改起来只改一处。
-func LocateONNXFilesFromEnv() (ONNXFiles, error) {
-	return LocateONNXFiles(os.Getenv(envEmbedModelDir), os.Getenv(envEmbedRuntime))
+// 优先级：设置里的目录 > 环境变量 COMPANION_EMBED_MODEL_DIR > 默认位置。
+//
+// 为什么设置优先于环境变量（与 config.Get 的"环境变量 > .env"相反）：这一项是
+// **用户在界面上点出来的**，而"点了按钮却没生效"是最难解释的一种失败；环境变量在这个
+// 项目里是部署与排查用的旁路，正常情况下它是空的。无论走了哪一条，设置页都会把
+// **实际生效**的模型路径打出来，所以不存在"悄悄用了别的模型"。
+//
+// 单独提供这一层，是为了让调用方（main）不必知道那两个变量名——名字属于这个包。
+func LocateONNXFilesForApp(userDir string) (ONNXFiles, error) {
+	dir := strings.TrimSpace(userDir)
+	if dir == "" {
+		dir = os.Getenv(envEmbedModelDir)
+	}
+	return LocateONNXFiles(dir, os.Getenv(envEmbedRuntime))
+}
+
+// ProbeONNXModel 用**指定的目录**试装一次嵌入器：定位三件套 → 加载模型 → 跑一次嵌入。
+//
+// 用途只有一个：用户选了自定义模型目录之后，**在保存之前**先确认它真能用。
+// 不校验的后果很具体：一个 768 维的模型会被安静地存下来，直到用户下次写记忆才发现
+// 写不进库（报错还来自 pgvector），而那时他早已忘了自己换过模型。
+//
+// ⚠️ 它**只认这一个目录**，不会回退到随包那份模型（见 locateInDir 的说明）。
+// ⚠️ 它**不碰正在跑的那个嵌入器**：临时实例用完就关。ONNX Runtime 的环境是进程级的，
+// 留着即可（见 Close 为什么不销毁环境）。
+// ⚠️ 它**不写任何配置**：存不存由调用方决定。
+func ProbeONNXModel(ctx context.Context, dir string) (ONNXFiles, error) {
+	files, skip := locateInDir(strings.TrimSpace(dir), os.Getenv(envEmbedRuntime))
+	if skip != "" {
+		return ONNXFiles{}, fmt.Errorf("%s（%s）", dir, skip)
+	}
+	e, err := NewONNXEmbedder(ONNXEmbedConfig{
+		RuntimePath:   files.Runtime,
+		ModelPath:     files.Model,
+		TokenizerPath: files.Tokenizer,
+	})
+	if err != nil {
+		return ONNXFiles{}, err
+	}
+	defer e.Close()
+	if err := e.Verify(ctx); err != nil {
+		return ONNXFiles{}, err
+	}
+	return files, nil
 }
 
 // ---------- 构造 ----------
@@ -325,8 +420,10 @@ func (e *ONNXEmbedder) Verify(ctx context.Context) error {
 		return err
 	}
 	if len(v) != 1 || len(v[0]) != e.dim {
-		return fmt.Errorf("自检失败：期望 1 条 %d 维向量，实际得到 %d 条、每条 %d 维",
-			e.dim, len(v), len(v[0]))
+		return fmt.Errorf("自检失败：期望 1 条 %d 维向量，实际得到 %d 条、每条 %d 维。"+
+			"本应用的记忆库固定为 vector(%d)，换模型**必须用 %d 维输出**的 embedding 模型"+
+			"（维度不符时向量写不进库，而报错来自数据库，看起来与嵌入毫无关系）",
+			e.dim, len(v), len(v[0]), e.dim, e.dim)
 	}
 	return nil
 }

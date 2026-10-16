@@ -80,6 +80,21 @@ type Store interface {
 	// SetSearchExe 保存搜索服务程序路径（空串 = 回到默认查找）。
 	SetSearchExe(path string) error
 
+	// EmbedModelDir 是用户指定的**嵌入模型目录**；空串表示**用户没指定**，
+	// 由 App 按默认位置找（exe 同目录 → 用户缓存目录，见 llm.LocateONNXFilesForApp）。
+	//
+	// 为什么要能指定：默认位置是"随包分发的那份模型"；想换模型（换精度、换语言、
+	// 换体积）的人只能把文件放到别处，而"程序该去哪找"只有他知道。
+	//
+	// ⚠️ 目录里的模型**必须输出 1024 维**：记忆库的向量列固定是 vector(1024)，
+	// 维度不符时向量写不进库。这条在保存前由 llm.ProbeONNXModel 真加载校验。
+	EmbedModelDir() (string, error)
+	// SetEmbedModelDir 保存嵌入模型目录（空串 = 回到默认位置）。
+	//
+	// ⚠️ 它**只负责存**，不做任何校验：校验要加载模型（几百 MB、秒级），属于调用方
+	//（App 在保存前先 Probe 一次）——存储层不该知道 ONNX 这回事。
+	SetEmbedModelDir(dir string) error
+
 	CreatePersona(name, copyFromID string) (string, error)
 	RenamePersona(id, name string) error
 	DeletePersona(id string) error

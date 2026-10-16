@@ -49,6 +49,9 @@ type MemoryStore struct {
 	searchURL string
 	// searchExe 是搜索服务程序的位置；空串表示按默认位置找（见 App.searchExePath）。
 	searchExe string
+	// embedModelDir 是用户指定的嵌入模型目录；空串表示按默认位置找
+	//（见 llm.LocateONNXFilesForApp）。
+	embedModelDir string
 
 	// storageReady 表示"持久化存储是否可用"。内存实现自己恒为可用，
 	// 但它被当作 PG 连不上时的降级路径时，前端要据此提示"数据库未连接"。
@@ -251,6 +254,21 @@ func (s *MemoryStore) SetSearchExe(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.searchExe = path
+	return nil
+}
+
+// EmbedModelDir 实现 Store。
+func (s *MemoryStore) EmbedModelDir() (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.embedModelDir, nil
+}
+
+// SetEmbedModelDir 实现 Store。
+func (s *MemoryStore) SetEmbedModelDir(dir string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.embedModelDir = dir
 	return nil
 }
 

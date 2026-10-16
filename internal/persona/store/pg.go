@@ -366,6 +366,37 @@ func (s *PgStore) SetSearchExe(path string) error {
 	return nil
 }
 
+// EmbedModelDir 实现 Store：读 app_settings，没存过则为空串（= 按默认位置找）。
+func (s *PgStore) EmbedModelDir() (string, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	var v string
+	err := s.pool.QueryRow(ctx,
+		`SELECT value FROM app_settings WHERE key = $1`, settingEmbedModelDir).Scan(&v)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("读取嵌入模型目录失败: %w", err)
+	}
+	return v, nil
+}
+
+// SetEmbedModelDir 实现 Store。空串 = 回到默认位置（见 llm.LocateONNXFilesForApp）。
+func (s *PgStore) SetEmbedModelDir(dir string) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO app_settings (key, value) VALUES ($1, $2)
+		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+		settingEmbedModelDir, strings.TrimSpace(dir)); err != nil {
+		return fmt.Errorf("保存嵌入模型目录失败: %w", err)
+	}
+	return nil
+}
+
 // CreatePersona 新建人格（可从内置或已有的人格复制），返回新人格 ID。
 func (s *PgStore) CreatePersona(name, copyFromID string) (string, error) {
 	ctx, cancel := s.ctx()
@@ -920,6 +951,8 @@ const (
 	settingSearchURL = "search_url"
 	// settingSearchExe 是搜索服务程序的位置。没有这个 key 当空串（= 按默认位置找）。
 	settingSearchExe = "search_exe"
+	// settingEmbedModelDir 是嵌入模型所在目录。没有这个 key 当空串（= 按默认位置找）。
+	settingEmbedModelDir = "embed_model_dir"
 )
 
 // app_settings 里布尔值的两种写法。

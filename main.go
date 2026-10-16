@@ -7,6 +7,7 @@ import (
 	historystore "agent-for-you-love/internal/history/store"
 	"agent-for-you-love/internal/llm"
 	memorystore "agent-for-you-love/internal/memory/store"
+	"agent-for-you-love/internal/persona"
 	"agent-for-you-love/internal/persona/builtin"
 	"agent-for-you-love/internal/persona/store"
 	"context"
@@ -59,7 +60,10 @@ func main() {
 	// 嵌入后端（记忆检索用）。默认是**进程内 ONNX**，不再依赖任何常驻服务。
 	// 自检失败**不阻止进程启动**，但会让界面进阻断态——嵌入不可用等于记忆失效，
 	// 而用户明确要求过不允许出现"聊完了没记忆"（见 llm.EmbedStatus 的注释）。
-	embedder, embedStatus := openEmbedder()
+	//
+	// 传 personaStore 进去是因为"用户指定过模型目录"这件事存在设置里，而模型必须在
+	// 组装 App 之前就定下来（自检要真加载几百 MB）。见 openEmbedder。
+	embedder, embedStatus := openEmbedder(personaStore)
 
 	// 变量名刻意避开包名：下面还要用 app.NewApp 这个包限定符，
 	// 叫 app 的话变量会把包名遮蔽掉（编译得过，但之后再也用不了那个包）。
@@ -160,8 +164,10 @@ const embedSelfCheckTimeout = 30 * time.Second
 // 不能等用户聊完一轮才发现（用户的原话是"不希望用户聊完了没记忆"）。
 //
 // 返回的 embedder 在不可用时是 nil，但 **EmbedStatus.Detail 一定说得清原因**：
-// 这个字符串会直接显示在阻断页上，所以"找不到模型"这类错要带上试过的位置。
-func openEmbedder() (llm.Embedder, llm.EmbedStatus) {
+// 这个字符串会直接显示在阻断页上，所以"找不到模型"这类错要带上试过的位置与各自的原因。
+//
+// settings 用来取"用户在设置里选的模型目录"；为 nil（没有数据库）时按默认位置找。
+func openEmbedder(settings persona.Store) (llm.Embedder, llm.EmbedStatus) {
 	ctx, cancel := context.WithTimeout(context.Background(), embedSelfCheckTimeout)
 	defer cancel()
 
@@ -186,7 +192,16 @@ func openEmbedder() (llm.Embedder, llm.EmbedStatus) {
 	}
 
 	// 默认：进程内 ONNX
-	files, err := llm.LocateONNXFilesFromEnv()
+	userDir := ""
+	if settings != nil {
+		if dir, err := settings.EmbedModelDir(); err != nil {
+			// 只是"设置读不到"，按默认位置找即可；真正的定位失败会在下面报出来。
+			log.Printf("[embed] 读取自定义模型目录失败，按默认位置查找: %v", err)
+		} else {
+			userDir = dir
+		}
+	}
+	files, err := llm.LocateONNXFilesForApp(userDir)
 	if err != nil {
 		log.Printf("[embed] %v", err)
 		return nil, llm.EmbedStatus{Backend: backend, Detail: err.Error()}
@@ -208,7 +223,11 @@ func openEmbedder() (llm.Embedder, llm.EmbedStatus) {
 	// 这两行值得打：它们把"到底用的哪个模型文件、哪个版本的 runtime"钉在日志里，
 	// 而"记忆召回不准"排查到最后往往就是这两个东西和预期不一致。
 	log.Printf("[embed] 就绪：进程内 ONNX（onnxruntime %s，%d 维）", llm.ONNXRuntimeVersion(), e.Dim())
-	log.Printf("[embed] 模型 %s", files.Model)
+	if userDir != "" {
+		log.Printf("[embed] 模型 %s（来自设置里指定的目录 %s）", files.Model, userDir)
+	} else {
+		log.Printf("[embed] 模型 %s", files.Model)
+	}
 	return e, llm.EmbedStatus{
 		Backend: backend,
 		Ready:   true,

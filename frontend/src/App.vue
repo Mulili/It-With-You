@@ -10,7 +10,7 @@ import {
   PendingDowngrade, ApproveDowngrade, RefuseDowngrade,
   RuleCandidates, PromoteRuleCandidate, DeleteRuleCandidate,
   GetSettings, SetThinkingDisabled, SetSearchDisabled, SetSearchURL, SetSearchExe,
-  ReindexEmbeddings,
+  ReindexEmbeddings, ChooseEmbedModelDir, SetEmbedModelDir,
   ExportPersonaToFile, ImportPersonaFromFile,
   ContextStat,
 } from '../wailsjs/go/app/App'
@@ -67,6 +67,9 @@ const settings = ref({
   // 嵌入后端的状态（见 Go 侧 llm.EmbedStatus）。
   // ready 为 false 时进阻断态：嵌入不可用等于记忆整体失效，不能让他先聊起来。
   embed: { backend: '', ready: true, dim: 0, detail: '' },
+  // 用户选的嵌入模型目录（原值，空串 = 按默认位置找）。
+  // 它与 embed.detail 不是一回事：detail 里是**正在跑**的那个模型，这里是**下次启动**要用的
+  embedModelDir: '',
 })
 // 导出哪个人格；空串 = 用当前生效的那个
 const exportId = ref('')
@@ -312,6 +315,47 @@ async function reindexEmbeddings() {
     showToast('重建失败：' + errText(e))
   } finally {
     reindexing.value = false
+  }
+}
+
+// 选择自定义嵌入模型目录。
+//
+// 后端在这一个调用里做完"弹目录框 → 真加载一次模型 → 校验维度 → 保存"：
+// 加载几百 MB 要等一两秒，所以按钮期间显示"校验中…"。
+// 校验不过会带具体原因回来（缺文件 / 有多个 .onnx / 不是 1024 维），原样展示给用户。
+//
+// ⚠️ 保存后**不热切换**：嵌入器在启动时构建。所以这里必须把"重启后生效"说出来，
+// 否则用户会以为点了就换好了，然后困惑于"状态行里怎么还是旧模型"。
+const probingModel = ref(false)
+
+async function chooseEmbedModelDir() {
+  if (probingModel.value) return
+  probingModel.value = true
+  try {
+    const dir = await ChooseEmbedModelDir()
+    if (!dir) return // 用户取消
+    await loadSettings()
+    showToast('已保存，重启应用后生效。重启后记得点一次「重建记忆索引」')
+  } catch (e) {
+    showToast(errText(e))
+  } finally {
+    probingModel.value = false
+  }
+}
+
+// 清回默认查找（空串 = 让后端按 exe 同目录 → 用户缓存目录找）。
+// 空串不做校验，所以不会去加载模型，会立刻返回。
+async function resetEmbedModelDir() {
+  if (probingModel.value) return
+  probingModel.value = true
+  try {
+    await SetEmbedModelDir('')
+    await loadSettings()
+    showToast('已恢复默认查找，重启应用后生效')
+  } catch (e) {
+    showToast('恢复默认失败：' + errText(e))
+  } finally {
+    probingModel.value = false
   }
 }
 
@@ -1571,7 +1615,7 @@ onUnmounted(() => {
                  嵌入不可用等于**记忆整体失效**——那时整个界面会被阻断页盖住，
                  所以这里必须把"到底缺什么"原样显示出来。 -->
             <p class="statusline" :class="embedClass()">
-              嵌入模型：{{ settings.embed?.ready ? '就绪' : '不可用' }}
+              嵌入模型（当前生效）：{{ settings.embed?.ready ? '就绪' : '不可用' }}
               <span v-if="settings.embed?.dim" class="statusline__path">（{{ settings.embed.dim }} 维）</span>
               <span class="statusline__path">— {{ settings.embed?.detail || '—' }}</span>
             </p>
@@ -1587,6 +1631,40 @@ onUnmounted(() => {
             <p class="pane__note">
               换了嵌入模型之后点一次：旧向量与新模型不在同一个坐标系，混着用会让召回静默变差
               （分数整体漂移，界面上看不出来）。只重算向量，记忆内容与时间都不动。
+            </p>
+
+            <!-- 换嵌入模型：选目录 + 1024 维提醒。
+                 这句提醒必须显眼：维度与本应用建表的 vector(1024) 绑死了，拿一个 768 维的
+                 模型进来会表现成"记忆写不进去"，而报错来自数据库、看不出跟模型有关 -->
+            <div class="rules__head"><span>换嵌入模型</span></div>
+            <p class="pane__note pane__note--warn">
+              ⚠️ 只能用 <b>1024 维输出</b>的 embedding 模型。记忆库是建在
+              <code>vector(1024)</code> 上的，维度不符的向量写不进库——而那时报错来自数据库，
+              完全看不出跟模型有关。所以选了之后会先真加载一次再保存，维度不对当场拒绝。
+            </p>
+            <p class="pane__note">
+              目录里要有 <code>.onnx</code> 与 <code>tokenizer.json</code>。目录里若有多份
+              <code>.onnx</code>，请自己收成一份再选（我们不猜，猜错的表现是"召回莫名其妙不准"）。
+            </p>
+            <p class="pane__note">
+              当前设置：{{ settings.embedModelDir || '（未设置，按默认位置查找）' }}
+            </p>
+            <div class="ops">
+              <button class="btn btn--ghost" :disabled="probingModel" @click="chooseEmbedModelDir">
+                {{ probingModel ? '校验中…' : '选择模型目录…' }}
+              </button>
+              <button
+                v-if="settings.embedModelDir"
+                class="btn btn--ghost"
+                :disabled="probingModel"
+                @click="resetEmbedModelDir"
+              >
+                恢复默认
+              </button>
+            </div>
+            <p class="pane__note">
+              保存后要<b>重启应用</b>才生效（模型是在启动时加载的）。重启后还要回到上面点一次
+              「重建记忆索引」——否则库里那批旧向量与新模型不在同一个坐标系。
             </p>
 
             <div class="rules__head"><span>人格导入导出</span></div>
@@ -1636,9 +1714,20 @@ onUnmounted(() => {
           她靠嵌入模型把记住的东西变成向量。模型不在，就一条也记不住——所以这里先不让你进去聊。
         </p>
         <p class="blocker__steps">
-          ① 把模型目录整个放到 exe 旁边：<code>models/bge-m3-onnx-int8/</code><br />
+          ① 直接把模型目录整个放到 exe 旁边：<code>models/bge-m3-onnx-int8/</code><br />
           ② 把 <code>onnxruntime.dll</code> 放到 exe 同目录<br />
-          ③ 或用 <code>.env</code> 里的 COMPANION_EMBED_MODEL_DIR / COMPANION_ONNXRUNTIME_DLL 指定位置
+          ③ 或者点下面这个按钮，指到你自己那份模型所在的目录
+        </p>
+        <!-- 就地给一个出口：这个页面存在的意义就是"让你把模型补上"，
+             只写"去设置里改"的话，窗口这么小、菜单还藏在 ☰ 里，等于没说 -->
+        <div class="ops">
+          <button class="btn btn--ghost" :disabled="probingModel" @click="chooseEmbedModelDir">
+            {{ probingModel ? '校验中…' : '选择模型目录…' }}
+          </button>
+        </div>
+        <p class="blocker__steps">
+          ⚠️ 模型必须是 <b>1024 维输出</b>的 embedding 模型（记忆库建在 <code>vector(1024)</code> 上）。
+          选完会先真加载校验一次，通过即保存，<b>重启应用后生效</b>。
         </p>
         <p class="blocker__hint">到底缺什么：{{ settings.embed?.detail || '（后端没给出原因）' }}</p>
       </template>
@@ -2289,6 +2378,16 @@ onUnmounted(() => {
   font-size: 11px;
   line-height: 1.5;
   color: #9a9aa8;
+}
+
+/* 需要用户当心的一条说明（当前只有"换嵌入模型必须 1024 维"用它）。
+   给它底色是因为它的代价不对称：读漏了不是"少个功能"，而是记忆从此写不进去 */
+.pane__note--warn {
+  margin: 0 10px 2px;
+  border-left: 3px solid #e0a028;
+  border-radius: 4px;
+  background: rgba(230, 160, 40, 0.12);
+  color: #8a6320;
 }
 
 /* 搜索服务的那一行状态：运行中=绿，没起来=黄（不是错误，是"还得配一下"）。

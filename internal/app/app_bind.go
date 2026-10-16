@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 	"agent-for-you-love/internal/memory"
 	"agent-for-you-love/internal/ui"
 	"agent-for-you-love/internal/web"
+
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // 这个文件装「给界面的数据绑定」：历史、记忆、应用级设置。
@@ -57,7 +60,13 @@ type AppSettings struct {
 	//
 	// 它比搜索服务更要紧：搜索不可用只是"少一个能力"，嵌入不可用等于**记忆整体失效**，
 	// 而记忆是这款应用的核心。所以它同时驱动**启动拦截**（Ready=false 时前端进阻断态）。
+	//
+	// ⚠️ Detail 里是**实际正在跑**的那个模型（由 main 在启动时定位），不是设置里的值：
+	// 用户刚改了目录但还没重启时，两者不一样，而"现在到底用的哪个"才是他要知道的。
 	Embed llm.EmbedStatus `json:"embed"`
+	// EmbedModelDir 是用户选的嵌入模型目录（**原值**，空串 = 按默认位置找）。
+	// 与 Embed.Detail 的区别见上：这个是"下次启动要用哪个"。
+	EmbedModelDir string `json:"embedModelDir"`
 }
 
 // GetSettings 返回全局设置。
@@ -75,6 +84,7 @@ func (a *App) GetSettings() AppSettings {
 		SearchExe:        a.searchExe,
 		SearchService:    st,
 		Embed:            a.embedStatus,
+		EmbedModelDir:    a.embedModelDir,
 	}
 }
 
@@ -218,7 +228,7 @@ func (a *App) ensureSearchServiceAfterSettingChange() {
 // ReindexTimeout 是一次重建索引的上限。
 //
 // 它由界面上的按钮 await，所以不能给无限长；但库大时确实要跑一会儿
-//（现在几十条是秒级，几千条也就几分钟）。给 3 分钟：正常的库够用，
+// （现在几十条是秒级，几千条也就几分钟）。给 3 分钟：正常的库够用，
 // 真超了说明出了问题，不该让按钮一直转下去。
 const ReindexTimeout = 3 * time.Minute
 
@@ -258,6 +268,92 @@ func (a *App) ReindexEmbeddings() (memory.ReembedResult, error) {
 	log.Printf("[embed] 已重建记忆索引：%d 条事实 + %d 片往事 + %d 条归档规则",
 		res.Memories, res.Chunks, res.Rules)
 	return res, nil
+}
+
+// ---------- 自定义嵌入模型目录 ----------
+
+// probeEmbedTimeout 是一次"试装模型"的上限。
+//
+// 它要加载几百 MB 的模型文件（实测约 2 秒，冷盘更慢）再跑一次前向，所以不能按普通接口
+// 的几秒来给。60 秒是"慢盘也够、卡死也不至于让按钮一直转"的折中。
+const probeEmbedTimeout = 60 * time.Second
+
+// ChooseEmbedModelDir 弹目录选择框，**校验通过后保存**，返回最终保存的目录。
+//
+// 返回空串表示用户取消了（不报错、也不改任何设置）。
+//
+// 为什么把"选 + 校验 + 存"合成一个绑定：这三步是用户眼里的**一个动作**，而中间任何一步
+// 失败都只能用同一条提示说清（"这个目录不能用，因为…"）。拆开只会让前端也去维护
+// "选了但还没校验"这个中间态。
+func (a *App) ChooseEmbedModelDir() (string, error) {
+	if a.ctx == nil {
+		return "", fmt.Errorf("应用尚未准备就绪")
+	}
+	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "选择嵌入模型目录（里面要有 .onnx 与 tokenizer.json）",
+	})
+	if err != nil {
+		return "", fmt.Errorf("打开目录对话框失败: %w", err)
+	}
+	if dir == "" {
+		return "", nil // 用户取消
+	}
+	if err := a.SetEmbedModelDir(dir); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// SetEmbedModelDir 校验并保存嵌入模型目录（空串 = 回到默认位置）。
+//
+// **存之前一定先真装一次**（llm.ProbeONNXModel：定位 → 加载 → 跑一次嵌入）：
+//   - 它把"目录里没有 .onnx / 少了 tokenizer.json / 有多个 .onnx 不知道用哪个"
+//     当场说清楚，而不是等下次启动才在阻断页上蹦出来；
+//   - 更要紧的是**维度**：记忆库的向量列固定是 vector(1024)。用户拿一个 768 维的
+//     embedding 模型进来，如果被静默存下，症状要等到他下次写记忆才出现（写不进库），
+//     而那时报错来自 pgvector、看着与嵌入毫无关系。
+//
+// ⚠️ 保存后**不热切换**：嵌入器由 main 在启动时建好（真加载几百 MB 并自检），
+// 换它要处理正在跑的检索与结算，风险不划算。所以这里只管"验 + 存"，生效在下次启动——
+// 设置页会把这句话明写出来，不让用户以为点了就换好了。
+//
+// ⚠️ 校验通过**不等于**已经可用：它只说明"那个目录里的模型跑得起来、维度也对"，
+// 而这些向量与库里已有的不在同一个坐标系（见 ReindexEmbeddings），
+// 所以重启之后还要点一次「重建记忆索引」。
+func (a *App) SetEmbedModelDir(dir string) error {
+	if err := a.requireStore(); err != nil {
+		return err
+	}
+	dir = strings.TrimSpace(dir)
+
+	if dir != "" {
+		base := a.ctx
+		if base == nil {
+			base = context.Background() // 测试里 ctx 可能没注入
+		}
+		ctx, cancel := context.WithTimeout(base, probeEmbedTimeout)
+		defer cancel()
+
+		files, err := llm.ProbeONNXModel(ctx, dir)
+		if err != nil {
+			return fmt.Errorf("这个目录不能用：%w", err)
+		}
+		log.Printf("[embed] 已校验自定义模型目录 %s（用的是 %s）", dir, filepath.Base(files.Model))
+	}
+
+	if err := a.personas.SetEmbedModelDir(dir); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.embedModelDir = dir
+	a.mu.Unlock()
+
+	if dir == "" {
+		log.Printf("[embed] 嵌入模型目录已清回默认（下次启动生效）")
+	} else {
+		log.Printf("[embed] 嵌入模型目录已设为 %s（下次启动生效）", dir)
+	}
+	return nil
 }
 
 // ---------- 历史与记忆（第 5 步的界面数据）----------

@@ -416,10 +416,19 @@ VECTOR(n) 的类型定义在建表时固化，HNSW 索引也与其绑定；后�
 | `models/bge-m3-onnx-int8/model_quantized.onnx` | 543MB | int8 动态量化模型 |
 | `models/bge-m3-onnx-int8/tokenizer.json` | 16MB | BGE-M3 分词器（Unigram + Precompiled 归一化） |
 
-- 位置可覆盖：`COMPANION_EMBED_MODEL_DIR`（模型目录）与 `COMPANION_ONNXRUNTIME_DLL`（动态库完整路径）；
-  不设时按 exe 同目录 → `%LOCALAPPDATA%\It-With-You\models\...` 找。
+- **换模型：设置 → 换嵌入模型 → 「选择模型目录…」**，指到你自己那份模型所在的目录即可
+  （保存进 `app_settings`，与"搜索程序路径"同一套）。
+  - 目录里要有 `.onnx` 与 `tokenizer.json`；有多个 `.onnx` 时不猜，会列出来让你自己收成一个。
+  - ⚠️ **必须是 1024 维输出**的 embedding 模型：记忆库的向量列固定是 `vector(1024)`，
+    维度不符的向量写不进库，而报错来自数据库、看不出跟模型有关。所以选完会**先真加载一次**
+    校验维度，不对当场拒绝保存。
+  - 保存后要**重启应用**生效（模型在启动时加载）；重启后还要点一次「重建记忆索引」。
+  - 优先级：**设置里的目录 > 环境变量 > 默认位置**。环境变量 `COMPANION_EMBED_MODEL_DIR`
+    与 `COMPANION_ONNXRUNTIME_DLL` 仍可用（部署/排查用），不设时按 exe 同目录 →
+    `%LOCALAPPDATA%\It-With-You\models\...` 找。
 - **找不到模型 = 拦住启动**（页面上写出原因与试过的位置），不再是过去那种"降级成没有记忆"。
-  用户明确要求过：不允许出现"聊完了没记忆"。
+  用户明确要求过：不允许出现"聊完了没记忆"。阻断页上**就地给了「选择模型目录…」按钮**，
+  不让用户先去小窗口的 ☰ 菜单里绕一圈。
 - 分词器是**自己写的纯 Go 实现**（`internal/llm/tokenizer`），拿官方 `tokenizers` 产出的
   900 条基准逐 token 对拍验收——不引入任何 Rust / Python 运行依赖。
 - 换模型 = 换坐标系：库里的历史向量必须按新模型重算。入口是设置页的「重建记忆索引」
