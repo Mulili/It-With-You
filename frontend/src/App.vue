@@ -1639,12 +1639,12 @@ onUnmounted(() => {
             <div class="rules__head"><span>换嵌入模型</span></div>
             <p class="pane__note pane__note--warn">
               ⚠️ 只能用 <b>1024 维输出</b>的 embedding 模型。记忆库是建在
-              <code>vector(1024)</code> 上的，维度不符的向量写不进库——而那时报错来自数据库，
-              完全看不出跟模型有关。所以选了之后会先真加载一次再保存，维度不对当场拒绝。
+              <code>vector(1024)</code> 上的，维度不符的向量无法入库，此时错误来自数据库
+              ，无法识别错误是否来自模型。
             </p>
             <p class="pane__note">
               目录里要有 <code>.onnx</code> 与 <code>tokenizer.json</code>。目录里若有多份
-              <code>.onnx</code>，请自己收成一份再选（我们不猜，猜错的表现是"召回莫名其妙不准"）。
+              <code>.onnx</code>，请收成一份再选，否则可能语义不准确。
             </p>
             <p class="pane__note">
               当前设置：{{ settings.embedModelDir || '（未设置，按默认位置查找）' }}
