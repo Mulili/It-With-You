@@ -137,7 +137,7 @@ const (
 // **编出来的答案比重复提一句有害得多。**
 // 返回值里的 Refs 是"编号 → ID"对照表，供 stream 解析她自标的 [[used:…]] 用——
 // 那是计数归口（以及归档规则复活）的唯一依据（见 markUsed）。
-func (a *App) recall(personaID, sessionID string, msgs []llm.Message) recallResult {
+func (a *App) recall(personaID, sessionID string, msgs []llm.Message, excludeChunkID string) recallResult {
 	if a.memories == nil || a.embedder == nil {
 		return recallResult{} // 记忆功能整体停用（见 App.embedder 的注释）
 	}
@@ -191,6 +191,11 @@ func (a *App) recall(personaID, sessionID string, msgs []llm.Message) recallResu
 	for _, h := range chunkHits {
 		if len(chunks) >= recallChunkLimit {
 			break
+		}
+		// 已经作为"上一片"直接放进上下文的那条，别再当往事召一遍：
+		// 同一段摘要出现两次，她会以为这是两件事。
+		if excludeChunkID != "" && h.Chunk.ChunkID == excludeChunkID {
+			continue
 		}
 		if h.Score < recallThreshold(h.Chunk.LastRecalledSession, h.Chunk.RecallCount, sessionID) {
 			continue
@@ -427,6 +432,84 @@ func repeatedNote(count int) string {
 		return "（这条你这次已经反复提过很多次了）"
 	}
 	return ""
+}
+
+// continuityMaxMessages 是"摘要还没结算出来"时，退化取上一片的最后几条消息。
+//
+// 两条就够：一个问答对。取多了会把上一段的原文又灌回上下文，等于把分片边界作废。
+const continuityMaxMessages = 2
+
+// continuityWindowMessages 是"开场窗口"：新片的前几条消息里继续尝试注入上一片。
+//
+// 为什么不是"只有第一条"：摘要由 settlePending 在后台生成，开场那一轮大概率还没好。
+// 四轮（8 条）是给"用户连着发消息、结算还没跑完"留的余量；正常情况下一轮就够。
+// 超过窗口就不再等——那时这段对话已经靠自己的内容站住了。
+const continuityWindowMessages = 8
+
+// shouldInjectContinuity 决定这一轮还要不要接上一片。
+//
+// 三种情况：
+//   - 已经注入过摘要 → 不再注入（它已经在那段对话的上下文里了）；
+//   - 摘要就绪 → 注入并记住，之后不再重复；
+//   - 摘要还没好 → 用上一片最后两句话兜底，不标记完成（下一轮继续等摘要）。
+//
+// 硬上限是 continuityWindowMessages：超过就不再等，避免一段对话聊了十轮还在"接上一次"。
+func (a *App) shouldInjectContinuity(chunkID string, msgCount int, summaryReady bool) bool {
+	if msgCount <= 0 || msgCount > continuityWindowMessages {
+		return false
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.continuityChunk != chunkID {
+		a.continuityChunk = chunkID
+		a.continuityDone = false
+	}
+	if a.continuityDone {
+		return false
+	}
+	if summaryReady {
+		a.continuityDone = true
+	}
+	return true
+}
+
+// continuityBlock 把上一片接在新一段的开头。
+//
+// 为什么要有它：上下文只发当前片，话题一换，上一段就当场离开上下文。
+// 光靠向量召回不够——"接着刚才那件事"换个说法时就未必相似。上一片是**确定的上下文**，
+// 不是"可能相关的回忆"，所以不按相似度筛、也不进 recall 的编号体系。
+//
+// 优先用摘要（结算产物，稳定、短）；摘要还没结算出来时退化成最后两句话——
+// settlePending 是异步的，新话题的第一轮可能撞上它还没跑完，退化一下也不会开场断片。
+func (a *App) continuityBlock(prev history.Chunk) string {
+	body := strings.TrimSpace(prev.Summary)
+	if body == "" {
+		msgs, err := a.history.ChunkMessages(prev.ID, continuityMaxMessages)
+		if err != nil || len(msgs) == 0 {
+			return ""
+		}
+		var lines []string
+		for _, m := range msgs {
+			who := "他"
+			if m.Role == llm.RoleAssistant {
+				who = "你"
+			}
+			lines = append(lines, who+"："+clip(m.Content, 160))
+		}
+		body = strings.Join(lines, "\n")
+	}
+
+	when := "刚才"
+	if prev.EndedAt > 0 {
+		if d := relativeDay(prev.EndedAt); d != "今天" {
+			when = d
+		}
+	}
+	return "（你们" + when + "聊到这里，接着往下说就好。\n" +
+		"别复述下面这段，也别把它当成新信息再讲一遍：\n" +
+		body + "）\n\n"
 }
 
 // relativeDay 把时间戳说成"人话"。

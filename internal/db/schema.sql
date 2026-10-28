@@ -128,9 +128,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- NOT NULL：会话必然属于某个具体人格（你是在跟某一个人聊）。
     -- 与 memories 的两分法（可空）形成对照：**经历私有，事实公共**
     persona_id uuid   NOT NULL REFERENCES personas (id) ON DELETE CASCADE,
-    -- title / summary 由会话收尾时一次调用生成（懒结算）
+    -- title 由会话收尾时生成（懒结算）。
+    -- 摘要**只存在片级**（session_chunks.summary）：检索与开场衔接都用片摘要，
+    -- 会话级摘要从来没有写入过，v8 → v9 删掉了这一列。
     title      text   NOT NULL DEFAULT '',
-    summary    text   NOT NULL DEFAULT '',
     started_at bigint NOT NULL,
     -- NULL = 还没收尾（懒结算要扫这个状态）
     ended_at   bigint,
@@ -141,6 +142,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS sessions_persona_idx ON sessions (persona_id, started_at DESC);
 -- 部分索引：收尾时只扫"还没结束"的会话，比全列索引小得多
 CREATE INDEX IF NOT EXISTS sessions_open_idx ON sessions (ended_at) WHERE ended_at IS NULL;
+
+-- v8 → v9：删掉从没写过的 sessions.summary（摘要在片级）。
+-- 幂等：新库的 CREATE TABLE 里已经没有它，这一句是空操作。
+ALTER TABLE sessions DROP COLUMN IF EXISTS summary;
 
 -- 会话内的片：长会话按体量切开，避免"边打游戏边聊一整天"导致上下文被截断。
 --

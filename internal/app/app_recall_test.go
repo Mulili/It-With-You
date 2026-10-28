@@ -112,7 +112,7 @@ func TestMarkUsedCountsOnlyWhatSheUsed(t *testing.T) {
 	id := seedMemory(t, mems, personaID, "用户有一把 HHKB 键盘", 0)
 	msgs := []llm.Message{{Role: llm.RoleUser, Content: "我那个键盘到了"}}
 
-	rec := app.recall(personaID, "", msgs)
+	rec := app.recall(personaID, "", msgs, "")
 	if len(rec.Refs) != 1 {
 		t.Fatalf("应当恰好一条编号对照，实际 %d 条：%+v", len(rec.Refs), rec.Refs)
 	}
@@ -233,7 +233,7 @@ func TestRecallDisabledWithoutEmbedder(t *testing.T) {
 // recallText 是测试用的薄封装：这些用例只关心"注入了什么文本"，
 // 不关心"编号 → ID"那张对照表（那是 markUsed 的事）。
 func (a *App) recallText(personaID, sessionID string, msgs []llm.Message) string {
-	return a.recall(personaID, sessionID, msgs).Text
+	return a.recall(personaID, sessionID, msgs, "").Text
 }
 
 // 门槛的曲线形状（"先陡后缓"）以及它与基础阈值的关系。
@@ -300,7 +300,7 @@ func TestRecallDowngradesRatherThanForgets(t *testing.T) {
 	)
 
 	// 第一次：正常档。她还没用到过，措辞就不该降级
-	first := app.recall(personaID, sessionA, msgs)
+	first := app.recall(personaID, sessionA, msgs, "")
 	if !strings.Contains(first.Text, "HHKB") {
 		t.Fatalf("第一次应当注入，实际：\n%s", first.Text)
 	}
@@ -322,7 +322,7 @@ func TestRecallDowngradesRatherThanForgets(t *testing.T) {
 
 	// ⚠️ **反复追问也必须一直看得到内容**（用户举的正是这个场景：草莓 / 芒果 / 菠萝）
 	for i := 0; i < 4; i++ {
-		r := app.recall(personaID, sessionA, msgs)
+		r := app.recall(personaID, sessionA, msgs, "")
 		if !strings.Contains(r.Text, "HHKB") {
 			t.Fatalf("第 %d 次追问仍须带内容（丢了她就只能编），实际：\n%s", i+3, r.Text)
 		}
@@ -364,7 +364,7 @@ func TestRecallDowngradesPastConversationInSameSession(t *testing.T) {
 		sessionB = "00000000-0000-0000-0000-0000000000b1"
 	)
 
-	first := app.recall(personaID, sessionA, msgs)
+	first := app.recall(personaID, sessionA, msgs, "")
 	if !strings.Contains(first.Text, "西瓜味冰棍") || strings.Contains(first.Text, "只当背景资料") {
 		t.Fatalf("第一次应当正常注入这段往事，实际：\n%s", first.Text)
 	}
@@ -492,7 +492,7 @@ func TestArchivedRuleRecalledAndRevived(t *testing.T) {
 	// ① 它得能被检索回来，而且注入的措辞必须说明"现在不再要求"——
 	// 少了这句，她会把归档当成现行规则照做，那"归档"这件事就白做了
 	msgs := []llm.Message{{Role: llm.RoleUser, Content: "你今天说话怎么这么正经"}}
-	rec := app.recall(pid, "", msgs)
+	rec := app.recall(pid, "", msgs, "")
 	if !strings.Contains(rec.Text, "你以前的做法") {
 		t.Fatalf("归档规则应当被检索回来，实际：\n%s", rec.Text)
 	}

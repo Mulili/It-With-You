@@ -143,7 +143,11 @@ func (s *MemoryStore) Search(personaID string, vec []float32, limit int) ([]memo
 		// 相似度用与 PG 的 <=> 同一个口径（余弦），否则同一条断言在两种实现下会得出不同结论
 		hits = append(hits, memory.MemoryHit{Memory: e.m, Score: cosine(vec, e.vec)})
 	}
-	sortHits(hits, func(h memory.MemoryHit) float64 { return h.Score })
+	// 排序看"相似度 + importance"，但 Score 本身保持原始相似度——
+	// 门槛（recallMinScore）比的是原始值，不能被重要性加成带过去。
+	sortHits(hits, func(h memory.MemoryHit) float64 {
+		return memory.RankScore(h.Score, h.Memory.Importance)
+	})
 	return trimHits(hits, limit), nil
 }
 

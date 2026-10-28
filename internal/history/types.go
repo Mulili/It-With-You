@@ -66,13 +66,13 @@ const ChunkMaxMessages = ContextMessagesLimit - 2
 var ErrNotFound = errors.New("记录不存在")
 
 // Session 是一次完整的对话：从某个话题开始，到聊完为止。
+// Title 在会话收尾时一次生成（懒结算），所以未收尾时为空。
 //
-// Title / Summary 在会话收尾时一次生成（懒结算），所以未收尾时为空。
+// 摘要**不在会话级**：检索与开场衔接都用 session_chunks.summary。
 type Session struct {
 	ID        string `json:"id"`
 	PersonaID string `json:"personaId"`
 	Title     string `json:"title"`
-	Summary   string `json:"summary"`
 	StartedAt int64  `json:"startedAt"`
 	// EndedAt 为 0 表示还没收尾。"当前会话"就是该人格最近一个未收尾的会话——
 	// 这也是重启后能接着上一段继续聊的原因。
@@ -175,6 +175,12 @@ type Store interface {
 
 	// ListChunks 列出该会话的片（按 seq 正序）。
 	ListChunks(sessionID string) ([]Chunk, error)
+
+	// PreviousChunk 返回该人格**最近一个已收尾**的片（不含 excludeID）。
+	//
+	// 给"新一段开场时承接上一段"用：它**不按相似度筛**——不管话题像不像，
+	// 上一段都要接上。摘要可能还空着（懒结算在后台跑），调用方自己决定怎么退化。
+	PreviousChunk(personaID, excludeID string) (Chunk, bool, error)
 
 	// EndSession 给会话打上结束时间（ended_at），并**顺手收尾它的当前片**。
 	//

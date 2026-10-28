@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -138,12 +139,18 @@ func (s *PgStore) Search(personaID string, vec []float32, limit int) ([]memory.M
 	// 连着问"草莓喜不喜欢 / 芒果喜不喜欢 / 菠萝喜不喜欢"，第三次起若不再返回，
 	// 她会**不知道**，然后就开始编。提过的那些照常返回，由上层降级为弱化措辞
 	// （见 memory.Memory.RecallCount）。
+	// 多取一些再重排：SQL 只能按向量距离截断，而最终顺序还要看 importance。
+	// 只取 limit 条再重排，会把"向量稍远但很重要"的那条挡在门外。
+	fetch := limit
+	if fetch > 0 {
+		fetch *= 3
+	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+memoryColumns+`, 1 - (embedding <=> $1::vector) AS score
 		FROM memories
 		WHERE persona_id IS NULL OR persona_id = $2::uuid
 		ORDER BY embedding <=> $1::vector
-		LIMIT $3`, vectorLiteral(vec), pgutil.NullIfEmpty(personaID), limit)
+		LIMIT $3`, vectorLiteral(vec), pgutil.NullIfEmpty(personaID), fetch)
 	if err != nil {
 		return nil, fmt.Errorf("检索记忆失败: %w", err)
 	}
@@ -162,6 +169,15 @@ func (s *PgStore) Search(personaID string, vec []float32, limit int) ([]memory.M
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("遍历检索结果失败: %w", err)
+	}
+	// 排序看"相似度 + importance"，但 Score 本身保持原始相似度——
+	// 门槛（recallMinScore）比的是原始值，不能被重要性加成带过去。
+	sort.SliceStable(out, func(i, j int) bool {
+		return memory.RankScore(out[i].Score, out[i].Memory.Importance) >
+			memory.RankScore(out[j].Score, out[j].Memory.Importance)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }

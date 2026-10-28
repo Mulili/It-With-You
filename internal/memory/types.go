@@ -36,6 +36,21 @@ const (
 // 而重复只是多占一个 Top-3 名额（还能清理）。等有真实数据再校。
 const DefaultDedupThreshold = 0.85
 
+// ImportanceWeight 是 importance 在检索排序里的权重（每一级）。
+//
+// 排序分 = 相似度 + ImportanceWeight × (importance − 3)，1..5 对应 ±0.10。
+// 它只在"相关性接近"时起作用：足够把重要的事顶上来，又不足以让一条明显不相关的
+// 记忆越过真正相关的那条。
+//
+// ⚠️ 它**只影响排序**，不参与 recallMinScore 的比较——门槛看的是原始相似度。
+// 否则"很重要但不太相关"的记忆会越过阈值被硬塞进上下文。
+const ImportanceWeight = 0.05
+
+// RankScore 把相似度与 importance 合成排序分（仅用于排序，见 ImportanceWeight）。
+func RankScore(similarity float64, importance int) float64 {
+	return similarity + ImportanceWeight*float64(importance-3)
+}
+
 // Memory 是一条长期记忆。
 type Memory struct {
 	ID string `json:"id"`
