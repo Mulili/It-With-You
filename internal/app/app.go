@@ -78,6 +78,13 @@ type App struct {
 	// 用 TryLock 而不是 Lock：抢不到就跳过这次——判断依据是"最新的几句"，
 	// 跳过旧的那次没有损失，而排队只会让判断越来越滞后。
 	judgeMu sync.Mutex
+	// continuityChunk / continuityDone 记"这一片有没有已经接上上一片"。
+	//
+	// 为什么需要状态：摘要由后台结算，开场那一轮可能还没好。只靠"前几条消息"的窗口，
+	// 要么等不到摘要、要么把它重复注入好几轮。这两个字段让摘要一就绪就补上，
+	// 补过一次就不再提（下一轮它回到普通检索池，需要时按相似度召回）。
+	continuityChunk string
+	continuityDone  bool
 	// prevCancel 是上一轮流的取消函数。context.CancelFunc 可重复调用，所以不必清理，
 	// 每次新请求直接覆盖即可——省掉了"谁负责清空"的并发问题。
 	prevCancel context.CancelFunc
@@ -454,8 +461,33 @@ func (a *App) Ask(text string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// 新一段的开头几轮：把上一片接上（见 continuityBlock）。
+	//
+	// 不能只看"第一条消息"：摘要由后台结算（settlePending），开场那一轮可能还没生成出来。
+	// 所以在开场窗口内继续尝试：先用上一片最后两句话顶上，等摘要结算好就自动换成摘要；
+	// 摘要补过一次就不再重复（见 shouldInjectContinuity）。
+	prev, hasPrev, err := a.history.PreviousChunk(personaID, chunk.ID)
+	if err != nil {
+		log.Printf("[recall] 查上一片失败，本轮不做开场衔接: %v", err)
+	}
+	active := err == nil && hasPrev &&
+		a.shouldInjectContinuity(chunk.ID, len(msgs), prev.Summary != "")
+	excludeChunkID := ""
+	if active {
+		excludeChunkID = prev.ID
+	}
 	// 想在拼上下文之前：它是这一轮里唯一的嵌入调用，跑完才有东西可注入（见 recall）
-	rec := a.recall(personaID, sess.ID, msgs)
+	rec := a.recall(personaID, sess.ID, msgs, excludeChunkID)
+	if active {
+		if block := a.continuityBlock(prev); block != "" {
+			rec.Text = block + rec.Text
+			src := fmt.Sprintf("摘要 %d 字", utf8.RuneCountInString(prev.Summary))
+			if prev.Summary == "" {
+				src = "原文兜底"
+			}
+			log.Printf("[recall] 开场衔接：接上一片 %s（%s）", relativeDay(prev.EndedAt), src)
+		}
+	}
 	full := a.buildMessages(personaID, msgs, rec)
 
 	go a.stream(ctx, id, sess.ID, chunk.ID, personaID, full, noThinking, rec)

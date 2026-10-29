@@ -49,7 +49,7 @@ func (s *PgStore) ctx() (context.Context, context.CancelFunc) {
 //
 // ended_at 用 COALESCE 兜成 0：Go 侧用 0 表示"未收尾"，而库里是 NULL——
 // 让 NULL 透到 Go 会逼每个调用点都处理一遍可空性，不如在 SQL 边界上收敛掉。
-const sessionColumns = `id, persona_id, title, summary, started_at, COALESCE(ended_at, 0), created_at, updated_at`
+const sessionColumns = `id, persona_id, title, started_at, COALESCE(ended_at, 0), created_at, updated_at`
 
 // chunkColumns 是读片的列清单，与各处的 Scan 顺序一一对应。
 const chunkColumns = `id, session_id, persona_id, seq, started_at, COALESCE(ended_at, 0), summary, created_at, updated_at`
@@ -76,7 +76,7 @@ func (s *PgStore) EnsureSession(personaID string) (history.Session, error) {
 		LIMIT 1`, personaID)
 
 	var sess history.Session
-	err := row.Scan(&sess.ID, &sess.PersonaID, &sess.Title, &sess.Summary,
+	err := row.Scan(&sess.ID, &sess.PersonaID, &sess.Title,
 		&sess.StartedAt, &sess.EndedAt, &sess.CreatedAt, &sess.UpdatedAt)
 	if err == nil {
 		return sess, nil
@@ -97,8 +97,8 @@ func (s *PgStore) EnsureSession(personaID string) (history.Session, error) {
 		UpdatedAt: now,
 	}
 	if _, err := s.pool.Exec(ctx, `
-		INSERT INTO sessions (id, persona_id, title, summary, started_at, ended_at, created_at, updated_at)
-		VALUES ($1, $2, '', '', $3, NULL, $4, $5)`,
+		INSERT INTO sessions (id, persona_id, title, started_at, ended_at, created_at, updated_at)
+		VALUES ($1, $2, '', $3, NULL, $4, $5)`,
 		sess.ID, sess.PersonaID, sess.StartedAt, sess.CreatedAt, sess.UpdatedAt); err != nil {
 		return history.Session{}, fmt.Errorf("新建会话失败: %w", err)
 	}
@@ -327,7 +327,7 @@ func (s *PgStore) ListSessions(personaID string, limit int) ([]history.Session, 
 	out := make([]history.Session, 0, 8)
 	for rows.Next() {
 		var sess history.Session
-		if err := rows.Scan(&sess.ID, &sess.PersonaID, &sess.Title, &sess.Summary,
+		if err := rows.Scan(&sess.ID, &sess.PersonaID, &sess.Title,
 			&sess.StartedAt, &sess.EndedAt, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("解析会话失败: %w", err)
 		}
@@ -394,6 +394,31 @@ func (s *PgStore) EndSession(sessionID string) error {
 		return fmt.Errorf("收尾会话的当前片失败: %w", err)
 	}
 	return nil
+}
+
+// PreviousChunk 实现 history.Store。
+//
+// 按 ended_at 倒序取最近一个已收尾的片：会话内切片与会话之间切换走的是同一条路，
+// 所以这里不需要区分"同一会话的上一片"和"上一段会话"。
+func (s *PgStore) PreviousChunk(personaID, excludeID string) (history.Chunk, bool, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	row := s.pool.QueryRow(ctx, `
+		SELECT `+chunkColumns+`
+		FROM session_chunks
+		WHERE persona_id = $1 AND id <> $2 AND ended_at IS NOT NULL
+		ORDER BY ended_at DESC
+		LIMIT 1`, personaID, excludeID)
+
+	c, err := scanChunk(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return history.Chunk{}, false, nil
+	}
+	if err != nil {
+		return history.Chunk{}, false, fmt.Errorf("查上一片失败: %w", err)
+	}
+	return c, true, nil
 }
 
 // PendingChunks 实现 history.Store。

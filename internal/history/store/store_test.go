@@ -27,6 +27,9 @@ const (
 	// D 只服务于"条数到阈值也换片"那条：它要断言"新片序号是 2"，
 	// 所以必须用一个**前面没用过**的人格——复用的话会接上别人已经建好的会话与片，序号就不从 1 开始了
 	testPersonaD = "00000000-0000-0000-0000-00000000d001"
+	// E 只服务于 PreviousChunk：它要断言"上一片是谁"，必须是一段没被别的子测试
+	// 收尾过的干净历史，否则最近一个已收尾的片可能是别人留下的。
+	testPersonaE = "00000000-0000-0000-0000-00000000e001"
 )
 
 // 同一套断言跑两种实现：内存与 PG 的行为必须一致。
@@ -445,6 +448,45 @@ func runStoreContract(t *testing.T, s history.Store) {
 			t.Error("已结束的会话不该被复用")
 		}
 	})
+
+	t.Run("PreviousChunk 取最近一个已收尾的片，且不跨人格", func(t *testing.T) {
+		// 第一段：写一条消息 → 收尾 → 写摘要
+		sess1, c1 := newChunk(t, testPersonaE)
+		appendTo(t, c1, "第一段的内容")
+		if err := s.EndSession(sess1.ID); err != nil {
+			t.Fatalf("结束会话失败: %v", err)
+		}
+		if err := s.SetChunkSummary(c1.ID, "主题：第一段"); err != nil {
+			t.Fatalf("写片摘要失败: %v", err)
+		}
+
+		// 第二段：当前片还没收尾
+		_, c2 := newChunk(t, testPersonaE)
+
+		got, ok, err := s.PreviousChunk(testPersonaE, c2.ID)
+		if err != nil {
+			t.Fatalf("取上一片失败: %v", err)
+		}
+		if !ok {
+			t.Fatal("应当找到上一片")
+		}
+		if got.ID != c1.ID {
+			t.Errorf("上一片应当是 %s，实际 %s", c1.ID, got.ID)
+		}
+		if got.Summary != "主题：第一段" {
+			t.Errorf("摘要应当带出来，实际 %q", got.Summary)
+		}
+
+		// 被 exclude 的那片不能算"上一片"
+		if _, ok, _ := s.PreviousChunk(testPersonaE, c1.ID); ok {
+			t.Error("不该把被排除的片当成上一片")
+		}
+
+		// 换个 人格 查，只能拿到它自己的片（或没有），绝不能拿到 E 的
+		if other, ok, _ := s.PreviousChunk(testPersonaB, c2.ID); ok && other.PersonaID != testPersonaB {
+			t.Errorf("跨人格返回了 %s 的片", other.PersonaID)
+		}
+	})
 }
 
 func TestMemoryStoreContract(t *testing.T) {
@@ -453,7 +495,7 @@ func TestMemoryStoreContract(t *testing.T) {
 
 func TestPgStoreContract(t *testing.T) {
 	st, pool := openTestPgStore(t)
-	for _, id := range []string{testPersonaA, testPersonaB, testPersonaC, testPersonaD} {
+	for _, id := range []string{testPersonaA, testPersonaB, testPersonaC, testPersonaD, testPersonaE} {
 		ensureTestPersona(t, pool, id)
 	}
 	runStoreContract(t, st)

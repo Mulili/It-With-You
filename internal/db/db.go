@@ -35,7 +35,8 @@ import (
 //	v7 → v8：persona_rules 加 downgrade_asked_at / downgrade_refused_at
 //	         （她"提议收起来"那一问的状态：她问、用户点头才降；另外把提升来的规则
 //	          从 manual 里分出来记成 promoted）
-const SchemaVersion = 8
+//	v8 → v9：删掉 sessions.summary（从没写过；摘要只存在 session_chunks 这一级）
+const SchemaVersion = 9
 
 // envDSN 是连接串所在的环境变量名。
 const envDSN = "COMPANION_PG_DSN"

@@ -124,6 +124,24 @@ func (s *MemoryStore) sessionPersonaLocked(sessionID string) string {
 	return ""
 }
 
+// PreviousChunk 实现 history.Store。
+func (s *MemoryStore) PreviousChunk(personaID, excludeID string) (history.Chunk, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var best history.Chunk
+	found := false
+	for _, c := range s.chunks {
+		if c.PersonaID != personaID || c.ID == excludeID || c.EndedAt == 0 {
+			continue
+		}
+		if !found || c.EndedAt > best.EndedAt {
+			best, found = c, true
+		}
+	}
+	return best, found, nil
+}
+
 // AppendMessage 实现 history.Store。
 func (s *MemoryStore) AppendMessage(m history.Message) (string, error) {
 	s.mu.Lock()

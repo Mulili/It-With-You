@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -522,6 +523,45 @@ func runStoreContract(t *testing.T, s memory.Store, chunk testChunk) {
 			t.Error("公共记忆不该被删：人格没了，但事实仍然成立")
 		}
 	})
+
+	// importance 只影响排序，不改原始相似度——门槛（recallMinScore）比的是原始值。
+	t.Run("importance 参与排序，但不改原始相似度", func(t *testing.T) {
+		// 两条方向接近、相似度不同的记忆。用不同 Kind 避开"相似就合并"：
+		// 去重只在同 Kind 之间发生。
+		lowID := save(t, memory.Memory{
+			PersonaID: testPersonaA, Kind: memory.KindFact, Importance: 1,
+			Content: testContentPrefix + "排序用的琐事",
+		}, makeVecPair(40, 41, 0.60, 0.80)).ID
+		highID := save(t, memory.Memory{
+			PersonaID: testPersonaA, Kind: memory.KindPromise, Importance: 5,
+			Content: testContentPrefix + "排序用的重要承诺",
+		}, makeVecPair(40, 41, 0.55, 0.835)).ID
+
+		hits, err := s.Search(testPersonaA, makeVec(40, 1), 100)
+		if err != nil {
+			t.Fatalf("检索失败: %v", err)
+		}
+		posLow, posHigh := -1, -1
+		var scoreLow, scoreHigh float64
+		for i, h := range hits {
+			switch h.Memory.ID {
+			case lowID:
+				posLow, scoreLow = i, h.Score
+			case highID:
+				posHigh, scoreHigh = i, h.Score
+			}
+		}
+		if posLow < 0 || posHigh < 0 {
+			t.Fatalf("两条记忆都应当被检索到（low=%d high=%d）", posLow, posHigh)
+		}
+		if posHigh > posLow {
+			t.Errorf("importance 高的应当排在前面：high@%d low@%d", posHigh, posLow)
+		}
+		// 原始相似度不变：重要性不能污染门槛比较
+		if math.Abs(scoreLow-0.60) > 0.01 || math.Abs(scoreHigh-0.55) > 0.01 {
+			t.Errorf("Score 应当是原始相似度（低=0.60、高=0.55），实际 %.3f / %.3f", scoreLow, scoreHigh)
+		}
+	})
 }
 
 func TestMemoryStoreContract(t *testing.T) {
@@ -926,8 +966,8 @@ func createTestChunk(t *testing.T, pool *pgxpool.Pool, personaID string) testChu
 
 	c := testChunk{ChunkID: uuid.NewString(), SessionID: uuid.NewString()}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO sessions (id, persona_id, title, summary, started_at, ended_at, created_at, updated_at)
-		VALUES ($1, $2, '', '', $3, NULL, $3, $3)`,
+		INSERT INTO sessions (id, persona_id, title, started_at, ended_at, created_at, updated_at)
+		VALUES ($1, $2, '', $3, NULL, $3, $3)`,
 		c.SessionID, personaID, now); err != nil {
 		t.Fatalf("准备测试会话失败: %v", err)
 	}
