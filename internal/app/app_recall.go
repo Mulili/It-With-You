@@ -366,7 +366,8 @@ func formatRecall(mems []memory.MemoryHit, chunks []memory.ChunkHit, rules []mem
 		b.WriteString("\n以前聊过：\n")
 		for _, h := range freshChunks {
 			refs = append(refs, recallRef{ChunkID: h.Chunk.ChunkID})
-			fmt.Fprintf(&b, "%d. %s，%s\n", len(refs), relativeDay(h.Chunk.CreatedAt), h.Chunk.Summary)
+			fmt.Fprintf(&b, "%d. %s\n", len(refs),
+				chunkSummaryForRecall(h.Chunk.CreatedAt, h.Chunk.Summary))
 		}
 	}
 	// 归档规则（"你以前的做法"）排在最后：它是三条线里最不该主动提的一条——
@@ -398,8 +399,9 @@ func formatRecall(mems []memory.MemoryHit, chunks []memory.ChunkHit, rules []mem
 		}
 		for _, h := range saidChunks {
 			refs = append(refs, recallRef{ChunkID: h.Chunk.ChunkID})
-			fmt.Fprintf(&b, "%d. %s%s，%s\n", len(refs),
-				repeatedNote(h.Chunk.RecallCount), relativeDay(h.Chunk.CreatedAt), h.Chunk.Summary)
+			fmt.Fprintf(&b, "%d. %s%s\n", len(refs),
+				repeatedNote(h.Chunk.RecallCount),
+				chunkSummaryForRecall(h.Chunk.CreatedAt, h.Chunk.Summary))
 		}
 	}
 
@@ -510,6 +512,54 @@ func (a *App) continuityBlock(prev history.Chunk) string {
 	return "（你们" + when + "聊到这里，接着往下说就好。\n" +
 		"别复述下面这段，也别把它当成新信息再讲一遍：\n" +
 		body + "）\n\n"
+}
+
+// currentTimeLine 是每轮注入的"现在"。
+func currentTimeLine() string { return nowLine(time.Now().UnixMilli()) }
+
+// nowLine 把时间戳说成"她看得懂的一句现在"。
+//
+// 为什么要每轮给：system 提示词里从来没有当前时间，她只能靠 `get_current_time` 工具查；
+// 而"今天几号/现在几点/昨天"这类话，每轮都答不出来。
+//
+// 为什么放在**最后一条用户消息之前**那个 system 块里（与回忆同位置）：
+// 它每轮都在变，塞进人格提示词头部会把整段前缀缓存打掉（4.7 记过这个坑）。
+func nowLine(ms int64) string {
+	t := time.UnixMilli(ms).Local()
+	weekday := [...]string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}[t.Weekday()]
+	return fmt.Sprintf("（现在是 %s %s %s）", t.Format("2006-01-02"), weekday, t.Format("15:04"))
+}
+
+// chunkTimeRange 把一片的时间段写成一行（摘要的第一行）。
+//
+// 跨天时两头都带日期；同一天只写一次日期，省几个字。
+func chunkTimeRange(start, end int64) string {
+	if start <= 0 {
+		start = end
+	}
+	if end <= 0 {
+		end = start
+	}
+	if start <= 0 {
+		return ""
+	}
+	s, e := time.UnixMilli(start).Local(), time.UnixMilli(end).Local()
+	if s.Format("2006-01-02") == e.Format("2006-01-02") {
+		return s.Format("2006-01-02 15:04") + "–" + e.Format("15:04")
+	}
+	return s.Format("2006-01-02 15:04") + "–" + e.Format("2006-01-02 15:04")
+}
+
+// chunkSummaryForRecall 给召回里的片摘要补上"什么时候"。
+//
+// 2026-10-28 起，新摘要的第一行就是绝对时间段，直接用；老摘要没有这一行，
+// 退回相对时间（"3 天前"）。两者都没有时 relativeDay 会返回"以前"。
+func chunkSummaryForRecall(createdAt int64, summary string) string {
+	// 首行形如 2026-10-30 14:00–14:32：第 5、8 个字符是 '-'
+	if len(summary) >= 10 && summary[4] == '-' && summary[7] == '-' {
+		return summary
+	}
+	return relativeDay(createdAt) + "，" + summary
 }
 
 // relativeDay 把时间戳说成"人话"。

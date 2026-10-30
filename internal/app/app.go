@@ -488,6 +488,9 @@ func (a *App) Ask(text string) (string, error) {
 			log.Printf("[recall] 开场衔接：接上一片 %s（%s）", relativeDay(prev.EndedAt), src)
 		}
 	}
+	// "现在"每轮都给（见 currentTimeLine）。它和回忆共用一个 system 块，
+	// 位置在最后一条用户消息之前——每轮都在变，放在这里不会打掉前缀缓存。
+	rec.Text = currentTimeLine() + "\n" + rec.Text
 	full := a.buildMessages(personaID, msgs, rec)
 
 	go a.stream(ctx, id, sess.ID, chunk.ID, personaID, full, noThinking, rec)

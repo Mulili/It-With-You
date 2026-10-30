@@ -416,6 +416,11 @@ func (a *App) settleChunk(c history.Chunk) error {
 	}
 
 	summary := res.Summary()
+	// 第一行放**绝对时间段**：摘要本身要能回答"哪天聊的"。
+	// 召回注入会原样带出这一行；老摘要没有这行时退回相对时间（见 chunkSummaryForRecall）。
+	if tr := chunkTimeRange(c.StartedAt, c.EndedAt); tr != "" {
+		summary = tr + "\n" + summary
+	}
 	// 摘要与全部事实**一次嵌入算完**：逐条发请求就是十几次网络往返
 	texts := make([]string, 0, 1+len(res.Facts))
 	texts = append(texts, summary)
