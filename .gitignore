@@ -26,4 +26,6 @@ TTS原生go方案.md
 情感.md
 
 #
-models/kokoro-v1.1-zh.fp16.onnx
+# TTS 模型与音色：体积大，且含第三方 / 游戏角色素材，不入库
+# 来源与许可见 THIRD_PARTY_NOTICES.md
+models/
