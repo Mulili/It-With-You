@@ -1,4 +1,4 @@
-// Package voice 预留：语音对话（阶段5 落地）。
+// Package voice 预留：语音对话里"能听"的那条链（阶段5b）。
 //
 // 目标数据流：
 //
@@ -6,19 +6,17 @@
 //	                ↑
 //	            用户说话时打断
 //
-// 选型倾向（README 阶段5「关键决策」）：ASR/TTS 优先云 API 换取低延迟与低负载，
-// 本地模型（Whisper.cpp / GPT-SoVITS）作为隐私选项后置。
+// 本包只负责**输入侧**：采集、VAD、ASR、语音打断（需要 AEC 参考回流，
+// 否则她会听见自己的声音当作用户）。
 //
-// 计划中的形态（阶段5 实现时再落成真实代码）：
+// 输出侧（TTS）已经独立在 internal/tts：**纯 Go 内嵌 ONNX**，不依赖云 API，
+// 也不起本地常驻服务（取舍见 TTS原生go方案.md §0）。
+//
+// 计划中的形态（5b 实现时再落成真实代码）：
 //
 //	type Recognizer interface {
 //		// Start 开始采集并返回识别出的文本流。
 //		Start(ctx context.Context) (<-chan string, error)
 //		Stop() error
-//	}
-//
-//	type Synthesizer interface {
-//		// Speak 合成并播放，ctx 取消即打断。
-//		Speak(ctx context.Context, text string) error
 //	}
 package voice
