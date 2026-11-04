@@ -42,9 +42,36 @@ func TestNormalize(t *testing.T) {
 
 func TestPhonesBasic(t *testing.T) {
 	f := newTestFrontend(t)
+	// 三声连读：你好 = ni3 hao3 → ni2 hao3
 	got := strings.Join(f.Phones("你好"), " ")
-	if got != "n i3 h ao3" {
-		t.Errorf("你好 → %q，期望 %q", got, "n i3 h ao3")
+	if got != "n i2 h ao3" {
+		t.Errorf("你好 → %q，期望 %q", got, "n i2 h ao3")
+	}
+}
+
+func TestSandhiThreeTonesChain(t *testing.T) {
+	f := newTestFrontend(t)
+	// 我很好 = wo3 hen3 hao3 → 前两个变二声
+	if got := strings.Join(f.Phones("我很好"), " "); got != "w o2 h en2 h ao3" {
+		t.Errorf("我很好 → %q，期望 w o2 h en2 h ao3", got)
+	}
+	// 标点打断连读区间：单独一个三声不变
+	if got := strings.Join(f.Phones("好"), " "); got != "h ao3" {
+		t.Errorf("好 → %q", got)
+	}
+}
+
+func TestNeutralToneNotDropped(t *testing.T) {
+	f := newTestFrontend(t)
+	// go-pinyin 对轻声返回不带调号的 "de"/"le"，必须补成 5 —— 否则整字被丢
+	cases := map[string]string{
+		"我的": "w o3 d e5",
+		"好了": "h ao3 l e5",
+	}
+	for in, want := range cases {
+		if got := strings.Join(f.Phones(in), " "); got != want {
+			t.Errorf("%s → %q，期望 %q", in, got, want)
+		}
 	}
 }
 
