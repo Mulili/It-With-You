@@ -51,6 +51,42 @@ func RankScore(similarity float64, importance int) float64 {
 	return similarity + ImportanceWeight*float64(importance-3)
 }
 
+// TimeWeight 是时间档位在排序里的权重（每一级）。
+//
+// 档位见 RecencyLevel：3 天内 5 级、3~7 天 3 级、一周以上 2 级。
+// 5 级与 2 级之差 = 0.02 × 3 = 0.06，约等于 1.2 级 importance 的差距：
+// 足以在"两条都过线"时把太旧的压到后面，又不会盖过真实的相关性差异。
+//
+// ⚠️ 它**只影响排序**，与 ImportanceWeight 同一姿态：门槛（recallMinScore）
+// 仍然比原始相似度，否则"三天内但并不相关"的往事会越过阈值被硬塞进上下文。
+const TimeWeight = 0.02
+
+// RecencyLevel 把"多久以前"折成档位：3 天内 5、3~7 天 3、一周以上 2。
+//
+// 时间是毫秒（与 CreatedAt 同单位），按连续 72h/168h 算而不是自然日——
+// 否则 23:59 写入的一条，第二天早上就掉一档。
+// 时间缺失（<=0）或晚于现在：返回中性 3，不奖励也不惩罚。
+func RecencyLevel(createdAtMillis, nowMillis int64) int {
+	if createdAtMillis <= 0 || createdAtMillis > nowMillis {
+		return 3
+	}
+	const dayMillis = int64(24 * 60 * 60 * 1000)
+	age := nowMillis - createdAtMillis
+	switch {
+	case age < 3*dayMillis:
+		return 5
+	case age < 7*dayMillis:
+		return 3
+	default:
+		return 2
+	}
+}
+
+// RankScoreAt 在 RankScore 之上再叠加时间档位（往事没有 importance，传 3 即可）。
+func RankScoreAt(similarity float64, importance, recency int) float64 {
+	return RankScore(similarity, importance) + TimeWeight*float64(recency-3)
+}
+
 // Memory 是一条长期记忆。
 type Memory struct {
 	ID string `json:"id"`

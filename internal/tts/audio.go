@@ -145,6 +145,73 @@ func Resample(in []float32, from, to int) ([]float32, error) {
 	return out, nil
 }
 
+// TrimSilence 砍掉句子首尾的静音，只留一小段余量。
+//
+// 为什么需要它：vits 对"句首补的 ."和"句末标点"都会吐出一段静音，逐句拼接时
+// 这些静音会叠成听感上"停了两秒"的空档。句间的真实停顿应当由播放端控制
+// （当前是 50ms 起排），而不是让模型随意生成。
+//
+// 判据用 5ms 窗的 RMS 相对峰值（-26dB），比逐样本阈值稳：一个咔哒声不会把整段当成有声。
+func TrimSilence(in []float32, rate int) []float32 {
+	if len(in) == 0 || rate <= 0 {
+		return in
+	}
+	var peak float32
+	for _, v := range in {
+		if v < 0 {
+			v = -v
+		}
+		if v > peak {
+			peak = v
+		}
+	}
+	if peak < 0.01 { // 整句都近乎静音：原样返回，交给上层判断
+		return in
+	}
+	th := peak * 0.05
+
+	const win = 5 // ms
+	w := rate * win / 1000
+	if w < 1 {
+		w = 1
+	}
+
+	loud := func(from int) bool {
+		end := from + w
+		if end > len(in) {
+			end = len(in)
+		}
+		var sum float64
+		for _, v := range in[from:end] {
+			sum += float64(v) * float64(v)
+		}
+		return math.Sqrt(sum/float64(end-from)) > float64(th)
+	}
+
+	start := 0
+	for start+w <= len(in) && !loud(start) {
+		start += w
+	}
+	end := len(in)
+	for end-w >= start && !loud(end-w) {
+		end -= w
+	}
+
+	// 留一点余量，避免把字头的辅音或句尾的尾音削掉
+	start -= rate * 40 / 1000
+	end += rate * 80 / 1000
+	if start < 0 {
+		start = 0
+	}
+	if end > len(in) {
+		end = len(in)
+	}
+	if start >= end {
+		return in
+	}
+	return append([]float32(nil), in[start:end]...)
+}
+
 // WriteWAV 把 float32 单声道写成 PCM16 WAV（一次性验证用，不进运行时）。
 func WriteWAV(path string, samples []float32, rate int) error {
 	buf := make([]byte, 44+len(samples)*2)

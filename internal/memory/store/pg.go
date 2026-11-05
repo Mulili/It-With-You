@@ -170,11 +170,14 @@ func (s *PgStore) Search(personaID string, vec []float32, limit int) ([]memory.M
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("遍历检索结果失败: %w", err)
 	}
-	// 排序看"相似度 + importance"，但 Score 本身保持原始相似度——
-	// 门槛（recallMinScore）比的是原始值，不能被重要性加成带过去。
+	// 排序看"相似度 + importance + 时间档位"，但 Score 本身保持原始相似度——
+	// 门槛（recallMinScore）比的是原始值，不能被这些加成带过去。
+	now := timeutil.NowMillis()
 	sort.SliceStable(out, func(i, j int) bool {
-		return memory.RankScore(out[i].Score, out[i].Memory.Importance) >
-			memory.RankScore(out[j].Score, out[j].Memory.Importance)
+		return memory.RankScoreAt(out[i].Score, out[i].Memory.Importance,
+			memory.RecencyLevel(out[i].Memory.CreatedAt, now)) >
+			memory.RankScoreAt(out[j].Score, out[j].Memory.Importance,
+				memory.RecencyLevel(out[j].Memory.CreatedAt, now))
 	})
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
@@ -220,6 +223,13 @@ func (s *PgStore) SearchChunks(personaID string, vec []float32, limit int) ([]me
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("遍历片索引失败: %w", err)
 	}
+	// 往事没有 importance：同分时新事排前面，太旧的往事靠后。
+	// 与 Search 同一姿态——Score 保持原始相似度，门槛那层不受影响。
+	now := timeutil.NowMillis()
+	sort.SliceStable(out, func(i, j int) bool {
+		return memory.RankScoreAt(out[i].Score, 3, memory.RecencyLevel(out[i].Chunk.CreatedAt, now)) >
+			memory.RankScoreAt(out[j].Score, 3, memory.RecencyLevel(out[j].Chunk.CreatedAt, now))
+	})
 	return out, nil
 }
 

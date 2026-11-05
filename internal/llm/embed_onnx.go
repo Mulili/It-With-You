@@ -26,6 +26,7 @@ import (
 	"sync"
 
 	"agent-for-you-love/internal/llm/tokenizer"
+	"agent-for-you-love/internal/onnxrt"
 
 	ort "github.com/yalue/onnxruntime_go"
 )
@@ -84,43 +85,14 @@ type ONNXEmbedder struct {
 
 // ---------- 进程级运行时初始化 ----------
 
-var (
-	runtimeMu     sync.Mutex
-	runtimeInited bool
-	runtimeErr    error
-)
+// 运行时初始化收在 internal/onnxrt：TTS 与嵌入共用同一份 ONNX Runtime，而
+// InitializeEnvironment / SetSharedLibraryPath 都是进程级、只能生效一次的。
+// 留这两个薄转发，是为了让本包其余代码与既有调用点不用改。
 
-// ensureRuntime 初始化 ONNX Runtime。
-//
-// 它是**进程级、只能初始化一次**的（binding 的 InitializeEnvironment 管的是全局环境），
-// 所以这里用包级状态兜住，而不是放在 ONNXEmbedder 上——否则测试里建第二个实例就会炸。
-//
-// ⚠️ SetSharedLibraryPath 同样是全局的：**第一个**成功的路径生效。
-// 本项目只需要一个嵌入后端，所以这不是问题；真需要换 dll 只能重启进程。
-func ensureRuntime(runtimePath string) error {
-	runtimeMu.Lock()
-	defer runtimeMu.Unlock()
-	if runtimeInited {
-		return runtimeErr
-	}
-	if !ort.IsInitialized() {
-		ort.SetSharedLibraryPath(runtimePath)
-		runtimeErr = ort.InitializeEnvironment()
-	}
-	runtimeInited = true
-	return runtimeErr
-}
+func ensureRuntime(runtimePath string) error { return onnxrt.Ensure(runtimePath) }
 
 // ONNXRuntimeVersion 返回已加载的 onnxruntime 版本（启动日志用）。
-//
-// binding 把 C API 头固定在某个版本上，**必须与 dll 对齐**，而版本不匹配的症状是
-// 加载期一句很难懂的报错。所以启动时把实际版本打出来，出问题时一眼能对上。
-func ONNXRuntimeVersion() string {
-	if !ort.IsInitialized() {
-		return ""
-	}
-	return ort.GetVersion()
-}
+func ONNXRuntimeVersion() string { return onnxrt.Version() }
 
 // ---------- 三件套的定位 ----------
 

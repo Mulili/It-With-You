@@ -48,6 +48,25 @@ func TestResampleAntiAliases(t *testing.T) {
 	}
 }
 
+func TestTrimSilence(t *testing.T) {
+	const rate = 32000
+	// 0.3s 静音 + 0.2s 正弦 + 0.5s 静音
+	in := make([]float32, 0, rate)
+	in = append(in, make([]float32, rate*3/10)...)
+	in = append(in, sine(440, rate, rate/5)...)
+	in = append(in, make([]float32, rate*5/10)...)
+
+	out := TrimSilence(in, rate)
+	got := float64(len(out)) / rate
+	// 期望 ≈ 0.2s 主体 + 40ms 头 + 80ms 尾 = 0.32s，允许 ±0.1s
+	if got < 0.22 || got > 0.42 {
+		t.Errorf("裁剪后 %.3fs，期望 ≈0.32s", got)
+	}
+	if len(out) > len(in) {
+		t.Error("裁剪不应变长")
+	}
+}
+
 func TestResampleSameRateCopies(t *testing.T) {
 	in := []float32{0.1, -0.2, 0.3}
 	out, err := Resample(in, 16000, 16000)

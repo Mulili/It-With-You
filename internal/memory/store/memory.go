@@ -143,10 +143,12 @@ func (s *MemoryStore) Search(personaID string, vec []float32, limit int) ([]memo
 		// 相似度用与 PG 的 <=> 同一个口径（余弦），否则同一条断言在两种实现下会得出不同结论
 		hits = append(hits, memory.MemoryHit{Memory: e.m, Score: cosine(vec, e.vec)})
 	}
-	// 排序看"相似度 + importance"，但 Score 本身保持原始相似度——
-	// 门槛（recallMinScore）比的是原始值，不能被重要性加成带过去。
+	// 排序看"相似度 + importance + 时间档位"，但 Score 本身保持原始相似度——
+	// 门槛（recallMinScore）比的是原始值，不能被这些加成带过去。
+	now := timeutil.NowMillis()
 	sortHits(hits, func(h memory.MemoryHit) float64 {
-		return memory.RankScore(h.Score, h.Memory.Importance)
+		return memory.RankScoreAt(h.Score, h.Memory.Importance,
+			memory.RecencyLevel(h.Memory.CreatedAt, now))
 	})
 	return trimHits(hits, limit), nil
 }
@@ -167,7 +169,11 @@ func (s *MemoryStore) SearchChunks(personaID string, vec []float32, limit int) (
 		// 丢掉她就会在"你上次说的那件事"面前哑口无言。重复提改用弱化措辞解决。
 		hits = append(hits, memory.ChunkHit{Chunk: e.ci, Score: cosine(vec, e.vec)})
 	}
-	sortHits(hits, func(h memory.ChunkHit) float64 { return h.Score })
+	// 往事没有 importance，只看"相似度 + 时间档位"：太旧的往事在同分时排后面
+	now := timeutil.NowMillis()
+	sortHits(hits, func(h memory.ChunkHit) float64 {
+		return memory.RankScoreAt(h.Score, 3, memory.RecencyLevel(h.Chunk.CreatedAt, now))
+	})
 	return trimHits(hits, limit), nil
 }
 
