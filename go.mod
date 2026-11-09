@@ -7,6 +7,7 @@ require (
 	github.com/free-llms-foundation/retrieval-go v0.0.0-20260916210821-e2897ee5bfcf
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/mozillazg/go-pinyin v0.21.0
 	github.com/rivo/uniseg v0.4.7
 	github.com/wailsapp/wails/v2 v2.16.0
 	github.com/yalue/onnxruntime_go v1.36.0

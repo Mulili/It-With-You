@@ -248,7 +248,10 @@ func (e *Engine) Synthesize(ctx context.Context, ref *RefFeatures, phones []stri
 		return nil, fmt.Errorf("vits 失败：%w", err)
 	}
 	defer destroyValues(vOut)
-	return append([]float32(nil), vOut[0].(*ort.Tensor[float32]).GetData()...), nil
+	audio := append([]float32(nil), vOut[0].(*ort.Tensor[float32]).GetData()...)
+	// 句首/句尾的静音由模型自由发挥，逐句拼接时会叠成"停顿两秒"；这里削掉，
+	// 句间停顿交给播放端（统一 50ms 起排）。
+	return TrimSilence(audio, e.voice.SampleRate), nil
 }
 
 func (e *Engine) runHuBERT(audio []float32) (*ort.Tensor[float32], error) {

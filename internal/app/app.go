@@ -154,6 +154,11 @@ type App struct {
 	// 而"算"这件事只有 buildMessages 会做（只有它知道发出去的是什么）。
 	// 存在这里，前端重开窗口时也能立刻拿到上一次的样子，不必重算。
 	lastCtxStat ui.ContextStat
+
+	// speech 把流式正文变成语音推给前端（见 app_tts.go）。
+	//
+	// 懒加载：引擎要读 ~450MB 模型，不能挡在启动路径上；加载失败只停语音，对话照常。
+	speech *speech
 }
 
 // nextID 返回进程内自增的轮次编号。
@@ -176,6 +181,17 @@ func (a *App) emit(name string, payload any) {
 		return
 	}
 	runtime.EventsEmit(a.ctx, name, payload)
+}
+
+// emitChunk 推一段正文，并同时喂给语音队列。
+//
+// 两件事绑在一起：漏掉任何一处都会让"界面有字、但没有声音"（或反过来），
+// 而那种不一致很难定位到是这里。
+func (a *App) emitChunk(id, delta string) {
+	a.emit(ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: delta})
+	if a.speech != nil {
+		a.speech.Feed(id, delta)
+	}
 }
 
 // NewApp 组装应用。
@@ -221,6 +237,7 @@ func NewApp(provider llm.Provider, personas persona.Store, hist history.Store,
 	// 把 ensure 挂在 Searcher 上（而不是让上层记得先调），见 Searcher.ensure 的说明。
 	a.searchService = web.NewService(a.searchExePath, a.searchURLOrDefault)
 	a.tools = tool.Builtins(web.NewSearcher(a.searchURLOrDefault, a.ensureSearchService), web.NewReader(), a.searchEnabled)
+	a.speech = newSpeech(a)
 	return a
 }
 
@@ -336,6 +353,12 @@ func (a *App) Startup(ctx context.Context) {
 	// 放后台跑，不拖慢启动——结算一次要几秒，而它跟"能不能开始聊"没有关系。
 	go a.settlePending()
 
+	// 语音引擎也在后台预热：加载七条会话要十几秒，等用户说完第一句才开始就太晚了。
+	// 失败只记一条日志（见 app_tts.engine），对话照常。
+	if a.speech != nil {
+		go a.speech.engine()
+	}
+
 	// 顺手清一次过期的「她学到的」：应用关着的那段时间没有结算，候选不会自己过期。
 	// 也放后台：它是维护动作，与"能不能开始聊"同样无关。
 	go a.pruneStaleCandidates()
@@ -416,6 +439,10 @@ func (a *App) Ask(text string) (string, error) {
 		a.prevCancel() // 掐掉上一轮，保证同时只有一个流
 	}
 	a.prevCancel = cancel
+	// 上一轮的语音也要立刻闭嘴：新问题意味着用户不想再听旧的
+	if a.speech != nil {
+		a.speech.Stop()
+	}
 	// 这一轮归属"当前人格"：历史按人格隔离，回复也要写回它所属的那一份
 	personaID := a.activePersonaID()
 	// 轮次 ID：前端据此过滤片段，与落库的消息 ID 无关
@@ -510,6 +537,9 @@ func (a *App) Cancel() {
 	a.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if a.speech != nil {
+		a.speech.Stop()
 	}
 }
 
@@ -704,6 +734,9 @@ func (a *App) stream(ctx context.Context, id, sessionID, chunkID, personaID stri
 			// 走到这里说明请求还没发出去（缺 Key、网络不通、4xx）。
 			// 历史里保留用户这句，方便重试
 			a.emit(ui.EventChatError, ui.ChatErrorPayload{ID: id, Message: err.Error()})
+			if a.speech != nil {
+				a.speech.Stop()
+			}
 			return
 		}
 		if canceled {
@@ -711,6 +744,9 @@ func (a *App) stream(ctx context.Context, id, sessionID, chunkID, personaID stri
 			// 已收到的半截内容照样进历史，但标成 canceled：菜单要能把它和正常回复区分开。
 			body, _ := stripRecallUsage(answer.String() + content)
 			a.appendAssistant(sessionID, chunkID, personaID, body, ui.StatusCanceled)
+			if a.speech != nil {
+				a.speech.Stop()
+			}
 			return
 		}
 
@@ -718,7 +754,7 @@ func (a *App) stream(ctx context.Context, id, sessionID, chunkID, personaID stri
 		// 这里补的那一个字符也要推给前端，否则界面里看到的东西与落库的不一致
 		if answer.Len() > 0 && content != "" {
 			answer.WriteString("\n")
-			a.emit(ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: "\n"})
+			a.emitChunk(id, "\n")
 		}
 		answer.WriteString(content)
 
@@ -755,6 +791,10 @@ func (a *App) stream(ctx context.Context, id, sessionID, chunkID, personaID stri
 	body, used := stripRecallUsage(answer.String())
 	a.appendAssistant(sessionID, chunkID, personaID, body, ui.StatusOK)
 	a.emit(ui.EventChatDone, ui.ChatDonePayload{ID: id})
+	// 正文结束：把最后那句没等到标点的尾巴也送去合成
+	if a.speech != nil {
+		a.speech.Done(id)
+	}
 
 	// 计数归口：只给她**真的用到了**的那些 +1（见 markUsed）。
 	// 放在这里而不是 recall 里，是因为只有读完整段回复才知道她到底用到了哪几条。
@@ -810,7 +850,7 @@ func (a *App) streamRound(ctx context.Context, id string, msgs []llm.Message, op
 		// 这一块里认不出来。尾巴留着，等下一块拼齐再决定——否则它会在界面上闪一下。
 		if s := pending.String(); true {
 			if n := safePrefixLen(s); n > 0 {
-				a.emit(ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: s[:n]})
+				a.emitChunk(id, s[:n])
 				pending.Reset()
 				pending.WriteString(s[n:])
 			}
@@ -821,9 +861,9 @@ func (a *App) streamRound(ctx context.Context, id string, msgs []llm.Message, op
 	// 不带 tool_calls——万一是被截断的，拼出来的参数也不是合法的调用
 	if s := pending.String(); s != "" {
 		if i := strings.Index(s, recallUsageOpen); i < 0 {
-			a.emit(ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: s})
+			a.emitChunk(id, s)
 		} else if i > 0 {
-			a.emit(ui.EventChatChunk, ui.ChatChunkPayload{ID: id, Delta: s[:i]})
+			a.emitChunk(id, s[:i])
 		}
 	}
 	return full.String(), nil, "", false, nil

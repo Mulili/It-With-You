@@ -33,7 +33,29 @@ const (
 	// 界面就只是停在半截回复上——用户会以为卡死了，然后去点停止。
 	// 零延迟的工具**不发**这个事件（见 app.announceTool）：发了只会让提示闪一下。
 	EventToolRunning = "tool:running"
+
+	// EventTTSAudio 是一句合成好的语音（负载 ui.TTSAudioPayload）。
+	//
+	// 为什么把 PCM 推给前端而不是后端播放：这是 Wails 应用，前端就是 WebView，
+	// 用 Web Audio 播放少一个 cgo 依赖，打断就是前端 stop，而且阶段6 的口型/字幕
+	// 本来就在前端做（方案 §8 的取舍）。
+	EventTTSAudio = "tts:audio"
+
+	// EventTTSStop 要求前端立刻停下并清空队列（新问题、点停止、切人格）。
+	EventTTSStop = "tts:stop"
 )
+
+// TTSAudioPayload 是一句语音。
+//
+// PCM 是 base64 编码的 **PCM16 单声道小端**：JSON 事件只能传文本，float32 再 base64
+// 体积会翻倍，而 32k/16bit 对语音足够。
+type TTSAudioPayload struct {
+	ID   string `json:"id"`
+	Seq  int    `json:"seq"`
+	Rate int    `json:"rate"`
+	PCM  string `json:"pcm"`
+	Text string `json:"text"`
+}
 
 // SayPayload 是 EventSay 事件的负载。
 type SayPayload struct {

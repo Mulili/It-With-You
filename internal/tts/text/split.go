@@ -49,7 +49,18 @@ func (s *Splitter) Split(text string) []string {
 			continue
 		}
 		if !allPunct([]rune(block)[0]) {
-			buf.WriteString(block)
+			// 一整块**自身**就超长（代码、无标点的长串）时按上限硬切；
+			// 普通中文（逗号很多）不在这里切——否则会把词劈开，正是"吞字断句怪"的来源。
+			blockEff := 0
+			for _, r := range block {
+				buf.WriteRune(r)
+				blockEff += runeLen(r)
+				if s.MaxLen > 0 && blockEff >= s.MaxLen {
+					sentences = append(sentences, strings.TrimSpace(buf.String()))
+					buf.Reset()
+					blockEff = 0
+				}
+			}
 			continue
 		}
 
@@ -108,13 +119,16 @@ func effectiveLen(s string) int {
 		if allPunct(r) {
 			continue
 		}
-		if r < 128 {
-			n++
-		} else {
-			n += 2
-		}
+		n += runeLen(r)
 	}
 	return n
+}
+
+func runeLen(r rune) int {
+	if r < 128 {
+		return 1
+	}
+	return 2
 }
 
 func blockHasEnd(block string) bool {

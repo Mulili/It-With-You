@@ -40,19 +40,82 @@ func (f *Frontend) syllables(text string) []syllable {
 		}
 		if n, py := f.matchWord(rs, i); n > 0 {
 			for k := 0; k < n; k++ {
-				out = append(out, syllable{ch: rs[i+k], py: py[k]})
+				out = append(out, syllable{ch: rs[i+k], py: withNeutralTone(py[k])})
 			}
 			i += n
 			continue
 		}
-		out = append(out, syllable{ch: r, py: f.charPinyin(r)})
+		out = append(out, syllable{ch: r, py: withNeutralTone(f.charPinyin(r))})
 		i++
 	}
 	applySandhi(out)
+	applyThreeSandhi(out)
 	return out
 }
 
+// applyThreeSandhi 做三声连读变调：同一段连续的三声里，只有最后一个读三声，其余读二声。
+//
+// 这里**没有分词**，所以是"按连续区间"而不是"按词"：好/喜欢 这种跨词边界的组合会被
+// 一并变调。听感上差别很小（普通话的连读本来就会跨词），而换 jieba 进来要多背一个
+// 词典与词性标注，收益不成比例。标点会打断区间，所以跨句不会串。
+func applyThreeSandhi(syls []syllable) {
+	for i := 0; i < len(syls); {
+		if !isHan(syls[i].ch) || toneOf(syls[i].py) != '3' {
+			i++
+			continue
+		}
+		j := i
+		for j < len(syls) && isHan(syls[j].ch) && toneOf(syls[j].py) == '3' {
+			j++
+		}
+		if j-i >= 2 {
+			for k := i; k < j-1; k++ {
+				syls[k].py = withTone(syls[k].py, '2')
+			}
+		}
+		i = j
+	}
+}
+
+func withTone(py string, tone byte) string {
+	if py == "" {
+		return py
+	}
+	return py[:len(py)-1] + string(tone)
+}
+
+// withNeutralTone 给**没有声调数字**的拼音补上 5（轻声）。
+//
+// go-pinyin 对"的/了/着/吗"这类字返回的是 "de"、"le"——不带调号。而音素表里只有
+// "e5"（轻声）没有 "e"，不补这一步整字的拼音会被 splitPhone 判成"没有声调"直接丢掉，
+// 表现出来的就是**"的""了"全被吞了**（这是实测踩到的坑，不是理论问题）。
+// pypinyin 的 neutral_tone_with_five=True 就是同一个约定。
+func withNeutralTone(py string) string {
+	if py == "" {
+		return py
+	}
+	c := py[len(py)-1]
+	if c >= '1' && c <= '5' {
+		return py
+	}
+	return py + "5"
+}
+
+// interjectionPinyin 是语气词的读音补丁。
+//
+// go-pinyin 对"嗯"给的是 "n2"、"呣"给的是 "m2"——opencpop 里没有 n / m 这两个音节，
+// 结果整字被 splitPhone 丢掉，表现出来就是"嗯。"只剩一个句号、合成出来 40 毫秒。
+// 这两个音就近映射到 en / mu（听感最接近，且两音节都在表里），声调交给
+// withNeutralTone 补成轻声 5。
+var interjectionPinyin = map[rune]string{
+	'嗯': "en",
+	'呣': "mu",
+}
+
 func (f *Frontend) charPinyin(r rune) string {
+	if py, ok := interjectionPinyin[r]; ok {
+		return py
+	}
 	res := pinyin.Pinyin(string(r), f.pyArgs)
 	if len(res) == 0 || len(res[0]) == 0 || strings.TrimSpace(res[0][0]) == "" {
 		return string(r)

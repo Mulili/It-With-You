@@ -21,13 +21,13 @@ GENIE 导出的 ONNX 是「**fp32 的图 + fp16 的权重**」：
 
 用法示例
 --------
-  python models/_tools/prep_tts_onnx.py inspect
-  python models/_tools/prep_tts_onnx.py fp32   --only t2s_encoder
-  python models/_tools/prep_tts_onnx.py fp32
-  python models/_tools/prep_tts_onnx.py int8   --only t2s_encoder
-  python models/_tools/prep_tts_onnx.py verify
+  python _tools/prep_tts_onnx.py inspect
+  python _tools/prep_tts_onnx.py fp32   --only t2s_encoder
+  python _tools/prep_tts_onnx.py fp32
+  python _tools/prep_tts_onnx.py int8   --only t2s_encoder
+  python _tools/prep_tts_onnx.py verify
 
-⚠️ 目录 `models/` 整个被 .gitignore 忽略，本工具不会进仓库；产物同理。
+⚠️ 本工具在 `_tools/`，纳入版本库；只有 `models/`（第三方数据与产物）被 .gitignore 忽略。
 """
 
 import argparse
@@ -40,14 +40,14 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MODELS = os.path.join(ROOT, "models")
 
 # 需要处理的两组模型
-#   1) 单个角色的 TTS 四件套 + vits（CharacterModels/v2ProPlus/<name>/tts_models）
-#   2) 音色准备用的 chinese-hubert-base（每角色一次预计算，运行时不加载）
-TTS_DIR = os.path.join(MODELS, "CharacterModels", "v2ProPlus")
-HUBERT_DIR = os.path.join(MODELS, "GenieData", "chinese-hubert-base")
+#   1) 单个角色的 TTS 四件套 + vits（models/voices/<音色>/tts）
+#   2) 音色准备用的 chinese-hubert-base（models/shared/hubert，每角色一次预计算，运行时不加载）
+TTS_DIR = os.path.join(MODELS, "voices")
+HUBERT_DIR = os.path.join(MODELS, "shared", "hubert")
 
 
 # ---------- 基础 ----------
@@ -144,7 +144,7 @@ def _file_scales(model, base_dir):
 def collect_models():
     """返回 [(label, onnx_path, ...)]。"""
     out = []
-    for d in sorted(glob.glob(os.path.join(TTS_DIR, "*", "tts_models"))):
+    for d in sorted(glob.glob(os.path.join(TTS_DIR, "*", "tts"))):
         name = os.path.basename(os.path.dirname(d))
         for p in sorted(glob.glob(os.path.join(d, "*.onnx"))):
             out.append((name + "/" + os.path.basename(p)[:-5], p))

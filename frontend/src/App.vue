@@ -25,6 +25,8 @@ const EVENT_PERSONA_CHANGED = 'persona:changed'
 const EVENT_WINDOW_HIDDEN = 'window:hidden'
 const EVENT_CONTEXT = 'context:stat'
 const EVENT_TOOL_RUNNING = 'tool:running'
+const EVENT_TTS_AUDIO = 'tts:audio'
+const EVENT_TTS_STOP = 'tts:stop'
 
 const bubbleText = ref('')
 // toolNotice 是"她正在上网查…"这类耗时提示（后端在调用慢工具前推一条）。
@@ -73,6 +75,19 @@ const settings = ref({
 })
 // 导出哪个人格；空串 = 用当前生效的那个
 const exportId = ref('')
+
+// 气泡停留秒数：纯前端偏好（localStorage），不占应用设置。
+// 回复播完后气泡再停这么久，用户点一下气泡可以立刻收起。
+const bubbleSeconds = ref(readBubbleSeconds())
+function readBubbleSeconds() {
+  const n = Number(localStorage.getItem('bubbleSeconds') || 15)
+  return Number.isFinite(n) ? Math.min(120, Math.max(3, n)) : 15
+}
+function saveBubbleSeconds() {
+  const n = Math.min(120, Math.max(3, Math.round(Number(bubbleSeconds.value) || 15)))
+  bubbleSeconds.value = n
+  localStorage.setItem('bubbleSeconds', String(n))
+}
 
 // ---------- 上下文占用（窗口顶部那条状态条）----------
 //
@@ -935,11 +950,73 @@ watch(busy, (running) => {
   if (!running) focusInput()
 })
 
+// ---------- 语音播放 ----------
+//
+// 后端把每句 PCM16 推过来，这里用 Web Audio 排队播放。
+// 为什么不用 <audio>：它吃不掉原始 PCM，而打断需要精确 stop（见方案 §8 的取舍）。
+let audioCtx = null
+let ttsEndAt = 0
+const ttsSources = new Set()
+
+function ensureAudioCtx() {
+  if (!audioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext
+    if (!Ctx) return null
+    audioCtx = new Ctx()
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume()
+  return audioCtx
+}
+
+function base64ToInt16(b64) {
+  const bin = atob(b64)
+  const out = new Int16Array(bin.length >> 1)
+  for (let i = 0; i < out.length; i++) {
+    let v = bin.charCodeAt(i * 2) | (bin.charCodeAt(i * 2 + 1) << 8)
+    if (v >= 0x8000) v -= 0x10000
+    out[i] = v
+  }
+  return out
+}
+
+function onTTSAudio(p) {
+  if (!p || !p.pcm || !p.rate) return
+  const ctx = ensureAudioCtx()
+  if (!ctx) return
+  const pcm = base64ToInt16(p.pcm)
+  if (!pcm.length) return
+
+  const buf = ctx.createBuffer(1, pcm.length, p.rate)
+  const ch = buf.getChannelData(0)
+  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768
+
+  const src = ctx.createBufferSource()
+  src.buffer = buf
+  src.connect(ctx.destination)
+  const now = ctx.currentTime
+  if (ttsEndAt < now + 0.05) ttsEndAt = now + 0.05
+  src.start(ttsEndAt)
+  ttsEndAt += buf.duration
+
+  ttsSources.add(src)
+  src.onended = () => ttsSources.delete(src)
+}
+
+function stopTTS() {
+  ttsSources.forEach((s) => { try { s.stop() } catch (_) {} })
+  ttsSources.clear()
+  ttsEndAt = 0
+}
+
 async function send() {
   const text = draft.value.trim()
   // dbReady 这一道是防御：阻断层已经盖住了输入区，但回车键仍可能走到这里
   if (!text || busy.value || blocked.value) return
 
+  stopTTS()
+  // 在这里创建/唤醒 AudioContext：send() 是用户手势触发的，浏览器才允许出声。
+  // 等到 tts:audio 事件里再创建，某些 WebView 会以 "autoplay blocked" 静音。
+  ensureAudioCtx()
   draft.value = ''
   bubbleText.value = ''
   toolNotice.value = ''
@@ -956,6 +1033,7 @@ async function send() {
 
 function stop() {
   Cancel()
+  stopTTS()
   toolNotice.value = ''
   busy.value = false
 }
@@ -1015,6 +1093,8 @@ onMounted(async () => {
   EventsOn(EVENT_WINDOW_HIDDEN, onWindowHidden)
   EventsOn(EVENT_CONTEXT, onContextStat)
   EventsOn(EVENT_TOOL_RUNNING, onToolRunning)
+  EventsOn(EVENT_TTS_AUDIO, onTTSAudio)
+  EventsOn(EVENT_TTS_STOP, stopTTS)
 
   // 先把存储状态问出来，再决定说什么。
   // 顺序不能反：数据库没就绪时该立刻进阻断态，而不是等用户点开菜单才知道
@@ -1041,6 +1121,8 @@ onUnmounted(() => {
   EventsOff(EVENT_WINDOW_HIDDEN)
   EventsOff(EVENT_CONTEXT)
   EventsOff(EVENT_TOOL_RUNNING)
+  EventsOff(EVENT_TTS_AUDIO)
+  EventsOff(EVENT_TTS_STOP)
   clearTimeout(toastTimer)
 })
 </script>
@@ -1091,7 +1173,7 @@ onUnmounted(() => {
 
     <main class="stage">
       <!-- 流式期间 duration=0，避免气泡在长回复中途自动收起 -->
-      <Bubble :text="bubbleText" :duration="busy ? 0 : 8000" />
+      <Bubble :text="bubbleText" :duration="busy ? 0 : bubbleSeconds * 1000" />
       <!-- 耗时工具的提示（"正在上网查…"）：搜索要几秒、读一页更久，
            不提示的话气泡一直空着，看着像卡死了 -->
       <p v-if="toolNotice" class="toolnotice">{{ toolNotice }}</p>
@@ -1552,6 +1634,24 @@ onUnmounted(() => {
             <p class="pane__note">
               只影响对话本身；「记住我的要求」那条链路仍然会用思考，它靠的是准确性。
             </p>
+
+            <div class="rules__head"><span>气泡停留</span></div>
+            <p class="pane__note">
+              她说完一句话后，气泡继续停留多少秒（3–120）。离开输入框时生效并记住；
+              想提前收起，点一下气泡就行。
+            </p>
+            <div class="ops">
+              <input
+                class="input"
+                type="number"
+                min="3"
+                max="120"
+                step="1"
+                v-model.number="bubbleSeconds"
+                @change="saveBubbleSeconds"
+              />
+              <span class="pane__note">秒</span>
+            </div>
 
             <div class="rules__head"><span>联网</span></div>
             <p class="pane__note">

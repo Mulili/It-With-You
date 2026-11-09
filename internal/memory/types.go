@@ -59,7 +59,7 @@ func RankScore(similarity float64, importance int) float64 {
 //
 // ⚠️ 它**只影响排序**，与 ImportanceWeight 同一姿态：门槛（recallMinScore）
 // 仍然比原始相似度，否则"三天内但并不相关"的往事会越过阈值被硬塞进上下文。
-const TimeWeight = 0.02
+const TimeWeight = 0.03
 
 // RecencyLevel 把"多久以前"折成档位：3 天内 5、3~7 天 3、一周以上 2。
 //
