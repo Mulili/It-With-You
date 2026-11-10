@@ -3,7 +3,7 @@ import petImg from './assets/pet.png'
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import Bubble from './components/Bubble.vue'
 import {
-  Ask, Cancel, Say, HideWindow, Quit, History, SessionMessages, Memories, DeleteMemory, SetMenuOpen,
+  Ask, Cancel, HideWindow, Quit, History, SessionMessages, Memories, DeleteMemory, SetMenuOpen,
   GetPersonaSnapshot, SetActivePersona, GetPersonaRules, GetPersonaChanges, GetPersonaMeta,
   CreatePersona, RenamePersona, DeletePersona, SaveSeedText,
   SaveRule, DeleteRule, SetRuleEnabled, ArchiveRule, ReviveRule,
@@ -37,6 +37,7 @@ const toolNotice = ref('')
 const draft = ref('')
 const busy = ref(false)   // 是否正在流式回复
 const streamId = ref('')  // 当前这一轮的 ID，用来过滤掉上一轮的残留片段
+let chunkedId = ''        // 已经吐过正文的那一轮：用来让第一段正文顶替掉气泡里原有的文字
 const inputEl = ref(null) // 输入框，用来在发送后把焦点还回去
 
 const menuOpen = ref(false)
@@ -1009,16 +1010,22 @@ function stopTTS() {
 }
 
 async function send() {
-  const text = draft.value.trim()
+  await sendText(draft.value.trim())
+}
+
+// sendText 是发送的底层：接受一段明确的文本，供"摸头"这类不由输入框触发的对话复用。
+// keepBubble=true 时不清空气泡——摸头要让人先看见"你摸了一下她的头"，
+// 等助手的第一段正文到达时再由 onChunk 顶替掉。
+async function sendText(text, keepBubble = false) {
   // dbReady 这一道是防御：阻断层已经盖住了输入区，但回车键仍可能走到这里
   if (!text || busy.value || blocked.value) return
 
   stopTTS()
-  // 在这里创建/唤醒 AudioContext：send() 是用户手势触发的，浏览器才允许出声。
+  // 在这里创建/唤醒 AudioContext：sendText 由用户手势触发，浏览器才允许出声。
   // 等到 tts:audio 事件里再创建，某些 WebView 会以 "autoplay blocked" 静音。
   ensureAudioCtx()
   draft.value = ''
-  bubbleText.value = ''
+  if (!keepBubble) bubbleText.value = ''
   toolNotice.value = ''
   busy.value = true
   focusInput()
@@ -1045,15 +1052,16 @@ function onEnter(e) {
   send()
 }
 
-// 桌宠按钮：输入框里有草稿就当作发送，空着就退回阶段1 的 Say()。
-// 保留 Say() 这条通路是有意的——它不依赖模型，key 没配好时也能确认气泡链路活着。
+// 桌宠按钮：有草稿时仍当作发送（保留原有手感）；空着时就是"摸头"——
+// 气泡先给一句动作描述，再把同一个动作作为一句话发给模型，让她自己回应。
 function onPetClick() {
   if (busy.value) return
   if (draft.value.trim()) {
     send()
     return
   }
-  Say('我是Lapwing,你过得还好吗')
+  say('你摸了一下她的头')
+  sendText('摸了一下你的头', true)
 }
 
 // 只认当前这一轮的事件：Ask 会掐掉上一轮，但上一轮可能还有片段在路上
@@ -1061,7 +1069,13 @@ function onChunk(p) {
   if (!p || p.id !== streamId.value) return
   // 她开始说话了：那条"正在查…"的提示该让位给正文
   toolNotice.value = ''
-  bubbleText.value += p.delta
+  // 第一段正文顶替气泡里原有的文字（例如摸头时的"你摸了一下她的头"），后续片段再追加
+  if (chunkedId !== p.id) {
+    chunkedId = p.id
+    bubbleText.value = p.delta
+  } else {
+    bubbleText.value += p.delta
+  }
 }
 
 function onDone(p) {
@@ -1177,7 +1191,7 @@ onUnmounted(() => {
       <!-- 耗时工具的提示（"正在上网查…"）：搜索要几秒、读一页更久，
            不提示的话气泡一直空着，看着像卡死了 -->
       <p v-if="toolNotice" class="toolnotice">{{ toolNotice }}</p>
-      <button class="pet" title="点我：有输入就发送，没输入就打个招呼" @click="onPetClick">
+      <button class="pet" title="点我：有输入就发送，没输入就摸摸她的头" @click="onPetClick">
         <img class = "pet__face" :src = "petImg" alt = "" draggable = "false" />
       </button>
     </main>
