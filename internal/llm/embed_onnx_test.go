@@ -382,6 +382,14 @@ func TestLocateInDirDoesNotFallBack(t *testing.T) {
 // 备齐"模型 + 分词器"但目录里没有动态库时，原因必须指明是缺 dll——
 // 否则用户看到的是"这个目录不合格"，会去翻模型文件，而真正缺的是另一个东西。
 func TestLocateInDirReportsMissingRuntime(t *testing.T) {
+	// 把"向上查找"整体堵死：测试目录在 Temp，当前 cwd 向上恰好能命中
+	// 项目根的 build/bin/onnxruntime.dll，会让 dll 候选意外命中、skip 为空。
+	// 这条测试的意图是"模型齐了但 dll 不可用时 skip 信息正确"，
+	// 不应该依赖机器上有没有真 dll。
+	orig := fnUpwardDirs
+	fnUpwardDirs = func() []string { return nil }
+	t.Cleanup(func() { fnUpwardDirs = orig })
+
 	dir := t.TempDir()
 	writeTempFile(t, dir, onnxModelFileName)
 	writeTempFile(t, dir, onnxTokenizerFileName)

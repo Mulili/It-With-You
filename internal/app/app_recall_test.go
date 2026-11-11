@@ -64,6 +64,65 @@ func lastRecalledAt(t *testing.T, s memory.Store, personaID, id string) int64 {
 	return 0
 }
 
+func lastInjectedAt(t *testing.T, s memory.Store, personaID, id string) int64 {
+	t.Helper()
+	list, err := s.List(personaID, 100)
+	if err != nil {
+		t.Fatalf("读记忆列表失败: %v", err)
+	}
+	for _, m := range list {
+		if m.ID == id {
+			return m.LastInjectedAt
+		}
+	}
+	t.Fatalf("列表里找不到 %s", id)
+	return 0
+}
+
+// 冷却：上一轮刚注入过 → 这一轮仍然注入（丢了她会编），但降为弱化措辞，
+// 并且额外提醒"刚刚才提过，这一轮绝对不要再提"。
+func TestRecallCoolsDownRecentlyInjected(t *testing.T) {
+	app, mems, personaID := newRecallApp(t)
+
+	id := seedMemory(t, mems, personaID, "用户有场面试，助手让他过了先通知一声", 0)
+	// 模拟"上一轮刚注入过"。正常由 recall 异步写；这里直接写，
+	// 是为了让这条测试只验证**措辞分组**，不被调度时序影响。
+	if err := mems.MarkInjected([]string{id}); err != nil {
+		t.Fatalf("标记注入失败: %v", err)
+	}
+
+	got := app.recallText(personaID, "", []llm.Message{{Role: llm.RoleUser, Content: "我回来了"}})
+	if !strings.Contains(got, "用户有场面试") {
+		t.Fatalf("冷却期仍应注入（否则她会不知道），实际：\n%s", got)
+	}
+	if !strings.Contains(got, "已经提过了") {
+		t.Errorf("冷却期应当降为弱化措辞，实际：\n%s", got)
+	}
+	if !strings.Contains(got, "刚刚才提过") {
+		t.Errorf("硬窗内应当额外提醒「刚刚才提过」，实际：\n%s", got)
+	}
+}
+
+// fresh 注入要"上发条"：把 last_injected_at 刷成现在。
+//
+// 它是异步写的（不在关键路径上），所以这里轮询等一小会儿；
+// 若这条失败，说明"冷却永远不生效"，那才是更糟的静默错误。
+func TestRecallMarksFreshInjection(t *testing.T) {
+	app, mems, personaID := newRecallApp(t)
+
+	id := seedMemory(t, mems, personaID, "用户有一把 HHKB 键盘", 0)
+	app.recall(personaID, "", []llm.Message{{Role: llm.RoleUser, Content: "我那个键盘到了"}}, "")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if lastInjectedAt(t, mems, personaID, id) > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("fresh 注入后应当记下 last_injected_at，否则冷却永远不会生效")
+}
+
 // 命中就注入。⚠️ 但**注入本身不该动计数**——计数归口在 markUsed，只有她真的用到了才 +1。
 //
 // 理由见 recall 里那段注释：一条被看了十轮、一次都没提的记忆，按"注入就记"会把门槛顶到最高，
@@ -291,7 +350,7 @@ func TestRecallThresholdRisesWithRecallCount(t *testing.T) {
 // 她会答"喜欢"。**编出来的答案比重复提一句有害得多。**
 func TestRecallDowngradesRatherThanForgets(t *testing.T) {
 	app, mems, personaID := newRecallApp(t)
-	seedMemory(t, mems, personaID, "用户有一把 HHKB 键盘", 0)
+	id := seedMemory(t, mems, personaID, "用户有一把 HHKB 键盘", 0)
 	msgs := []llm.Message{{Role: llm.RoleUser, Content: "我那个键盘到了"}}
 
 	const (
@@ -333,24 +392,36 @@ func TestRecallDowngradesRatherThanForgets(t *testing.T) {
 		t.Errorf("反复用到之后应当带上那句标记，实际：\n%s", final)
 	}
 
-	// 换一段对话回到正常档（"上次我们聊过…"是期望行为）
+	// 换一段对话：session 判据会失效，但**时间冷却仍然有效**——
+	// 换个会话不等于"她又忘了自己刚说过"。这里显式写一次注入时刻，
+	// 免得依赖前面那几轮异步写的调度时序。
+	if err := mems.MarkInjected([]string{id}); err != nil {
+		t.Fatalf("标记注入失败: %v", err)
+	}
 	third := app.recallText(personaID, sessionB, msgs)
-	if !strings.Contains(third, "HHKB") || strings.Contains(third, "只当背景资料") {
-		t.Errorf("换一段对话应当回到正常注入，实际：\n%s", third)
+	if !strings.Contains(third, "HHKB") {
+		t.Errorf("换会话后仍须带上内容，实际：\n%s", third)
+	}
+	if !strings.Contains(third, "只当背景资料") {
+		t.Errorf("冷却窗内换会话也要保持降档（这是这次补上的那一半），实际：\n%s", third)
 	}
 }
 
-// 往事那一侧同样：用到过之后降级为极弱措辞，但**内容永不丢弃**。
+// 往事那一侧同样：提到过之后降级为极弱措辞，但**内容永不丢弃**。
 //
 // ⚠️ 包括"本段对话自己的片"——它的摘要并不在上下文里（上下文只发当前片），
 // 丢掉她就会在"你上次说的那件事"面前哑口无言、甚至开始编。
-func TestRecallDowngradesPastConversationInSameSession(t *testing.T) {
+//
+// 两套"提过"的判据要分开验：本段对话里真的用到过（session 判据，换会话就失效），
+// 与注入冷却（绝对时间判据，**跨会话仍然有效**）。后者正是这次补上的那一半。
+func TestRecallDowngradesPastConversationAcrossSessions(t *testing.T) {
 	app, mems, personaID := newRecallApp(t)
 
+	const chunkID = "00000000-0000-0000-0000-0000000000f1"
 	vec := make([]float32, llm.DefaultEmbedDim)
 	vec[0] = 1
 	if err := mems.IndexChunk(memory.ChunkIndex{
-		ChunkID:   "00000000-0000-0000-0000-0000000000f1",
+		ChunkID:   chunkID,
 		SessionID: "00000000-0000-0000-0000-0000000000f2", // 刻意不等于下面两个会话
 		PersonaID: personaID,
 		Summary:   "主题：聊过西瓜味冰棍",
@@ -378,9 +449,17 @@ func TestRecallDowngradesPastConversationInSameSession(t *testing.T) {
 		t.Errorf("用到过之后应当降档，实际：\n%s", second)
 	}
 
+	// 换一段会话：**新规则下不会立刻复活**——冷却按绝对时间算，跨会话也有效。
+	// 这里显式写一次注入时刻，免得依赖第一轮那次异步写的调度时序。
+	if err := mems.MarkChunksInjected([]string{chunkID}); err != nil {
+		t.Fatalf("标记注入失败: %v", err)
+	}
 	third := app.recallText(personaID, sessionB, msgs)
-	if !strings.Contains(third, "西瓜味冰棍") || strings.Contains(third, "只当背景资料") {
-		t.Errorf("换一段对话应当回到正常注入，实际：\n%s", third)
+	if !strings.Contains(third, "西瓜味冰棍") {
+		t.Errorf("换会话后仍须带上往事内容，实际：\n%s", third)
+	}
+	if !strings.Contains(third, "只当背景资料") {
+		t.Errorf("冷却窗内换会话也要保持降档（这是它比 session 判据多出来的那一半），实际：\n%s", third)
 	}
 }
 

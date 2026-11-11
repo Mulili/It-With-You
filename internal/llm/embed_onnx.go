@@ -152,6 +152,38 @@ func onnxRuntimeFileName() string {
 	}
 }
 
+// upwardDirs 从工作目录起逐层向上给出候选目录（含工作目录本身）。
+//
+// 与 TTS 的 locate.go 是同一套约定：dev 模式 exe 在 build/bin 或 Temp，
+// 模型/dll 却在项目根的 models/ 下，只按 exe 同目录找必然落空。
+// 向上找这一下就是为了 dev；发布后工作目录不是项目根，这条候选不会命中，
+// 分发布局仍然靠 exe 同目录那档。
+//
+// maxUpLevels 跟 internal/config 的 MaxSearchUpLevels / tts.locate.go 的 maxUpLevels
+// 取同一个值——三个独立实现各自 copy 一份
+const embedMaxUpLevels = 5
+
+func embedUpwardDirs() []string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, embedMaxUpLevels)
+	for i := 0; i < embedMaxUpLevels; i++ {
+		out = append(out, dir)
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return out
+}
+
+// fnUpwardDirs 包级变量，指向 embedUpwardDirs——测试里可以临时绑成返回空列表，
+// 把"向上查找"这档候选整体堵死，避免真 dll 干扰测试。
+var fnUpwardDirs = embedUpwardDirs
+
 // ONNXFiles 是进程内嵌入需要的三个文件（绝对路径）。
 type ONNXFiles struct {
 	Runtime   string
@@ -179,6 +211,18 @@ func LocateONNXFiles(dirOverride, runtimeOverride string) (ONNXFiles, error) {
 	}
 	if exeDir != "" {
 		dirs = append(dirs, filepath.Join(exeDir, modelsDirName, modelDirName))
+	}
+	// 向上查找两层约定路径：
+	//   1. d/models/<名字>    ——项目根直接放（与 TTS 骨干/音色同一布局）
+	//   2. d/build/bin/models/<名字> ——dev 构建产物目录，dll 和嵌入模型实际在这
+	// dev 模式 exe 在 Temp 或别的地方，模型/dll 却在项目根或 build/bin，
+	// 只按 exe 同目录找会落空；发布后工作目录不是项目根，这两档不会命中，
+	// 分发布局仍靠 exe 同目录那档（与 TTS 的 LocateBackbone/LocateVoice 同一套路）。
+	for _, d := range fnUpwardDirs() {
+		dirs = append(dirs,
+			filepath.Join(d, modelsDirName, modelDirName),
+			filepath.Join(d, "build", "bin", modelsDirName, modelDirName),
+		)
 	}
 	if cache, err := os.UserCacheDir(); err == nil {
 		dirs = append(dirs, filepath.Join(cache, appCacheDirName, modelsDirName, modelDirName))
@@ -219,14 +263,26 @@ func locateInDir(dir, runtimeOverride string) (files ONNXFiles, skip string) {
 		return ONNXFiles{}, "缺少 " + onnxTokenizerFileName
 	}
 
-	// 动态库的三个候选：显式覆盖 → 模型同目录 → exe 同目录。
-	// 放"模型同目录"是为了让"整个 models/<名字>/ 一起拷过去"这种做法也能用。
+	// 动态库候选：显式覆盖 → 模型同目录 → exe 同目录 →
+	//          向上逐层（含 build/bin 约定）。
+	// 放"模型同目录"是为了让"整个 models/<名字>/ 一起拷过去"这种做法也能用；
+	// 向上逐层里除了 d/onnxruntime.dll，还查 d/build/bin/onnxruntime.dll——
+	// 因为 dll 就放在 dev 构建产物目录里，向上查项目根那一层即可命中。
+	// 发布后工作目录不是项目根，向上这档不会命中，分发布局仍靠 exe 同目录那档。
 	exeDir := exeDirOrEmpty()
-	for _, c := range []string{
+	dllCands := make([]string, 0, 3+2*embedMaxUpLevels)
+	dllCands = append(dllCands,
 		strings.TrimSpace(runtimeOverride),
 		filepath.Join(dir, onnxRuntimeFileName()),
 		filepath.Join(exeDir, onnxRuntimeFileName()),
-	} {
+	)
+	for _, d := range fnUpwardDirs() {
+		dllCands = append(dllCands,
+			filepath.Join(d, onnxRuntimeFileName()),
+			filepath.Join(d, "build", "bin", onnxRuntimeFileName()),
+		)
+	}
+	for _, c := range dllCands {
 		if c != "" && fileExists(c) {
 			return ONNXFiles{Runtime: c, Model: model, Tokenizer: tok}, ""
 		}

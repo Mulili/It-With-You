@@ -36,7 +36,9 @@ import (
 //	         （她"提议收起来"那一问的状态：她问、用户点头才降；另外把提升来的规则
 //	          从 manual 里分出来记成 promoted）
 //	v8 → v9：删掉 sessions.summary（从没写过；摘要只存在 session_chunks 这一级）
-const SchemaVersion = 9
+//	v9 → v10：memories / chunk_index 加 last_injected_at（注入冷却：窗口内降为弱化措辞，
+//	          时钟只由 fresh 注入上发条，窗口一过自动解冻）
+const SchemaVersion = 10
 
 // envDSN 是连接串所在的环境变量名。
 const envDSN = "COMPANION_PG_DSN"

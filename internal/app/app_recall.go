@@ -12,6 +12,7 @@ import (
 	"agent-for-you-love/internal/history"
 	"agent-for-you-love/internal/llm"
 	"agent-for-you-love/internal/memory"
+	"agent-for-you-love/internal/pkg/timeutil"
 )
 
 // ---------- 检索注入（第 4 步）----------
@@ -230,21 +231,27 @@ func (a *App) recall(personaID, sessionID string, msgs []llm.Message, excludeChu
 	log.Printf("[recall] 候选最高相似度 事实 %.3f / 往事 %.3f / 归档规则 %.3f；注入 %d 条事实、%d 段往事、%d 条旧做法",
 		memTop, chunkTop, ruleTop, len(mems), len(chunks), len(rules))
 
-	// 再逐条打出候选与去向。上面那行只有分数，**校准不了阈值**——
+	// 逐条打出候选与去向。上面那行只有分数，**校准不了阈值**——
 	// 知道"0.47 被筛掉了"没有用，得知道**那 0.47 是什么内容**：
 	// 是"差一点就该想起来的往事"（说明阈值该降），还是"纯噪声"（说明该升）。
 	//
 	// 门槛那一列里，"提过被挡"是"越提越难注入"这条曲线的**唯一可观测证据**：
 	// 它挡掉了多少、挡在什么分数上，就是校准 recallCountPenalty 的依据。
+	//
+	// "上次注入"那一列是校准 CooldownWindow / CooldownHard 的依据：
+	// 同一个内容隔多久被注入一次、落在 fresh 还是冷档，一眼看得出来。
+	now := timeutil.NowMillis()
 	for _, h := range memHits {
 		th := recallThreshold(h.Memory.LastRecalledSession, h.Memory.RecallCount, sessionID)
-		log.Printf("[recall]   %s 事实 %.3f（门槛 %.2f，本次已提 %d 次）：%s",
-			recallVerdict(h.Score, th), h.Score, th, h.Memory.RecallCount, clip(h.Memory.Content, 40))
+		log.Printf("[recall]   %s 事实 %.3f（门槛 %.2f，本次已提 %d 次，%s）：%s",
+			recallVerdict(h.Score, th), h.Score, th, h.Memory.RecallCount,
+			cooldownLabel(h.Memory.LastInjectedAt, now), clip(h.Memory.Content, 40))
 	}
 	for _, h := range chunkHits {
 		th := recallThreshold(h.Chunk.LastRecalledSession, h.Chunk.RecallCount, sessionID)
-		log.Printf("[recall]   %s 往事 %.3f（门槛 %.2f，本次已提 %d 次）：%s（%s）",
+		log.Printf("[recall]   %s 往事 %.3f（门槛 %.2f，本次已提 %d 次，%s）：%s（%s）",
 			recallVerdict(h.Score, th), h.Score, th, h.Chunk.RecallCount,
+			cooldownLabel(h.Chunk.LastInjectedAt, now),
 			clip(h.Chunk.Summary, 40), relativeDay(h.Chunk.CreatedAt))
 	}
 	// 归档规则这一行也是**校准 recallRuleMinScore 的依据**：它是三条线里唯一
@@ -258,12 +265,18 @@ func (a *App) recall(personaID, sessionID string, msgs []llm.Message, excludeChu
 		return recallResult{}
 	}
 
-	// ⚠️ **这里刻意不记"注入过"。** 计数归口在 markUsed —— 只有她真的在回复里用到了才 +1。
+	text, refs, fresh := formatRecall(mems, chunks, rules, sessionID, now)
+
+	// 注入冷却的"上发条"：只认**这一轮以 fresh 档注入**的那些。
 	//
-	// 为什么：一条记忆被人看了十轮、却一次都没提，按"注入就记"的话计数照样涨到十、
-	// 门槛升到顶——**你以后问起它就再也拿不到了**，尽管它从没造成过任何重复。
-	// 用户的原话是："按照采取次数累加，llm 认为这个记忆应该采取时才累加。"
-	text, refs := formatRecall(mems, chunks, rules, sessionID)
+	// 冷却期内的重复注入**不续期**——这是"节流阀"而不是"永久封杀"的关键：
+	// 只要还在被反复注入就一直是冷档，一旦停下，时间自然流逝，窗口一过就回到 fresh。
+	// 反过来（每轮都刷新时间戳）会让话题在的期间永远解冻不了，等于把她锁死。
+	//
+	// 异步写：文本已经拼好，这一步不在关键路径上；写失败最多让下一轮多 fresh 一次。
+	if len(fresh.MemoryIDs)+len(fresh.ChunkIDs) > 0 {
+		go a.markInjected(fresh)
+	}
 	return recallResult{Text: text, Refs: refs, Facts: len(mems), Chunks: len(chunks), Rules: len(rules)}
 }
 
@@ -328,23 +341,34 @@ type recallResult struct {
 //     这一档不能简单地"不注入"：用户主动问起时她得答得上细节——而那正是最需要它的时刻。
 //   - 归档规则那一段的措辞要多说一句"现在已不再要求"：少了它，她会把"以前的做法"
 //     当成现行要求照做——那等于归档从来没发生过
+//   - **注入冷却**：窗口内（memory.CooldownWindow）再命中的，一律算"刚提过"，
+//     归到弱化措辞那一段；落在更短的硬窗内（memory.CooldownHard）再加一句"这一轮绝对别说"。
+//     冷却**只改措辞，不拦截注入**——丢了她就会在"你上次说的那件事"面前开始编。
 func formatRecall(mems []memory.MemoryHit, chunks []memory.ChunkHit, rules []memory.RuleHit,
-	sessionID string) (string, []recallRef) {
-	// 拆成两组：本段对话里**还没提过**的、和**已经提过一遭**的（后者用弱化措辞）
+	sessionID string, now int64) (string, []recallRef, recallFresh) {
+	// 拆成两组：这一轮**可以主动提**的（fresh）、和**已经提过一遭**的（弱化措辞）。
+	//
+	// "提过"有两个来源，任一成立即算：
+	//   1. 本段对话里她已经真的用到过（last_recalled_session + recall_count）；
+	//   2. 绝对时间上还在冷却窗口内（last_injected_at）——跨会话也有效，
+	//      而且它是会自愈的节流阀：窗口过了自动回到 fresh。
 	var freshMems, saidMems []memory.MemoryHit
+	var fresh recallFresh
 	for _, h := range mems {
-		if sessionID != "" && h.Memory.LastRecalledSession == sessionID && h.Memory.RecallCount > 0 {
+		if h.Memory.SaidBefore(sessionID, now) {
 			saidMems = append(saidMems, h)
 		} else {
 			freshMems = append(freshMems, h)
+			fresh.MemoryIDs = append(fresh.MemoryIDs, h.Memory.ID)
 		}
 	}
 	var freshChunks, saidChunks []memory.ChunkHit
 	for _, h := range chunks {
-		if sessionID != "" && h.Chunk.LastRecalledSession == sessionID && h.Chunk.RecallCount > 0 {
+		if h.Chunk.SaidBefore(sessionID, now) {
 			saidChunks = append(saidChunks, h)
 		} else {
 			freshChunks = append(freshChunks, h)
+			fresh.ChunkIDs = append(fresh.ChunkIDs, h.Chunk.ChunkID)
 		}
 	}
 
@@ -395,12 +419,14 @@ func formatRecall(mems []memory.MemoryHit, chunks []memory.ChunkHit, rules []mem
 		b.WriteString("而且别提「我们之前聊过」。）\n")
 		for _, h := range saidMems {
 			refs = append(refs, recallRef{MemoryID: h.Memory.ID})
-			fmt.Fprintf(&b, "%d. %s%s\n", len(refs), repeatedNote(h.Memory.RecallCount), h.Memory.Content)
+			fmt.Fprintf(&b, "%d. %s%s%s\n", len(refs), repeatedNote(h.Memory.RecallCount),
+				cooldownNote(h.Memory.LastInjectedAt, now), h.Memory.Content)
 		}
 		for _, h := range saidChunks {
 			refs = append(refs, recallRef{ChunkID: h.Chunk.ChunkID})
-			fmt.Fprintf(&b, "%d. %s%s\n", len(refs),
+			fmt.Fprintf(&b, "%d. %s%s%s\n", len(refs),
 				repeatedNote(h.Chunk.RecallCount),
+				cooldownNote(h.Chunk.LastInjectedAt, now),
 				chunkSummaryForRecall(h.Chunk.CreatedAt, h.Chunk.Summary))
 		}
 	}
@@ -415,7 +441,82 @@ func formatRecall(mems []memory.MemoryHit, chunks []memory.ChunkHit, rules []mem
 		b.WriteString("就在回复的最末尾另起一行写：[[used:编号]]，多条用逗号隔开，例如 [[used:1,3]]。\n")
 		b.WriteString("一条都没用到，就完全不要写这一行。）\n")
 	}
-	return strings.TrimRight(b.String(), "\n"), refs
+	return strings.TrimRight(b.String(), "\n"), refs, fresh
+}
+
+// recallFresh 记录这一轮**以 fresh 档注入**的条目 ID。
+//
+// 它只服务注入冷区的"上发条"：只有 fresh 档才刷新 last_injected_at，
+// 冷却期内的重复注入不续期（见 memory.MarkInjected）。
+type recallFresh struct {
+	MemoryIDs []string
+	ChunkIDs  []string
+}
+
+// cooldownNote 给"刚刚才提过"的条目加一句更硬的标记，其余返回空串。
+//
+// 与 repeatedNote 的分工：那个按"提过几次"标，治的是**长期反复**；
+// 这个按"多久前提的"标，治的是**连着两三轮说同一件事**——用户会立刻反感的形态。
+// 两者可以叠加，措辞不冲突（一个说"反复提过"，一个说"刚刚才提过"）。
+func cooldownNote(lastInjectedAt, nowMillis int64) string {
+	if memory.JustInjected(lastInjectedAt, nowMillis) {
+		return "（这条你刚刚才提过，这一轮绝对不要再提）"
+	}
+	return ""
+}
+
+// markInjected 把本轮 fresh 注入过的条目记下来。
+//
+// 异步调用（recall 里 go 出去）：它不在关键路径上，失败只打日志，
+// 最多让下一轮多 fresh 一次，不值得为它拖慢这一轮。
+func (a *App) markInjected(fresh recallFresh) {
+	if a.memories == nil {
+		return
+	}
+	if len(fresh.MemoryIDs) > 0 {
+		if err := a.memories.MarkInjected(fresh.MemoryIDs); err != nil {
+			log.Printf("[recall] 记录记忆注入时刻失败: %v", err)
+		}
+	}
+	if len(fresh.ChunkIDs) > 0 {
+		if err := a.memories.MarkChunksInjected(fresh.ChunkIDs); err != nil {
+			log.Printf("[recall] 记录往事注入时刻失败: %v", err)
+		}
+	}
+}
+
+// cooldownLabel 给检索日志加一列"上次注入是什么时候、落在哪一档"。
+//
+// 它是校准 memory.CooldownWindow / CooldownHard 的**唯一依据**：
+// 只有看到"同一个内容隔多久被注入一次"，才知道窗口该定 30 分钟还是 6 小时。
+func cooldownLabel(lastInjectedAt, nowMillis int64) string {
+	if lastInjectedAt <= 0 {
+		return "从未注入"
+	}
+	age := nowMillis - lastInjectedAt
+	if age < 0 {
+		age = 0
+	}
+	switch {
+	case memory.JustInjected(lastInjectedAt, nowMillis):
+		return agoLabel(age) + "前注入→冷档（刚提过）"
+	case memory.InCooldown(lastInjectedAt, nowMillis):
+		return agoLabel(age) + "前注入→冷档"
+	default:
+		return agoLabel(age) + "前注入→fresh"
+	}
+}
+
+// agoLabel 把毫秒时长压成日志里好读的短串。
+func agoLabel(millis int64) string {
+	switch {
+	case millis < 60_000:
+		return fmt.Sprintf("%d 秒", millis/1000)
+	case millis < 3_600_000:
+		return fmt.Sprintf("%d 分钟", millis/60_000)
+	default:
+		return fmt.Sprintf("%.1f 小时", float64(millis)/3_600_000)
+	}
 }
 
 // repeatedRecallThreshold 是"同一个话题被反复提起"的门槛。

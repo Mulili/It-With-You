@@ -236,6 +236,50 @@ func (s *MemoryStore) MarkChunksRecalled(chunkIDs []string, sessionID string) er
 	return nil
 }
 
+// MarkInjected 实现 memory.Store。
+func (s *MemoryStore) MarkInjected(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := timeutil.NowMillis()
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	for i := range s.entries {
+		if want[s.entries[i].m.ID] {
+			s.entries[i].m.LastInjectedAt = now
+		}
+	}
+	return nil
+}
+
+// MarkChunksInjected 实现 memory.Store，语义同 MarkInjected。
+func (s *MemoryStore) MarkChunksInjected(chunkIDs []string) error {
+	if len(chunkIDs) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := timeutil.NowMillis()
+	want := make(map[string]bool, len(chunkIDs))
+	for _, id := range chunkIDs {
+		want[id] = true
+	}
+	for id, e := range s.chunkIndex {
+		if !want[id] {
+			continue
+		}
+		e.ci.LastInjectedAt = now
+		s.chunkIndex[id] = e
+	}
+	return nil
+}
+
 // IndexRule 实现 memory.Store。
 func (s *MemoryStore) IndexRule(ri memory.RuleIndex, vec []float32) error {
 	s.mu.Lock()

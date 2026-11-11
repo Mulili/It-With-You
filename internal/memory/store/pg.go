@@ -102,7 +102,7 @@ func (s *PgStore) Save(m memory.Memory, vec []float32, threshold float64) (memor
 //
 // 可空列用 COALESCE 兜成零值：让 NULL 透到 Go 会逼每个调用点都处理一遍可空性，
 // 不如在 SQL 边界上收敛掉（与 history 那边同一套路）。
-const memoryColumns = `id, COALESCE(persona_id::text, ''), content, kind, importance, evidence, COALESCE(follow_up_at, 0), COALESCE(last_recalled_at, 0), COALESCE(last_recalled_session::text, ''), recall_count, created_at, updated_at`
+const memoryColumns = `id, COALESCE(persona_id::text, ''), content, kind, importance, evidence, COALESCE(follow_up_at, 0), COALESCE(last_recalled_at, 0), COALESCE(last_recalled_session::text, ''), recall_count, last_injected_at, created_at, updated_at`
 
 // IndexChunk 实现 memory.Store。
 func (s *PgStore) IndexChunk(ci memory.ChunkIndex, vec []float32) error {
@@ -162,7 +162,7 @@ func (s *PgStore) Search(personaID string, vec []float32, limit int) ([]memory.M
 		if err := rows.Scan(&h.Memory.ID, &h.Memory.PersonaID, &h.Memory.Content, &h.Memory.Kind,
 			&h.Memory.Importance, &h.Memory.Evidence, &h.Memory.FollowUpAt,
 			&h.Memory.LastRecalledAt, &h.Memory.LastRecalledSession, &h.Memory.RecallCount,
-			&h.Memory.CreatedAt, &h.Memory.UpdatedAt, &h.Score); err != nil {
+			&h.Memory.LastInjectedAt, &h.Memory.CreatedAt, &h.Memory.UpdatedAt, &h.Score); err != nil {
 			return nil, fmt.Errorf("解析检索结果失败: %w", err)
 		}
 		out = append(out, h)
@@ -196,10 +196,11 @@ func (s *PgStore) SearchChunks(personaID string, vec []float32, limit int) ([]me
 	// ⚠️ 这里**故意不加**任何"提过就过滤"的条件——包括"排除当前会话自己的片"。
 	// 片的摘要并不在上下文里（只发当前片），所以她同样得靠注入才想得起来；
 	// 把它们丢掉，她就会在"你上次说的那件事"面前哑口无言、甚至开始编。
-	// 重复提的问题改用**弱化措辞**解决（见 memory.ChunkIndex.RecallCount）。
+	// 重复提的问题改用**弱化措辞**解决（见 memory.ChunkIndex.RecallCount），
+	// 并按绝对时间做冷却（见 memory.ChunkIndex.LastInjectedAt）。
 	rows, err := s.pool.Query(ctx, `
 		SELECT chunk_id, session_id, persona_id, summary, created_at,
-		       COALESCE(last_recalled_session::text, ''), recall_count,
+		       COALESCE(last_recalled_session::text, ''), recall_count, last_injected_at,
 		       1 - (embedding <=> $1::vector) AS score
 		FROM chunk_index
 		WHERE persona_id = $2::uuid
@@ -215,7 +216,7 @@ func (s *PgStore) SearchChunks(personaID string, vec []float32, limit int) ([]me
 		var h memory.ChunkHit
 		if err := rows.Scan(&h.Chunk.ChunkID, &h.Chunk.SessionID, &h.Chunk.PersonaID,
 			&h.Chunk.Summary, &h.Chunk.CreatedAt, &h.Chunk.LastRecalledSession,
-			&h.Chunk.RecallCount, &h.Score); err != nil {
+			&h.Chunk.RecallCount, &h.Chunk.LastInjectedAt, &h.Score); err != nil {
 			return nil, fmt.Errorf("解析片索引失败: %w", err)
 		}
 		out = append(out, h)
@@ -360,8 +361,8 @@ func (s *PgStore) MarkRecalled(ids []string, sessionID string) error {
 
 // MarkChunksRecalled 实现 memory.Store。
 //
-// 与 MarkRecalled 同一套路（逐条 UPDATE），但**没有时间戳那一半**：
-// 片索引上只需要"在哪段对话里提过"，不需要"什么时候提过"。
+// 与 MarkRecalled 同一套路（逐条 UPDATE），但**不写 last_injected_at**：
+// 后者由 MarkChunksInjected 单独负责（注入冷却与"她真的用到了"是两件事）。
 func (s *PgStore) MarkChunksRecalled(chunkIDs []string, sessionID string) error {
 	if len(chunkIDs) == 0 {
 		return nil
@@ -376,6 +377,46 @@ func (s *PgStore) MarkChunksRecalled(chunkIDs []string, sessionID string) error 
 			       last_recalled_session = $2::uuid
 			 WHERE chunk_id = $1::uuid`, id, pgutil.NullIfEmpty(sessionID)); err != nil {
 			return fmt.Errorf("记录往事回想失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// MarkInjected 实现 memory.Store。
+//
+// 一次 UPDATE 一行，与 MarkRecalled 同一取舍（这里最多三条）。
+// 只写 last_injected_at，**不碰** last_recalled_* 与 recall_count——
+// 那两列是"她真的用到了"的地盘，混写会让门槛和冷却互相污染。
+func (s *PgStore) MarkInjected(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	now := timeutil.NowMillis()
+	for _, id := range ids {
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE memories SET last_injected_at = $2 WHERE id = $1::uuid`, id, now); err != nil {
+			return fmt.Errorf("记录记忆注入时刻失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// MarkChunksInjected 实现 memory.Store，语义同 MarkInjected。
+func (s *PgStore) MarkChunksInjected(chunkIDs []string) error {
+	if len(chunkIDs) == 0 {
+		return nil
+	}
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	now := timeutil.NowMillis()
+	for _, id := range chunkIDs {
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE chunk_index SET last_injected_at = $2 WHERE chunk_id = $1::uuid`, id, now); err != nil {
+			return fmt.Errorf("记录往事注入时刻失败: %w", err)
 		}
 	}
 	return nil
@@ -404,7 +445,7 @@ func (s *PgStore) List(personaID string, limit int) ([]memory.Memory, error) {
 		var m memory.Memory
 		if err := rows.Scan(&m.ID, &m.PersonaID, &m.Content, &m.Kind, &m.Importance, &m.Evidence,
 			&m.FollowUpAt, &m.LastRecalledAt, &m.LastRecalledSession, &m.RecallCount,
-			&m.CreatedAt, &m.UpdatedAt); err != nil {
+			&m.LastInjectedAt, &m.CreatedAt, &m.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("解析记忆失败: %w", err)
 		}
 		out = append(out, m)

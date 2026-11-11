@@ -87,6 +87,59 @@ func RankScoreAt(similarity float64, importance, recency int) float64 {
 	return RankScore(similarity, importance) + TimeWeight*float64(recency-3)
 }
 
+// 注入冷却：同一条内容在窗口内只允许"被主动提"一次。
+//
+// 与上面三个旋钮的区别：它们都只改排序，冷却改的是**措辞档位**——窗口内仍然注入
+// （丢了她就会编，见 Memory.RecallCount 那条注释），但归到"提过了、别再主动提"那一段。
+//
+// 时钟只由 **fresh 注入**上发条：冷却期内的注入**不续期**，所以窗口一过自动回到 fresh。
+// 这条是"节流阀"而不是"永久封杀"的关键——单调累加的计数会让"你以后问起她也拿不到"。
+const (
+	// CooldownWindow 是"刚提过"的时间窗：窗口内降为弱化措辞。
+	//
+	// 2 小时是拍的初值，判据是"同一段对话里的轮次间隔"：连着聊时几十秒到几分钟，
+	// 间隔一拉长就说明已经换过话题了。真机若仍觉得"又提了"再往大调。
+	CooldownWindow = int64(2 * 60 * 60 * 1000)
+	// CooldownHard 是"刚刚才提过"的硬窗：窗口内额外加一句更强的标记。
+	//
+	// 比 CooldownWindow 短得多，因为要治的是"连着两三轮都说同一件事"——
+	// 那才是用户会立刻反感的形态。
+	CooldownHard = int64(10 * 60 * 1000)
+)
+
+// InCooldown 报告这条内容是否还在"刚提过"的窗口内。
+//
+// lastInjectedAt <= 0 表示从未注入过 → fresh。
+// 时间晚于现在（时钟回拨）按刚注入处理：宁可少提一句，也别因为时钟跳变而疯狂复读。
+func InCooldown(lastInjectedAt, nowMillis int64) bool {
+	if lastInjectedAt <= 0 {
+		return false
+	}
+	return nowMillis-lastInjectedAt < CooldownWindow
+}
+
+// JustInjected 报告这条内容是否落在"刚刚才提过"的硬窗内。
+func JustInjected(lastInjectedAt, nowMillis int64) bool {
+	if lastInjectedAt <= 0 {
+		return false
+	}
+	return nowMillis-lastInjectedAt < CooldownHard
+}
+
+// SaidBefore 报告这条记忆在当前语境里是否"已经提过一遭"——提过就不该再主动提。
+//
+// 两个来源任一成立即可：
+//   - 本段对话里她**真的用到过**（LastRecalledSession 相同且 RecallCount > 0）；
+//   - 绝对时间上还在**注入冷却窗口**内（LastInjectedAt）。
+//
+// 放在类型上而不是调用点：记忆与往事两张表要用同一条规则，写两遍迟早会漂。
+func (m Memory) SaidBefore(sessionID string, nowMillis int64) bool {
+	if sessionID != "" && m.LastRecalledSession == sessionID && m.RecallCount > 0 {
+		return true
+	}
+	return InCooldown(m.LastInjectedAt, nowMillis)
+}
+
 // Memory 是一条长期记忆。
 type Memory struct {
 	ID string `json:"id"`
@@ -108,8 +161,8 @@ type Memory struct {
 	FollowUpAt int64 `json:"followUpAt"`
 	// LastRecalledAt 是最近一次被检索注入的时间。
 	//
-	// ⚠️ 抑制"反复提同一件事"**不靠它**，靠下面的 LastRecalledSession：
-	// "隔了多久算久"是个要拍的数，而"同一段对话里提过没有"是确定的事实。
+	// ⚠️ 抑制"反复提同一件事"**不靠它**，靠下面两条：
+	// LastRecalledSession（同一段对话里提过没有）与 LastInjectedAt（绝对时间的冷却）。
 	// 它留着是因为"什么时候提过"本身有价值（将来做遗忘曲线 / 相关性衰减要用）。
 	LastRecalledAt int64 `json:"lastRecalledAt"`
 	// LastRecalledSession 是最近一次被注入时所在的会话 ID（空串 = 从未注入过）。
@@ -124,9 +177,16 @@ type Memory struct {
 	// ⚠️ 它**绝不用来丢弃**。曾经做过"提过太多次就不再返回"，被一个反例推翻了：
 	// 连着问"草莓喜不喜欢 / 芒果喜不喜欢 / 菠萝喜不喜欢"，第三次起若不再注入，
 	// 她会**不知道**——然后就开始编（"喜欢吧"）。**编出来的答案比重复提一句有害得多。**
-	RecallCount int   `json:"recallCount"`
-	CreatedAt   int64 `json:"createdAt"`
-	UpdatedAt   int64 `json:"updatedAt"`
+	RecallCount int `json:"recallCount"`
+	// LastInjectedAt 是最近一次**以 fresh 档被注入**的时间（0 = 从未注入过）。
+	//
+	// 它只服务"注入冷却"：窗口内再命中仍然注入（见 RecallCount 的反例），但降为弱化措辞；
+	// 且窗口内的注入**不续期**，于是窗口一过就自动回到 fresh。
+	// 与 LastRecalledSession 的分工：那个看"同一段对话"（换会话就复活），
+	// 这个看**绝对时间**（跨会话有效），而且是一个会自愈的节流阀。
+	LastInjectedAt int64 `json:"lastInjectedAt"`
+	CreatedAt      int64 `json:"createdAt"`
+	UpdatedAt      int64 `json:"updatedAt"`
 }
 
 // ChunkIndex 是「片索引」：向量库里的一条**指针**，指向 session_chunks 里的一片。
@@ -157,6 +217,16 @@ type ChunkIndex struct {
 	LastRecalledSession string
 	// RecallCount 语义同 Memory.RecallCount（在这段对话里已注入几次）。
 	RecallCount int
+	// LastInjectedAt 语义同 Memory.LastInjectedAt（最近一次以 fresh 档注入的时间）。
+	LastInjectedAt int64
+}
+
+// SaidBefore 语义同 Memory.SaidBefore。
+func (c ChunkIndex) SaidBefore(sessionID string, nowMillis int64) bool {
+	if sessionID != "" && c.LastRecalledSession == sessionID && c.RecallCount > 0 {
+		return true
+	}
+	return InCooldown(c.LastInjectedAt, nowMillis)
 }
 
 // SaveResult 说明一次保存的结果，让调用方能如实记日志。
@@ -270,10 +340,11 @@ type Store interface {
 	// MarkRecalled 把这些记忆标成"在这段对话里刚被注入过"（写 last_recalled_at
 	// 与 last_recalled_session）。
 	//
-	// 这是"别反复提同一件事"的**唯一依据**——它记录的是**注入**，不是"被用到"：
-	// 后者要靠模型自述、得再加一次调用，而注入本身就足以说明"她刚被提醒过这件事"。
+	// 它记录的是**她真的用到了**（模型自标 [[used:…]]），不是"被注入"：
+	// 后者由 MarkInjected 单独记时间戳。两列分开是有意的——一个管"越提越难拿到"的门槛，
+	// 一个管"刚提过就别再提"的措辞冷却，混在一列会让两种语义互相污染。
 	//
-	// 记的是**会话**而不是时间戳，理由见 last_recalled_session 的注释（不必拍冷却时长）。
+	// 记的是**会话**而不是时间戳，理由见 last_recalled_session 的注释。
 	//
 	// 找不到的 ID 不该报错：记忆可能刚被用户删掉，而这件事不值得打断一轮对话。
 	MarkRecalled(ids []string, sessionID string) error
@@ -283,6 +354,19 @@ type Store interface {
 	// 与它分开而不是合并成一个调用：两者操作的是两张表（memories / chunk_index），
 	// 合起来会让"哪个 id 属于哪一边"变成调用方要操心的事。
 	MarkChunksRecalled(chunkIDs []string, sessionID string) error
+
+	// MarkInjected 把这些记忆的"最近一次 fresh 注入"刷成现在（写 last_injected_at）。
+	//
+	// ⚠️ 调用方**只该传本轮以 fresh 档注入的那些**：冷却期内的注入不要调它。
+	// 这就是"节流阀"的实现方式——时钟只在 fresh 注入时上发条，
+	// 冷却期内的重复注入不续期，于是窗口一过自动解冻；否则只要话题还在，
+	// 这一列就会被每轮刷新，变成永久封杀。
+	//
+	// 找不到的 ID 不报错（与 MarkRecalled 同理）。
+	MarkInjected(ids []string) error
+
+	// MarkChunksInjected 把这些往事的"最近一次 fresh 注入"刷成现在，语义同 MarkInjected。
+	MarkChunksInjected(chunkIDs []string) error
 
 	// IndexRule 写入/覆盖一条归档规则的索引（rule_id 是主键，重复写是覆盖）。
 	//
