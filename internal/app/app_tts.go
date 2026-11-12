@@ -112,7 +112,9 @@ func (s *speech) Stop() {
 }
 
 func (s *speech) flushLocked(final bool) {
-	raw := s.buf.String()
+	// 分句之前先洗掉 markdown：模型输出的是源文，"**重点**""- 列表"这类标记
+	// 若留到 Normalize 里被逐个丢弃，段落/列表边界会一起消失，听起来就是"整段连读"。
+	raw := text.CleanForSpeech(s.buf.String())
 	if strings.TrimSpace(raw) == "" {
 		s.buf.Reset()
 		return
@@ -202,6 +204,9 @@ func (s *speech) run() {
 			Rate: eng.Voice().SampleRate,
 			PCM:  base64.StdEncoding.EncodeToString(pcm16(audio)),
 			Text: job.text,
+			// 停顿按这句**原文的句末标点**分级：句号 320ms、破折号 420ms、省略号 450ms…
+			// 之前是播放端固定 50ms，所有标点一个价，听感就是"平铺直叙"。
+			PauseMs: text.PauseAfterMs(job.text),
 		})
 
 		if first {

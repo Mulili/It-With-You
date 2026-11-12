@@ -997,7 +997,10 @@ function onTTSAudio(p) {
   const now = ctx.currentTime
   if (ttsEndAt < now + 0.05) ttsEndAt = now + 0.05
   src.start(ttsEndAt)
-  ttsEndAt += buf.duration
+  // 句间停顿由后端按标点分级给出（句号 320ms、破折号 420ms、省略号 450ms…）。
+  // 前端不再写死一个固定间隔：所有标点一个价，就是"平铺直叙"的直接来源。
+  const pause = Number.isFinite(p.pauseMs) ? p.pauseMs / 1000 : 0.05
+  ttsEndAt += buf.duration + pause
 
   ttsSources.add(src)
   src.onended = () => ttsSources.delete(src)
