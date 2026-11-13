@@ -62,6 +62,12 @@ type Backbone struct {
 	Symbols      string `json:"symbols"`
 	Opencpop     string `json:"opencpop"`
 	Polyphone    string `json:"polyphone"`
+	// Bert / BertVocab 是中文 BERT 与它的词表。**可为空**：缺了就退回"零 BERT"，
+	// 合成照常进行，只是语调更平（见 infer.go 的 text_bert）。
+	//
+	// 单独做成可选，是因为它 600MB 上下：有些人只想听个声、不想再下一份大模型。
+	Bert      string `json:"bert"`
+	BertVocab string `json:"bert_vocab"`
 }
 
 // 骨干文件的默认位置，只在 config.json 没写时才用。
@@ -71,6 +77,8 @@ const (
 	defaultSymbols   = "G2P/symbols_v2.json"
 	defaultOpencpop  = "G2P/ChineseG2P/opencpop-strict.txt"
 	defaultPolyphone = "G2P/ChineseG2P/polyphonic.json"
+	defaultBert      = "roberta/RoBERTa.onnx"
+	defaultBertVocab = "roberta/roberta_tokenizer/vocab.txt"
 )
 
 // LoadVoice 读入并校验一个音色目录。
@@ -126,6 +134,12 @@ func LoadBackbone(dir string) (*Backbone, error) {
 	if bb.Polyphone == "" {
 		bb.Polyphone = defaultPolyphone
 	}
+	if bb.Bert == "" {
+		bb.Bert = defaultBert
+	}
+	if bb.BertVocab == "" {
+		bb.BertVocab = defaultBertVocab
+	}
 	return &bb, nil
 }
 
@@ -148,6 +162,23 @@ func (b *Backbone) OpencpopPath(dir string) (string, error) {
 
 func (b *Backbone) PolyphonePath(dir string) (string, error) {
 	return resolveIn(dir, b.Polyphone, "多音字表")
+}
+
+// BertPaths 返回中文 BERT 与它的词表；**缺任何一个都返回 ok=false**，不报错。
+//
+// 这是有意的取舍：BERT 只影响语调自然度，不影响"能不能出声"。
+// 少一份 600MB 的模型不该让整个语音功能起不来——那时她会退回"零 BERT"，
+// 声音更平，但仍然能说话。
+func (b *Backbone) BertPaths(dir string) (model, vocab string, ok bool) {
+	m, err := resolveIn(dir, b.Bert, "中文 BERT 模型")
+	if err != nil {
+		return "", "", false
+	}
+	v, err := resolveIn(dir, b.BertVocab, "BERT 词表")
+	if err != nil {
+		return "", "", false
+	}
+	return m, v, true
 }
 
 // ModelPath 返回某个逻辑名对应的模型绝对路径，并确认文件存在。

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"sync"
 
 	"agent-for-you-love/internal/onnxrt"
@@ -42,8 +44,17 @@ type Engine struct {
 	symbols  *Symbols
 	frontend *text.Frontend
 
+	backboneDir string
+	threads     int
+
 	mu   sync.Mutex
 	refs map[string]*RefFeatures
+
+	// bert 是中文 BERT（语调）。**懒加载**：600MB 的模型放进启动路径不合适，
+	// 而预热本来就会调 PrepareReference，正好把它带起来。
+	bert       *Bert
+	bertTried  bool
+	bertWarned bool
 }
 
 // NewEngine 按顺序做完六件事，任何一步失败都返回错误、不返回半个 Engine：
@@ -151,7 +162,9 @@ func NewEngine(opts Options) (*Engine, error) {
 	return &Engine{
 		voice: v, backbone: bb, set: set, shared: shared,
 		symbols: symbols, frontend: frontend,
-		refs: make(map[string]*RefFeatures, 2),
+		backboneDir: backboneDir,
+		threads:     opts.Threads,
+		refs:        make(map[string]*RefFeatures, 2),
 	}, nil
 }
 
@@ -184,12 +197,90 @@ func (e *Engine) Speak(ctx context.Context, txt, emotion string) ([]float32, err
 	if err != nil {
 		return nil, err
 	}
-	phones, dropped := e.symbols.Filter(e.frontend.Phones(txt))
-	if len(phones) == 0 {
+	phones, counts := e.frontend.PhonesWithCounts(txt)
+	kept, keptCounts, dropped := e.filterPhones(phones, counts)
+	if len(kept) == 0 {
 		return nil, fmt.Errorf("这句话没有可用音素（文本前端没认出任何字）：%q", txt)
 	}
-	_ = dropped // 丢掉的符号只影响个别字，不值得为它让整句失败
-	return e.Synthesize(ctx, ref, phones)
+	// 丢符号以前是静默的，于是"某个字听不清"永远查不到源头。
+	// 现在把它打出来：这条日志是"吞字"与"读音错"的分界线。
+	if len(dropped) > 0 {
+		log.Printf("tts: 音素表里没有这些符号，已跳过：%s（原句 %q）",
+			strings.Join(dropped, "、"), clipText(txt, 40))
+	}
+	return e.Synthesize(ctx, ref, text.Normalize(txt), kept, keptCounts)
+}
+
+// filterPhones 按音素表过滤，并**同步扣减每个字的音素数**。
+//
+// 两张表必须一起改：counts 是 BERT 的 repeats，错一个位置整句的语调都会错位。
+func (e *Engine) filterPhones(phones []string, counts []int) (kept []string, keptCounts []int, dropped []string) {
+	kept = make([]string, 0, len(phones))
+	keptCounts = make([]int, 0, len(counts))
+	idx := 0
+	for _, n := range counts {
+		if n < 0 {
+			n = 0
+		}
+		if idx+n > len(phones) {
+			n = len(phones) - idx
+		}
+		ok := 0
+		for k := 0; k < n; k++ {
+			p := phones[idx]
+			idx++
+			if _, exists := e.symbols.ids[p]; exists {
+				kept = append(kept, p)
+				ok++
+			} else {
+				dropped = append(dropped, p)
+			}
+		}
+		keptCounts = append(keptCounts, ok)
+	}
+	return kept, keptCounts, dropped
+}
+
+// bertLocked 取（必要时加载）中文 BERT。调用方必须持有 e.mu。
+//
+// 加载失败**不算合成失败**：退回零 BERT，声音更平但能说话。
+func (e *Engine) bertLocked() *Bert {
+	if e.bertTried {
+		return e.bert
+	}
+	e.bertTried = true
+
+	model, vocab, ok := e.backbone.BertPaths(e.backboneDir)
+	if !ok {
+		log.Printf("tts: 没有中文 BERT（%s），本进程用零 BERT——语调会更平", e.backboneDir)
+		return nil
+	}
+	b, err := LoadBert(model, vocab, e.threads)
+	if err != nil {
+		log.Printf("tts: 加载中文 BERT 失败，退回零 BERT：%v", err)
+		return nil
+	}
+	e.bert = b
+	log.Printf("tts: 中文 BERT 已加载（%s）", model)
+	return e.bert
+}
+
+// warnBertOnce 让"每句都算不出 text_bert"只刷一次日志。
+func (e *Engine) warnBertOnce(err error) {
+	if e.bertWarned {
+		return
+	}
+	e.bertWarned = true
+	log.Printf("tts: 计算 text_bert 失败，退回零 BERT（后续不再重复提示）：%v", err)
+}
+
+// clipText 把文本截短，避免日志里出现整段回复。
+func clipText(s string, n int) string {
+	rs := []rune(s)
+	if len(rs) <= n {
+		return s
+	}
+	return string(rs[:n]) + "…"
 }
 
 // refLocked 取（必要时算）某个情绪的参考侧张量。调用方必须持有 e.mu。
@@ -209,7 +300,7 @@ func (e *Engine) refLocked(ctx context.Context, emotion string) (*RefFeatures, e
 	return r, nil
 }
 
-// Close 释放全部会话（音色五条 + 骨干两条）与缓存的参考张量。可以重复调用。
+// Close 释放全部会话（音色五条 + 骨干两条 + BERT）与缓存的参考张量。可以重复调用。
 func (e *Engine) Close() error {
 	for _, r := range e.refs {
 		r.Close()
@@ -217,6 +308,12 @@ func (e *Engine) Close() error {
 	e.refs = nil
 
 	var first error
+	if e.bert != nil {
+		if err := e.bert.Close(); err != nil {
+			first = err
+		}
+		e.bert = nil
+	}
 	if e.set != nil {
 		first = e.set.Close()
 		e.set = nil

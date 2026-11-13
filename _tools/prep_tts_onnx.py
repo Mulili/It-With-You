@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+﻿﻿# -*- coding: utf-8 -*-
 """GPT-SoVITS / GENIE 权重的一次性准备工具（**不进运行时**，Go 侧只读产物）。
 
 为什么需要它
@@ -33,6 +33,7 @@ GENIE 导出的 ONNX 是「**fp32 的图 + fp16 的权重**」：
 import argparse
 import glob
 import os
+import re
 import sys
 import time
 
@@ -43,11 +44,13 @@ from onnx import numpy_helper
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MODELS = os.path.join(ROOT, "models")
 
-# 需要处理的两组模型
+# 需要处理的三组模型
 #   1) 单个角色的 TTS 四件套 + vits（models/voices/<音色>/tts）
 #   2) 音色准备用的 chinese-hubert-base（models/shared/hubert，每角色一次预计算，运行时不加载）
+#   3) 中文 BERT（models/shared/roberta，自包含的 fp16 模型，只影响语调）
 TTS_DIR = os.path.join(MODELS, "voices")
 HUBERT_DIR = os.path.join(MODELS, "shared", "hubert")
+ROBERTA_DIR = os.path.join(MODELS, "shared", "roberta")
 
 
 # ---------- 基础 ----------
@@ -82,6 +85,30 @@ def _resolve(base_dir, location):
         if os.path.exists(p):
             return p, fb
     return os.path.join(base_dir, location), False
+
+
+# onnx / onnxruntime 在把"超 2GB 的 fp32 图"外部化时会写 `<GUID>.data` 到**当前目录**，
+# 而量化完成后并不清理。RoBERTa 一次就漏 1.1GB × 3（三次尝试），必须主动扫掉。
+_GUID_DATA = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.data$")
+
+
+def _sweep_guid_data(since):
+    """删掉本次运行期间落在仓库根目录的 GUID 外部数据文件，返回删了几个。
+
+    只删 mtime >= since 的：那是本次产生的；更早的可能是别人正在用的，不动。
+    """
+    n = 0
+    for name in os.listdir(ROOT):
+        if not _GUID_DATA.match(name):
+            continue
+        p = os.path.join(ROOT, name)
+        try:
+            if os.path.getmtime(p) >= since:
+                os.remove(p)
+                n += 1
+        except OSError:
+            pass
+    return n
 
 
 def _file_scales(model, base_dir):
@@ -150,6 +177,8 @@ def collect_models():
             out.append((name + "/" + os.path.basename(p)[:-5], p))
     for p in sorted(glob.glob(os.path.join(HUBERT_DIR, "*.onnx"))):
         out.append(("hubert/" + os.path.basename(p)[:-5], p))
+    for p in sorted(glob.glob(os.path.join(ROBERTA_DIR, "*.onnx"))):
+        out.append(("roberta/" + os.path.basename(p)[:-5], p))
     return out
 
 
@@ -192,6 +221,80 @@ def cmd_inspect(args):
 
 # ---------- fp32 上采样 ----------
 
+def _promote_type_proto(tp, acc):
+    """递归遍历 TypeProto，把任意深度的 fp16 元素类型抬到 fp32。
+
+    Sequence 可以嵌套（Sequence<Sequence<Tensor>>），只看一层会漏掉，
+    而 Loop 的类型推断恰恰是按声明来的——漏一处就是
+    "Input element type of 1 does not match existing output type of 10"。
+    """
+    if tp.HasField("tensor_type"):
+        if tp.tensor_type.elem_type == onnx.TensorProto.FLOAT16:
+            tp.tensor_type.elem_type = onnx.TensorProto.FLOAT
+            acc[0] += 1
+    elif tp.HasField("sequence_type"):
+        _promote_type_proto(tp.sequence_type.elem_type, acc)
+    elif tp.HasField("optional_type"):
+        _promote_type_proto(tp.optional_type.elem_type, acc)
+    elif tp.HasField("map_type"):
+        _promote_type_proto(tp.map_type.value_type, acc)
+
+
+def _promote_value_info(graph, acc):
+    """把 Graph 里声明的值类型从 fp16 抬到 fp32（含嵌套 Sequence 的元素类型）。"""
+    for vi in list(graph.input) + list(graph.output) + list(graph.value_info):
+        _promote_type_proto(vi.type, acc)
+
+
+def _promote_graph(graph, acc):
+    """递归把一张图（含 If / Loop / Scan 的子图）统一成 float32。"""
+    for t in graph.initializer:
+        if t.data_type == onnx.TensorProto.FLOAT16:
+            arr = np.frombuffer(t.raw_data, dtype=np.float16).astype(np.float32)
+            t.data_type = onnx.TensorProto.FLOAT
+            t.raw_data = arr.tobytes()
+            acc[0] += 1
+
+    for node in graph.node:
+        for attr in node.attribute:
+            if attr.type == onnx.AttributeProto.TENSOR:
+                tensors = [attr.t]
+            elif attr.type == onnx.AttributeProto.TENSORS:
+                tensors = list(attr.tensors)
+            else:
+                tensors = []
+            for t in tensors:
+                if t.data_type != onnx.TensorProto.FLOAT16:
+                    continue
+                arr = np.frombuffer(t.raw_data, dtype=np.float16).astype(np.float32)
+                t.data_type = onnx.TensorProto.FLOAT
+                t.raw_data = arr.tobytes()
+                acc[0] += 1
+
+            if attr.type == onnx.AttributeProto.GRAPH:
+                _promote_graph(attr.g, acc)
+            elif attr.type == onnx.AttributeProto.GRAPHS:
+                for g in attr.graphs:
+                    _promote_graph(g, acc)
+
+        if node.op_type == "Cast":
+            for attr in node.attribute:
+                if attr.name == "to" and attr.i == onnx.TensorProto.FLOAT16:
+                    attr.i = onnx.TensorProto.FLOAT
+                    acc[0] += 1
+
+        # SequenceEmpty 的元素类型藏在 `dtype` 属性里，不是靠输入推出来的：
+        # 它一口气声明"我要一个 fp16 的序列"，于是后面插入 float32 张量就报
+        # "Input element type of 1 does not match existing output type of 10"。
+        if node.op_type == "SequenceEmpty":
+            for attr in node.attribute:
+                if attr.name == "dtype" and attr.i == onnx.TensorProto.FLOAT16:
+                    attr.i = onnx.TensorProto.FLOAT
+                    acc[0] += 1
+
+    _promote_value_info(graph, acc)
+
+
 def cmd_fp32(args):
     for label, path in filter_models(collect_models(), args.only):
         t0 = time.time()
@@ -203,6 +306,15 @@ def cmd_fp32(args):
         for init in m.graph.initializer:
             ext = _ext_map(init)
             if not ext:
+                # 自包含的 fp16 模型（RoBERTa）：权重直接躺在 raw_data 里，没有外部文件。
+                # 动态量化不支持 fp16 权重，所以这一步同样要上采样，只是数据源不同。
+                if init.data_type == onnx.TensorProto.FLOAT16:
+                    n = _elems(init)
+                    arr = np.frombuffer(init.raw_data, dtype=np.float16, count=n)
+                    arr = arr.astype(np.float32).reshape(init.dims)
+                    init.data_type = onnx.TensorProto.FLOAT
+                    init.raw_data = arr.tobytes()
+                    n_up += 1
                 continue
             loc = ext["location"]
             fpath, fellback = _resolve(base, loc)
@@ -239,6 +351,10 @@ def cmd_fp32(args):
 
         out_dir = os.path.join(base, "fp32")
         os.makedirs(out_dir, exist_ok=True)
+        acc = [0]
+        _promote_graph(m.graph, acc)
+        if acc[0]:
+            print("   %s：另有 %d 处残留 fp16（常量/子图/Cast/类型声明）已抬到 fp32" % (label, acc[0]))
         out = os.path.join(out_dir, os.path.basename(path))
         onnx.save(m, out)
         print("   %s：上采样 %d 个 initializer → %s（%.2f MB，%.1fs）"
@@ -269,11 +385,29 @@ def cmd_int8(args):
         # quant_pre_process 会做常量折叠，把 `Transpose(常量)` 折成一个转置好的常量，
         # 量化器这才看得见它们。它顺带做符号形状推断，也是量化所必需的。
         prep = os.path.join(out_dir, "_prep_" + os.path.basename(path))
-        try:
-            quant_pre_process(src, prep, skip_optimization=False,
-                              skip_onnx_shape=False, skip_symbolic_shape=False, verbose=False)
-        except Exception as e:  # noqa: BLE001
-            print("   ⚠ %s 预处理失败，退回不折叠直接量化（效果会打折）：%s" % (label, e))
+        last_err = None
+        # 三档递退：完整预处理 → 跳过符号形状推断 → 完全跳过。
+        # RoBERTa 这张图里有一条 `Min(512, seq_len)` 的动态形状，
+        # 符号形状推断在它上面会报 "unsupported broadcast"，但常量折叠本身是能做的；
+        # 直接放弃预处理会让量化覆盖率明显下降（实测 .data 从 368MB 涨不上去，
+        # 而余弦只有 0.990）。
+        for kwargs in (
+            dict(skip_optimization=False, skip_onnx_shape=False, skip_symbolic_shape=False),
+            dict(skip_optimization=False, skip_onnx_shape=False, skip_symbolic_shape=True),
+            dict(skip_optimization=True, skip_onnx_shape=False, skip_symbolic_shape=True),
+        ):
+            for p in glob.glob(prep + "*"):
+                os.remove(p)
+            try:
+                quant_pre_process(src, prep, verbose=False, **kwargs)
+                last_err = None
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+        if last_err is not None:
+            print("   ⚠ %s 预处理失败，退回不折叠直接量化（效果会打折）：%s" % (label, last_err))
+            for p in glob.glob(prep + "*"):
+                os.remove(p)
             prep = src
         try:
             quantize_dynamic(
@@ -287,10 +421,13 @@ def cmd_int8(args):
             )
         except Exception as e:  # noqa: BLE001 —— 现场报错信息比栈更有用
             print("   ✗ %s 量化失败：%s" % (label, e))
+            _sweep_guid_data(t0)
             continue
         if prep != src:
-            for p in glob.glob(prep + "*"):  # 预处理产物只是中间件，别占着几百 MB
-                os.remove(p)
+            # 预处理产物只是中间件，别占着几百 MB（含 `*-inferred.onnx` 这种命名）
+            for p in glob.glob(prep + "*") + glob.glob(os.path.splitext(prep)[0] + "-inferred.onnx*"):
+                if os.path.exists(p):
+                    os.remove(p)
 
         # quantize_dynamic 写外置数据时会留冗余：`.data` 差不多是模型实际引用的两倍
         # （hubert 实测 243 MB vs 引用 122 MB）。重新保存一次，按引用重写就能压回去。
@@ -310,6 +447,9 @@ def cmd_int8(args):
         print("   %s：%.2f MB → %.2f MB（%.0f%%，%.1fs）"
               % (label, os.path.getsize(src) / 1e6, size / 1e6,
                  size / os.path.getsize(src) * 100, time.time() - t0))
+        leaked = _sweep_guid_data(t0)
+        if leaked:
+            print("   （已清理 %d 个临时外部数据文件）" % leaked)
 
 
 # ---------- verify ----------

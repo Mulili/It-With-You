@@ -11,6 +11,7 @@ import (
 	ort "github.com/yalue/onnxruntime_go"
 
 	"agent-for-you-love/internal/tts/sovits"
+	"agent-for-you-love/internal/tts/text"
 )
 
 const (
@@ -81,14 +82,15 @@ func (e *Engine) PrepareReference(ctx context.Context, wavPath, refText string) 
 		return nil, err
 	}
 
-	phones, _ := e.symbols.Filter(e.frontend.Phones(refText))
-	if len(phones) == 0 {
+	phones, counts := e.frontend.PhonesWithCounts(refText)
+	kept, keptCounts, _ := e.filterPhones(phones, counts)
+	if len(kept) == 0 {
 		ssl.Destroy()
 		ge.Destroy()
 		geAdv.Destroy()
 		return nil, errors.New("参考文本没有可用音素（文本前端没认出任何字）")
 	}
-	ids, err := e.symbols.IDs(phones)
+	ids, err := e.symbols.IDs(kept)
 	if err != nil {
 		ssl.Destroy()
 		ge.Destroy()
@@ -102,7 +104,8 @@ func (e *Engine) PrepareReference(ctx context.Context, wavPath, refText string) 
 		geAdv.Destroy()
 		return nil, fmt.Errorf("构造 ref_seq 失败：%w", err)
 	}
-	bert, err := ort.NewTensor(ort.NewShape(int64(len(ids)), bertDim), make([]float32, len(ids)*bertDim))
+	refBertData := e.bertDataLocked(ctx, text.Normalize(refText), keptCounts, len(ids))
+	bert, err := ort.NewTensor(ort.NewShape(int64(len(ids)), bertDim), refBertData)
 	if err != nil {
 		seq.Destroy()
 		ssl.Destroy()
@@ -113,11 +116,44 @@ func (e *Engine) PrepareReference(ctx context.Context, wavPath, refText string) 
 	return &RefFeatures{Seq: seq, Bert: bert, SSL: ssl, GE: ge, GEAdvanced: geAdv}, nil
 }
 
+// bertDataLocked 算出 [rows, 1024] 的音素级 BERT 特征；拿不到就返回全零。
+//
+// 全零不是"降级提示"，而是一条**曾经唯一**的路径：BERT 缺席时模型也能出声，
+// 只是语调平。所以这里不返回错误——把"没有 BERT"和"这句合成失败"分开。
+// 调用方必须持有 e.mu。
+func (e *Engine) bertDataLocked(ctx context.Context, norm string, counts []int, rows int) []float32 {
+	out := make([]float32, rows*bertDim)
+	b := e.bertLocked()
+	if b == nil {
+		return out
+	}
+	feat, err := b.PhoneFeatures(ctx, norm, counts)
+	if err != nil {
+		e.warnBertOnce(err)
+		return out
+	}
+	if len(feat) != len(feat)/bertDim*bertDim || len(feat)%bertDim != 0 {
+		e.warnBertOnce(fmt.Errorf("特征长度 %d 不是 %d 的整数倍", len(feat), bertDim))
+		return out
+	}
+	// rows 应当等于 len(feat)/bertDim（都按音素数算）。对不上说明对齐出错，
+	// 宁可退回零向量，也不要把错位的数据喂给模型——那会产出怪音而不是变平。
+	if len(feat)/bertDim != rows {
+		e.warnBertOnce(fmt.Errorf("BERT 音素数 %d 与音素序列 %d 不一致", len(feat)/bertDim, rows))
+		return out
+	}
+	copy(out, feat)
+	return out
+}
+
 // Synthesize 把一条音素序列合成成 PCM（float32、单声道、voice.SampleRate）。
 //
 // 流程与 GENIE 的 tts()/t2s_cpu() 一一对应，包括它的三处细节：
 // 文本前补一个'。'、EOS 取**最后一个**越界位置、循环结束后把最后一个 token 置 0。
-func (e *Engine) Synthesize(ctx context.Context, ref *RefFeatures, phones []string) ([]float32, error) {
+//
+// norm 是**归一化之后**的文本（与 phones 同源），counts 是每个字的音素数——
+// 两者一起用于 text_bert；传空则表示这段没有 BERT 可用（例如直接从音素构造的测试）。
+func (e *Engine) Synthesize(ctx context.Context, ref *RefFeatures, norm string, phones []string, counts []int) ([]float32, error) {
 	if ref == nil {
 		return nil, errors.New("参考特征为空：先调用 PrepareReference")
 	}
@@ -134,7 +170,19 @@ func (e *Engine) Synthesize(ctx context.Context, ref *RefFeatures, phones []stri
 		return nil, fmt.Errorf("构造 text_seq 失败：%w", err)
 	}
 	defer textSeq.Destroy()
-	textBert, err := ort.NewTensor(ort.NewShape(int64(len(ids)), bertDim), make([]float32, len(ids)*bertDim))
+
+	// text_bert 必须是**音素级**的：一行对应一个音素，长度与 text_seq 严格相等。
+	// 第一行留给上面补的那个 "."，所以把它前面的位置空出来（零向量），
+	// 后面接 BERT 给出的 [音素数, 1024]。
+	//
+	// 这一段就是"语气平不平"的分水岭：全零时模型没有词义上下文，
+	// 只能靠自回归先验把每个音素均匀地读出来。
+	textBertData := make([]float32, len(ids)*bertDim)
+	if len(counts) > 0 {
+		feat := e.bertDataLocked(ctx, norm, counts, len(phones))
+		copy(textBertData[bertDim:], feat)
+	}
+	textBert, err := ort.NewTensor(ort.NewShape(int64(len(ids)), bertDim), textBertData)
 	if err != nil {
 		return nil, fmt.Errorf("构造 text_bert 失败：%w", err)
 	}

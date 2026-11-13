@@ -35,6 +35,12 @@ type Session struct {
 	Sess    *ort.DynamicAdvancedSession
 	Inputs  []string
 	Outputs []string
+	// OutputTypes 与 Outputs 一一对应：输出张量的元素类型。
+	//
+	// 需要它是因为**不同精度会走不同的构造方式**：float32 可以让 ORT 自动分配，
+	// 而 float16（BERT 的原始导出）必须自己按 2 字节/元素预分配，
+	// 否则 binding 按 1 字节算，直接报 "not enough space"。
+	OutputTypes []ort.TensorElementDataType
 }
 
 // Run 按位置喂输入、按位置收输出（输出传 nil 由 runtime 分配）。
@@ -105,6 +111,16 @@ func OpenShared(hubertPath, speakerPath string, threads int) (*Shared, error) {
 		return nil, err
 	}
 	return &Shared{HuBERT: sessions[0], Speaker: sessions[1]}, nil
+}
+
+// OpenOne 打开单条会话（骨干里那些"不属于音色五件套"的模型用它，比如中文 BERT）。
+func OpenOne(path string, threads int) (*Session, error) {
+	opts, err := newOptions(threads)
+	if err != nil {
+		return nil, err
+	}
+	defer opts.Destroy()
+	return openOne(path, opts)
 }
 
 // Close 释放本音色的全部会话；返回第一个错误（其余继续释放，不能因为一个失败就泄漏）。
@@ -179,6 +195,7 @@ func openOne(path string, opts *ort.SessionOptions) (*Session, error) {
 		inNames[i] = v.Name
 	}
 	outNames := make([]string, 0, len(outs))
+	outTypes := make([]ort.TensorElementDataType, 0, len(outs))
 	for _, v := range outs {
 		// 跳过零维（标量）输出：这个 binding 建不出零维张量，自动分配会直接报
 		// "The shape has no dimensions"。`sdec` 的 stop_condition_tensor 就是标量，
@@ -187,12 +204,13 @@ func openOne(path string, opts *ort.SessionOptions) (*Session, error) {
 			continue
 		}
 		outNames = append(outNames, v.Name)
+		outTypes = append(outTypes, v.DataType)
 	}
 	sess, err := ort.NewDynamicAdvancedSession(path, inNames, outNames, opts)
 	if err != nil {
 		return nil, fmt.Errorf("创建会话失败：%w", err)
 	}
-	return &Session{Sess: sess, Inputs: inNames, Outputs: outNames}, nil
+	return &Session{Sess: sess, Inputs: inNames, Outputs: outNames, OutputTypes: outTypes}, nil
 }
 
 func destroyGroup(list []*Session) error {

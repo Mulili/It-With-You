@@ -165,18 +165,28 @@ func (b *Bert) PhoneFeatures(ctx context.Context, text string, repeats []int) ([
 	if err != nil {
 		return nil, err
 	}
-	// 输出必须**自己预分配**：这张图给的是 float16，而 binding 对未知元素类型的
-	// 自动分配只按 1 字节/元素算，ORT 会报 "not enough space: expected 86016, got 43008"。
-	// 形状我们本来就已知（总音素数 × 1024），直接按 2 字节/元素建一个半精度张量。
-	outBytes := make([]byte, total*bertDim*2)
-	outTensor, err := ort.NewCustomDataTensor(
-		ort.NewShape(int64(total), bertDim), outBytes, ort.TensorElementDataTypeFloat16)
-	if err != nil {
-		return nil, fmt.Errorf("构造 BERT 输出张量失败：%w", err)
-	}
-	defer outTensor.Destroy()
+	// 输出有两条路径，取决于模型精度：
+	//   - float32（int8 量化后的图）：让 ORT 自动分配，直接读 Tensor[float32]；
+	//   - float16（原始导出）：**必须自己预分配**。binding 对未知元素类型的自动分配
+	//     只按 1 字节/元素算，ORT 会报 "not enough space: expected 86016, got 43008"。
+	fp16Out := len(b.session.OutputTypes) > 0 &&
+		b.session.OutputTypes[0] == ort.TensorElementDataTypeFloat16
 
-	outs := []ort.Value{outTensor}
+	var outs []ort.Value
+	var outTensor *ort.CustomDataTensor
+	if fp16Out {
+		outTensor, err = ort.NewCustomDataTensor(
+			ort.NewShape(int64(total), bertDim), make([]byte, total*bertDim*2),
+			ort.TensorElementDataTypeFloat16)
+		if err != nil {
+			return nil, fmt.Errorf("构造 BERT 输出张量失败：%w", err)
+		}
+		defer outTensor.Destroy()
+		outs = []ort.Value{outTensor}
+	} else {
+		outs = make([]ort.Value, len(b.session.Outputs))
+	}
+
 	started := time.Now()
 	if err := b.session.Run(in, outs); err != nil {
 		return nil, fmt.Errorf("BERT 推理失败：%w", err)
@@ -185,14 +195,31 @@ func (b *Bert) PhoneFeatures(ctx context.Context, text string, repeats []int) ([
 		log.Printf("tts-debug: bert %d 音素耗时 %dms", total, time.Since(started).Milliseconds())
 	}
 
-	raw := outTensor.GetData()
-	if len(raw) != total*bertDim*2 {
-		return nil, fmt.Errorf("BERT 输出尺寸不对：%d 字节，期望 %d（%d 音素 × %d × 2）",
-			len(raw), total*bertDim*2, total, bertDim)
-	}
-	out := make([]float32, 0, total*bertDim)
-	for i := 0; i+1 < len(raw); i += 2 {
-		out = append(out, fp16ToFloat32(uint16(raw[i])|uint16(raw[i+1])<<8))
+	var out []float32
+	if fp16Out {
+		raw := outTensor.GetData()
+		if len(raw) != total*bertDim*2 {
+			return nil, fmt.Errorf("BERT 输出尺寸不对：%d 字节，期望 %d（%d 音素 × %d × 2）",
+				len(raw), total*bertDim*2, total, bertDim)
+		}
+		out = make([]float32, 0, total*bertDim)
+		for i := 0; i+1 < len(raw); i += 2 {
+			out = append(out, fp16ToFloat32(uint16(raw[i])|uint16(raw[i+1])<<8))
+		}
+	} else {
+		t, ok := outs[0].(*ort.Tensor[float32])
+		if !ok {
+			destroyValues(outs)
+			return nil, fmt.Errorf("BERT 输出类型不对：%T（期望 float32）", outs[0])
+		}
+		data := t.GetData()
+		if len(data) != total*bertDim {
+			destroyValues(outs)
+			return nil, fmt.Errorf("BERT 输出元素数不对：%d，期望 %d（%d 音素 × %d）",
+				len(data), total*bertDim, total, bertDim)
+		}
+		out = append([]float32(nil), data...)
+		destroyValues(outs)
 	}
 	// 全零说明写回没生效（binding 对 CustomDataTensor 的写回行为依版本而变）。
 	// 与其把零向量当"正常特征"喂下去，不如明确报错、退回零 BERT。
