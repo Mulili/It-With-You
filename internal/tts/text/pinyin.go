@@ -128,20 +128,36 @@ func (f *Frontend) charPinyin(r rune) string {
 // 查不到读音的音节会被**跳过**（与 GENIE 的 KeyError → continue 一致）：
 // 少一个字只是口齿不清，整句报错会让助手一句话都说不出来。
 func (f *Frontend) Phones(s string) []string {
+	phones, _ := f.PhonesWithCounts(s)
+	return phones
+}
+
+// PhonesWithCounts 与 Phones 相同，但额外给出**每个字贡献了几个音素**。
+//
+// counts 与 Normalize(s) 的字符一一对应（含标点；跳过的字符记 0）。
+// 它有两个用途：
+//   - 中文 BERT 的 `repeats` 输入（一个字 2 个音素、标点 1 个），
+//     没有它就没法把字符级特征铺到音素级；
+//   - 排查"某个字被吞掉"——counts 为 0 的位置就是被跳过的字。
+func (f *Frontend) PhonesWithCounts(s string) (phones []string, counts []int) {
 	syls := f.syllables(Normalize(s))
-	phones := make([]string, 0, len(syls)*2)
+	phones = make([]string, 0, len(syls)*2)
+	counts = make([]int, 0, len(syls))
 	for _, sy := range syls {
 		if !isHan(sy.ch) {
 			phones = append(phones, string(sy.ch))
+			counts = append(counts, 1)
 			continue
 		}
 		c, v, ok := f.splitPhone(sy.py)
 		if !ok {
+			counts = append(counts, 0)
 			continue
 		}
 		phones = append(phones, c, v)
+		counts = append(counts, 2)
 	}
-	return phones
+	return phones, counts
 }
 
 // splitPhone 把 "hao3" 变成 ("h", "ao3")。

@@ -55,6 +55,11 @@ type TTSAudioPayload struct {
 	Rate int    `json:"rate"`
 	PCM  string `json:"pcm"`
 	Text string `json:"text"`
+	// PauseMs 是这段音频**播放完之后**应该静默多久（按句末标点分级，见 text.PauseAfterMs）。
+	//
+	// 为什么放在负载里而不是前端自己按标点算：前端拿到的 Text 是分句后的原文，
+	// 算得出，但规则只该有一份——后端算错只改一处，前端各自实现迟早会漂。
+	PauseMs int `json:"pauseMs"`
 }
 
 // SayPayload 是 EventSay 事件的负载。

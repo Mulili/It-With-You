@@ -22,12 +22,17 @@ var (
 		'。': true, '！': true, '？': true, '…': true, '!': true, '?': true, '.': true,
 	}
 	sepChars = map[rune]bool{
-		'，': true, '、': true, '；': true, '：': true, '—': true,
+		'，': true, '、': true, '；': true, '：': true, '—': true, '－': true, '–': true,
 		',': true, ';': true, ':': true,
 	}
 	quoteChars = map[rune]bool{
 		'“': true, '”': true, '‘': true, '’': true, '"': true, '\'': true,
 	}
+	// dashChars 是**必定断开**的一类：它不像逗号那样可以继续攒。
+	//
+	// 破折号在口语里就是"话说到一半停一下再转"，把它和逗号一样处理会让停顿短得听不出来；
+	// 而它又不足以结束一句话（后面还有话）。所以单列一类：一定切，切完按 PauseAfterMs 给长停顿。
+	dashChars = map[rune]bool{'—': true, '－': true, '–': true}
 )
 
 func allPunct(r rune) bool {
@@ -66,7 +71,8 @@ func (s *Splitter) Split(text string) []string {
 
 		buf.WriteString(block)
 		eff := effectiveLen(buf.String())
-		if blockHasEnd(block) {
+		// 破折号与句末标点一样**必定断开**：它后面本来就是一次换气/转折。
+		if blockHasEnd(block) || blockHasDash(block) {
 			if eff >= s.MinLen {
 				sentences = append(sentences, strings.TrimSpace(buf.String()))
 				buf.Reset()
@@ -134,6 +140,15 @@ func runeLen(r rune) int {
 func blockHasEnd(block string) bool {
 	for _, r := range block {
 		if endChars[r] {
+			return true
+		}
+	}
+	return false
+}
+
+func blockHasDash(block string) bool {
+	for _, r := range block {
+		if dashChars[r] {
 			return true
 		}
 	}
