@@ -170,6 +170,13 @@ type Store interface {
 	// 以及将来做摘录 / 导出时的跨会话取数。
 	RecentMessages(personaID string, limit int) ([]Message, error)
 
+	// CountAssistant 数该人格**成功发出**的助手消息条数（role=assistant 且 status=ok）。
+	//
+	// 为什么按"她说的条数"而不是总条数：情绪种子取自她的发言，阈值也该落在同一个量纲上；
+	// 被取消的半截回复不算——它们不是完整的语气样本。
+	// 用途只有一个：判断"要不要给这个人格生成情绪种子"（50 条出 profile、200 条出参考集）。
+	CountAssistant(personaID string) (int, error)
+
 	// ListSessions 列出该人格的会话（时间倒序）。
 	ListSessions(personaID string, limit int) ([]Session, error)
 

@@ -291,6 +291,21 @@ func (s *PgStore) RecentMessages(personaID string, limit int) ([]history.Message
 	return scanMessages(rows)
 }
 
+// CountAssistant 实现 history.Store。
+func (s *PgStore) CountAssistant(personaID string) (int, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+
+	var n int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT count(*) FROM messages
+		WHERE persona_id = $1 AND role = 'assistant' AND status = 'ok'`,
+		personaID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("统计助手消息失败: %w", err)
+	}
+	return n, nil
+}
+
 // scanMessages 把结果集读成消息切片。
 func scanMessages(rows pgx.Rows) ([]history.Message, error) {
 	out := make([]history.Message, 0, 32)

@@ -193,6 +193,20 @@ func (s *MemoryStore) RecentMessages(personaID string, limit int) ([]history.Mes
 	}, limit), nil
 }
 
+// CountAssistant 实现 history.Store。
+func (s *MemoryStore) CountAssistant(personaID string) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	n := 0
+	for _, m := range s.messages {
+		if m.PersonaID == personaID && m.Role == "assistant" && m.Status == history.StatusOK {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // ListSessions 实现 history.Store。
 func (s *MemoryStore) ListSessions(personaID string, limit int) ([]history.Session, error) {
 	s.mu.RLock()
